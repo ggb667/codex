@@ -6,8 +6,48 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use tempfile::tempdir;
 
+use codex_keyring_store::CredentialStoreError;
 use codex_keyring_store::tests::MockKeyringStore;
 use keyring::Error as KeyringError;
+
+#[derive(Clone, Debug)]
+struct SaveSecretErrorKeyringStore {
+    inner: MockKeyringStore,
+}
+
+impl KeyringStore for SaveSecretErrorKeyringStore {
+    fn load(&self, service: &str, account: &str) -> Result<Option<String>, CredentialStoreError> {
+        self.inner.load(service, account)
+    }
+
+    fn load_secret(
+        &self,
+        service: &str,
+        account: &str,
+    ) -> Result<Option<Vec<u8>>, CredentialStoreError> {
+        self.inner.load_secret(service, account)
+    }
+
+    fn save(&self, service: &str, account: &str, value: &str) -> Result<(), CredentialStoreError> {
+        self.inner.save(service, account, value)
+    }
+
+    fn save_secret(
+        &self,
+        _service: &str,
+        _account: &str,
+        _value: &[u8],
+    ) -> Result<(), CredentialStoreError> {
+        Err(CredentialStoreError::new(KeyringError::Invalid(
+            "error".into(),
+            "save".into(),
+        )))
+    }
+
+    fn delete(&self, service: &str, account: &str) -> Result<bool, CredentialStoreError> {
+        self.inner.delete(service, account)
+    }
+}
 
 #[tokio::test]
 async fn file_storage_load_returns_auth_dot_json() -> anyhow::Result<()> {
@@ -97,19 +137,19 @@ fn ephemeral_storage_save_load_delete_is_in_memory_only() -> anyhow::Result<()> 
     Ok(())
 }
 
-fn seed_keyring_and_fallback_auth_file_for_delete<F>(
-    mock_keyring: &MockKeyringStore,
+fn seed_keyring_and_fallback_auth_file_for_delete(
+    storage: &KeyringAuthStorage,
     codex_home: &Path,
-    compute_key: F,
-) -> anyhow::Result<(String, PathBuf)>
-where
-    F: FnOnce() -> std::io::Result<String>,
-{
-    let key = compute_key()?;
-    mock_keyring.save(KEYRING_SERVICE, &key, "{}")?;
+    auth: &AuthDotJson,
+) -> anyhow::Result<(String, String, PathBuf)> {
+    storage.save(auth)?;
+    let base_key = compute_store_key(codex_home)?;
+    let revision = storage
+        .load_active_revision(&base_key)?
+        .context("active auth revision should exist")?;
     let auth_file = get_auth_file(codex_home);
     std::fs::write(&auth_file, "stale")?;
-    Ok((key, auth_file))
+    Ok((base_key, revision, auth_file))
 }
 
 fn seed_keyring_with_auth<F>(
@@ -128,15 +168,57 @@ where
 
 fn assert_keyring_saved_auth_and_removed_fallback(
     mock_keyring: &MockKeyringStore,
-    key: &str,
+    base_key: &str,
     codex_home: &Path,
     expected: &AuthDotJson,
 ) {
-    let saved_value = mock_keyring
-        .saved_value(key)
-        .expect("keyring entry should exist");
-    let expected_serialized = serde_json::to_string(expected).expect("serialize expected auth");
-    assert_eq!(saved_value, expected_serialized);
+    let active_key = keyring_layout_key(base_key, KEYRING_ACTIVE_REVISION_ENTRY);
+    let revision = mock_keyring
+        .saved_secret_utf8(&active_key)
+        .expect("active auth revision should exist");
+    assert!(
+        mock_keyring.saved_value(base_key).is_none(),
+        "legacy keyring entry should not be used for split auth storage"
+    );
+    let manifest_key = keyring_revision_key(base_key, &revision, KEYRING_MANIFEST_ENTRY);
+    let manifest_bytes = mock_keyring
+        .saved_secret(&manifest_key)
+        .expect("auth manifest should exist");
+    let manifest: KeyringAuthManifest =
+        serde_json::from_slice(&manifest_bytes).expect("manifest should deserialize");
+    assert_eq!(manifest, KeyringAuthManifest::from(expected));
+
+    let openai_api_key_key =
+        keyring_revision_key(base_key, &revision, KEYRING_OPENAI_API_KEY_ENTRY);
+    assert_eq!(
+        mock_keyring.saved_secret_utf8(&openai_api_key_key),
+        expected.openai_api_key
+    );
+
+    if let Some(tokens) = expected.tokens.as_ref() {
+        let id_token_key = keyring_revision_key(base_key, &revision, KEYRING_ID_TOKEN_ENTRY);
+        assert_eq!(
+            mock_keyring.saved_secret_utf8(&id_token_key),
+            Some(tokens.id_token.raw_jwt.clone())
+        );
+        let access_token_key =
+            keyring_revision_key(base_key, &revision, KEYRING_ACCESS_TOKEN_ENTRY);
+        assert_eq!(
+            mock_keyring.saved_secret_utf8(&access_token_key),
+            Some(tokens.access_token.clone())
+        );
+        let refresh_token_key =
+            keyring_revision_key(base_key, &revision, KEYRING_REFRESH_TOKEN_ENTRY);
+        assert_eq!(
+            mock_keyring.saved_secret_utf8(&refresh_token_key),
+            Some(tokens.refresh_token.clone())
+        );
+        let account_id_key = keyring_revision_key(base_key, &revision, KEYRING_ACCOUNT_ID_ENTRY);
+        assert_eq!(
+            mock_keyring.saved_secret_utf8(&account_id_key),
+            tokens.account_id.clone()
+        );
+    }
     let auth_file = get_auth_file(codex_home);
     assert!(
         !auth_file.exists(),
@@ -185,7 +267,7 @@ fn auth_with_prefix(prefix: &str) -> AuthDotJson {
 }
 
 #[test]
-fn keyring_auth_storage_load_returns_deserialized_auth() -> anyhow::Result<()> {
+fn keyring_auth_storage_load_supports_legacy_single_entry() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
     let mock_keyring = MockKeyringStore::default();
     let storage = KeyringAuthStorage::new(
@@ -203,6 +285,20 @@ fn keyring_auth_storage_load_returns_deserialized_auth() -> anyhow::Result<()> {
         || compute_store_key(codex_home.path()),
         &expected,
     )?;
+
+    let loaded = storage.load()?;
+    assert_eq!(Some(expected), loaded);
+    Ok(())
+}
+
+#[test]
+fn keyring_auth_storage_load_returns_deserialized_v2_auth() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let mock_keyring = MockKeyringStore::default();
+    let storage = KeyringAuthStorage::new(codex_home.path().to_path_buf(), Arc::new(mock_keyring));
+    let expected = auth_with_prefix("split");
+
+    storage.save(&expected)?;
 
     let loaded = storage.load()?;
     assert_eq!(Some(expected), loaded);
@@ -256,17 +352,29 @@ fn keyring_auth_storage_delete_removes_keyring_and_file() -> anyhow::Result<()> 
         codex_home.path().to_path_buf(),
         Arc::new(mock_keyring.clone()),
     );
-    let (key, auth_file) =
-        seed_keyring_and_fallback_auth_file_for_delete(&mock_keyring, codex_home.path(), || {
-            compute_store_key(codex_home.path())
-        })?;
+    let auth = auth_with_prefix("delete");
+    let (base_key, revision, auth_file) =
+        seed_keyring_and_fallback_auth_file_for_delete(&storage, codex_home.path(), &auth)?;
 
     let removed = storage.delete()?;
 
     assert!(removed, "delete should report removal");
+    let active_key = keyring_layout_key(&base_key, KEYRING_ACTIVE_REVISION_ENTRY);
     assert!(
-        !mock_keyring.contains(&key),
-        "keyring entry should be removed"
+        !mock_keyring.contains(&active_key),
+        "active revision should be removed"
+    );
+    for entry in KEYRING_RECORD_ENTRIES {
+        let key = keyring_revision_key(&base_key, &revision, entry);
+        assert!(
+            !mock_keyring.contains(&key),
+            "keyring entry should be removed"
+        );
+    }
+    let account_id_key = keyring_revision_key(&base_key, &revision, KEYRING_ACCOUNT_ID_ENTRY);
+    assert!(
+        !mock_keyring.contains(&account_id_key),
+        "account id entry should be removed"
     );
     assert!(
         !auth_file.exists(),
@@ -321,7 +429,11 @@ fn auto_auth_storage_load_falls_back_when_keyring_errors() -> anyhow::Result<()>
         Arc::new(mock_keyring.clone()),
     );
     let key = compute_store_key(codex_home.path())?;
-    mock_keyring.set_error(&key, KeyringError::Invalid("error".into(), "load".into()));
+    let active_key = keyring_layout_key(&key, KEYRING_ACTIVE_REVISION_ENTRY);
+    mock_keyring.set_error(
+        &active_key,
+        KeyringError::Invalid("error".into(), "load".into()),
+    );
 
     let expected = auth_with_prefix("fallback");
     storage.file_storage.save(&expected)?;
@@ -360,12 +472,12 @@ fn auto_auth_storage_save_prefers_keyring() -> anyhow::Result<()> {
 fn auto_auth_storage_save_falls_back_when_keyring_errors() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
     let mock_keyring = MockKeyringStore::default();
-    let storage = AutoAuthStorage::new(
-        codex_home.path().to_path_buf(),
-        Arc::new(mock_keyring.clone()),
-    );
+    let failing_keyring = SaveSecretErrorKeyringStore {
+        inner: mock_keyring.clone(),
+    };
+    let storage = AutoAuthStorage::new(codex_home.path().to_path_buf(), Arc::new(failing_keyring));
     let key = compute_store_key(codex_home.path())?;
-    mock_keyring.set_error(&key, KeyringError::Invalid("error".into(), "save".into()));
+    let active_key = keyring_layout_key(&key, KEYRING_ACTIVE_REVISION_ENTRY);
 
     let auth = auth_with_prefix("fallback");
     storage.save(&auth)?;
@@ -381,8 +493,8 @@ fn auto_auth_storage_save_falls_back_when_keyring_errors() -> anyhow::Result<()>
         .context("fallback auth should exist")?;
     assert_eq!(saved, auth);
     assert!(
-        mock_keyring.saved_value(&key).is_none(),
-        "keyring should not contain value when save fails"
+        mock_keyring.saved_secret_utf8(&active_key).is_none(),
+        "keyring should not point to a saved auth revision when save fails"
     );
     Ok(())
 }
@@ -395,17 +507,37 @@ fn auto_auth_storage_delete_removes_keyring_and_file() -> anyhow::Result<()> {
         codex_home.path().to_path_buf(),
         Arc::new(mock_keyring.clone()),
     );
-    let (key, auth_file) =
-        seed_keyring_and_fallback_auth_file_for_delete(&mock_keyring, codex_home.path(), || {
-            compute_store_key(codex_home.path())
-        })?;
+    let auth = auth_with_prefix("auto-delete");
+    let (base_key, revision, auth_file) = seed_keyring_and_fallback_auth_file_for_delete(
+        storage.keyring_storage.as_ref(),
+        codex_home.path(),
+        &auth,
+    )?;
 
     let removed = storage.delete()?;
 
     assert!(removed, "delete should report removal");
     assert!(
-        !mock_keyring.contains(&key),
-        "keyring entry should be removed"
+        !mock_keyring.contains(&keyring_layout_key(
+            &base_key,
+            KEYRING_ACTIVE_REVISION_ENTRY
+        )),
+        "active revision should be removed"
+    );
+    for entry in KEYRING_RECORD_ENTRIES {
+        let key = keyring_revision_key(&base_key, &revision, entry);
+        assert!(
+            !mock_keyring.contains(&key),
+            "keyring entry should be removed"
+        );
+    }
+    assert!(
+        !mock_keyring.contains(&keyring_revision_key(
+            &base_key,
+            &revision,
+            KEYRING_ACCOUNT_ID_ENTRY
+        )),
+        "account id entry should be removed"
     );
     assert!(
         !auth_file.exists(),
