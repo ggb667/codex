@@ -2,6 +2,7 @@ use super::*;
 use crate::token_data::IdTokenInfo;
 use anyhow::Context;
 use base64::Engine;
+use pretty_assertions::assert_eq;
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -207,15 +208,22 @@ fn assert_keyring_saved_auth_and_removed_fallback(
     codex_home: &Path,
     expected: &AuthDotJson,
 ) {
-    assert!(
-        mock_keyring.saved_value(base_key).is_none(),
-        "legacy keyring entry should not be used for split auth storage"
-    );
-    let loaded = load_split_json_from_keyring(mock_keyring, KEYRING_SERVICE, base_key)
-        .expect("split auth should load from keyring")
-        .expect("split auth should exist");
     let expected_json = serde_json::to_value(expected).expect("auth should serialize");
+    let loaded = load_json_from_keyring(mock_keyring, KEYRING_SERVICE, base_key)
+        .expect("auth should load from keyring")
+        .expect("auth should exist");
     assert_eq!(loaded, expected_json);
+    #[cfg(windows)]
+    assert!(
+        mock_keyring.saved_secret(base_key).is_none(),
+        "windows should store auth using split keyring entries"
+    );
+    #[cfg(not(windows))]
+    assert_eq!(
+        mock_keyring.saved_secret(base_key),
+        Some(serde_json::to_vec(&expected_json).expect("auth should serialize")),
+        "non-windows should store auth as one JSON secret"
+    );
     let auth_file = get_auth_file(codex_home);
     assert!(
         !auth_file.exists(),
@@ -289,13 +297,32 @@ fn keyring_auth_storage_load_supports_legacy_single_entry() -> anyhow::Result<()
 }
 
 #[test]
-fn keyring_auth_storage_load_returns_deserialized_split_auth() -> anyhow::Result<()> {
+fn keyring_auth_storage_load_returns_deserialized_keyring_auth() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
     let mock_keyring = MockKeyringStore::default();
     let storage = KeyringAuthStorage::new(codex_home.path().to_path_buf(), Arc::new(mock_keyring));
-    let expected = auth_with_prefix("split");
+    let expected = auth_with_prefix("keyring");
 
     storage.save(&expected)?;
+
+    let loaded = storage.load()?;
+    assert_eq!(Some(expected), loaded);
+    Ok(())
+}
+
+#[test]
+fn keyring_auth_storage_load_supports_split_json_compatibility() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let mock_keyring = MockKeyringStore::default();
+    let storage = KeyringAuthStorage::new(
+        codex_home.path().to_path_buf(),
+        Arc::new(mock_keyring.clone()),
+    );
+    let expected = auth_with_prefix("split-compat");
+    let key = compute_store_key(codex_home.path())?;
+    let value = serde_json::to_value(&expected)?;
+
+    codex_keyring_store::save_split_json_to_keyring(&mock_keyring, KEYRING_SERVICE, &key, &value)?;
 
     let loaded = storage.load()?;
     assert_eq!(Some(expected), loaded);
@@ -357,8 +384,8 @@ fn keyring_auth_storage_delete_removes_keyring_and_file() -> anyhow::Result<()> 
 
     assert!(removed, "delete should report removal");
     assert!(
-        load_split_json_from_keyring(&mock_keyring, KEYRING_SERVICE, &base_key)?.is_none(),
-        "split auth should be removed"
+        load_json_from_keyring(&mock_keyring, KEYRING_SERVICE, &base_key)?.is_none(),
+        "keyring auth should be removed"
     );
     assert!(
         !auth_file.exists(),
@@ -470,8 +497,8 @@ fn auto_auth_storage_save_falls_back_when_keyring_errors() -> anyhow::Result<()>
         .context("fallback auth should exist")?;
     assert_eq!(saved, auth);
     assert!(
-        load_split_json_from_keyring(&mock_keyring, KEYRING_SERVICE, &key)?.is_none(),
-        "keyring should not point to saved split auth when save fails"
+        load_json_from_keyring(&mock_keyring, KEYRING_SERVICE, &key)?.is_none(),
+        "keyring should not point to saved auth when save fails"
     );
     Ok(())
 }
@@ -495,8 +522,8 @@ fn auto_auth_storage_delete_removes_keyring_and_file() -> anyhow::Result<()> {
 
     assert!(removed, "delete should report removal");
     assert!(
-        load_split_json_from_keyring(&mock_keyring, KEYRING_SERVICE, &base_key)?.is_none(),
-        "split auth should be removed"
+        load_json_from_keyring(&mock_keyring, KEYRING_SERVICE, &base_key)?.is_none(),
+        "keyring auth should be removed"
     );
     assert!(
         !auth_file.exists(),
