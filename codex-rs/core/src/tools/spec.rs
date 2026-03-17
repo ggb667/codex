@@ -496,7 +496,7 @@ impl ToolsConfig {
     }
 
     fn is_tool_capability_enabled(&self, capability: ToolCapabilityKey) -> bool {
-        if matches!(capability, ToolCapabilityKey::WebSearch) {
+        if let ToolCapabilityKey::WebSearch = capability {
             // The resolved web_search_mode already reflects config, feature defaults,
             // and any requirement-driven overrides.
             return self
@@ -520,6 +520,9 @@ impl ToolsConfig {
             ToolCapabilityKey::ApplyPatch => self.apply_patch_tool_type.is_some(),
             ToolCapabilityKey::UpdatePlan => true,
             ToolCapabilityKey::RequestUserInput => self.request_user_input,
+            ToolCapabilityKey::WebSearch => self
+                .web_search_mode
+                .is_some_and(|mode| mode != WebSearchMode::Disabled),
             ToolCapabilityKey::ImageGeneration => self.image_gen_tool,
             ToolCapabilityKey::ViewImage => self.legacy_view_image_override.unwrap_or(true),
             ToolCapabilityKey::Artifacts => self.artifact_tools,
