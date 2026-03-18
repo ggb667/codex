@@ -25,39 +25,49 @@ use codex_protocol::models::VIEW_IMAGE_TOOL_NAME;
 use codex_utils_readiness::Readiness;
 use tracing::warn;
 
+pub(crate) const CONTAINER_EXEC_TOOL_NAME: &str = "container.exec";
+pub(crate) const EXEC_COMMAND_TOOL_NAME: &str = "exec_command";
+pub(crate) const LOCAL_SHELL_TOOL_NAME: &str = "local_shell";
+pub(crate) const SHELL_COMMAND_TOOL_NAME: &str = "shell_command";
+pub(crate) const SHELL_TOOL_NAME: &str = "shell";
+pub(crate) const WRITE_STDIN_TOOL_NAME: &str = "write_stdin";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Individual built-in tools known to Codex, independent of how they are
+/// grouped for config-driven enablement.
 pub(crate) enum BuiltinToolKey {
+    ApplyPatch,
+    Artifacts,
+    CloseAgent,
     CodeMode,
     ExecCommand,
-    WriteStdin,
-    ListMcpResources,
-    ListMcpResourceTemplates,
-    ReadMcpResource,
-    UpdatePlan,
+    GrepFiles,
+    ImageGeneration,
     JsRepl,
     JsReplReset,
-    RequestUserInput,
-    RequestPermissions,
-    SearchToolBm25,
-    ApplyPatch,
-    GrepFiles,
-    ReadFile,
     ListDir,
-    TestSyncTool,
-    WebSearch,
-    ImageGeneration,
-    ViewImage,
-    Artifacts,
-    SpawnAgent,
-    SendInput,
-    ResumeAgent,
-    Wait,
-    CloseAgent,
-    SpawnAgentsOnCsv,
+    ListMcpResources,
+    ListMcpResourceTemplates,
+    ReadFile,
+    ReadMcpResource,
+    RequestPermissions,
+    RequestUserInput,
     ReportAgentJobResult,
+    ResumeAgent,
+    SearchToolBm25,
+    SendInput,
+    SpawnAgent,
+    SpawnAgentsOnCsv,
+    TestSyncTool,
+    UpdatePlan,
+    ViewImage,
+    Wait,
+    WebSearch,
+    WriteStdin,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Coarse-grained built-in tool capability groups exposed in `config.tools`.
 pub(crate) enum ToolFeatureKey {
     Shell,
     Filesystem,
@@ -73,34 +83,34 @@ pub(crate) enum ToolFeatureKey {
 
 impl BuiltinToolKey {
     pub(crate) const ALL: [Self; 28] = [
+        Self::ApplyPatch,
+        Self::Artifacts,
+        Self::CloseAgent,
         Self::CodeMode,
         Self::ExecCommand,
-        Self::WriteStdin,
-        Self::ListMcpResources,
-        Self::ListMcpResourceTemplates,
-        Self::ReadMcpResource,
-        Self::UpdatePlan,
+        Self::GrepFiles,
+        Self::ImageGeneration,
         Self::JsRepl,
         Self::JsReplReset,
-        Self::RequestUserInput,
-        Self::RequestPermissions,
-        Self::SearchToolBm25,
-        Self::ApplyPatch,
-        Self::GrepFiles,
-        Self::ReadFile,
         Self::ListDir,
-        Self::TestSyncTool,
-        Self::WebSearch,
-        Self::ImageGeneration,
-        Self::ViewImage,
-        Self::Artifacts,
-        Self::SpawnAgent,
-        Self::SendInput,
-        Self::ResumeAgent,
-        Self::Wait,
-        Self::CloseAgent,
-        Self::SpawnAgentsOnCsv,
+        Self::ListMcpResources,
+        Self::ListMcpResourceTemplates,
+        Self::ReadFile,
+        Self::ReadMcpResource,
+        Self::RequestPermissions,
+        Self::RequestUserInput,
         Self::ReportAgentJobResult,
+        Self::ResumeAgent,
+        Self::SearchToolBm25,
+        Self::SendInput,
+        Self::SpawnAgent,
+        Self::SpawnAgentsOnCsv,
+        Self::TestSyncTool,
+        Self::UpdatePlan,
+        Self::ViewImage,
+        Self::Wait,
+        Self::WebSearch,
+        Self::WriteStdin,
     ];
 
     pub(crate) fn iter() -> impl Iterator<Item = Self> {
@@ -111,13 +121,13 @@ impl BuiltinToolKey {
         match self {
             Self::CodeMode => &[PUBLIC_TOOL_NAME],
             Self::ExecCommand => &[
-                "exec_command",
-                "shell",
-                "container.exec",
-                "local_shell",
-                "shell_command",
+                SHELL_TOOL_NAME,
+                EXEC_COMMAND_TOOL_NAME,
+                CONTAINER_EXEC_TOOL_NAME,
+                LOCAL_SHELL_TOOL_NAME,
+                SHELL_COMMAND_TOOL_NAME,
             ],
-            Self::WriteStdin => &["write_stdin"],
+            Self::WriteStdin => &[WRITE_STDIN_TOOL_NAME],
             Self::ListMcpResources => &["list_mcp_resources"],
             Self::ListMcpResourceTemplates => &["list_mcp_resource_templates"],
             Self::ReadMcpResource => &["read_mcp_resource"],

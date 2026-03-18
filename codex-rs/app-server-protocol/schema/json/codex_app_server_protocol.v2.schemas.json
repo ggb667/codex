@@ -11331,7 +11331,7 @@
       ],
       "type": "object"
     },
-    "ToolFeatureConfigV2": {
+    "ToolFeatureConfig": {
       "properties": {
         "enabled": {
           "type": [
@@ -11347,7 +11347,7 @@
         "agent_jobs": {
           "anyOf": [
             {
-              "$ref": "#/definitions/ToolFeatureConfigV2"
+              "$ref": "#/definitions/ToolFeatureConfig"
             },
             {
               "type": "null"
@@ -11357,7 +11357,7 @@
         "agents": {
           "anyOf": [
             {
-              "$ref": "#/definitions/ToolFeatureConfigV2"
+              "$ref": "#/definitions/ToolFeatureConfig"
             },
             {
               "type": "null"
@@ -11373,7 +11373,7 @@
         "document_generation": {
           "anyOf": [
             {
-              "$ref": "#/definitions/ToolFeatureConfigV2"
+              "$ref": "#/definitions/ToolFeatureConfig"
             },
             {
               "type": "null"
@@ -11383,7 +11383,7 @@
         "filesystem": {
           "anyOf": [
             {
-              "$ref": "#/definitions/ToolFeatureConfigV2"
+              "$ref": "#/definitions/ToolFeatureConfig"
             },
             {
               "type": "null"
@@ -11393,7 +11393,7 @@
         "image_generation": {
           "anyOf": [
             {
-              "$ref": "#/definitions/ToolFeatureConfigV2"
+              "$ref": "#/definitions/ToolFeatureConfig"
             },
             {
               "type": "null"
@@ -11403,7 +11403,7 @@
         "javascript": {
           "anyOf": [
             {
-              "$ref": "#/definitions/ToolFeatureConfigV2"
+              "$ref": "#/definitions/ToolFeatureConfig"
             },
             {
               "type": "null"
@@ -11413,7 +11413,7 @@
         "planning": {
           "anyOf": [
             {
-              "$ref": "#/definitions/ToolFeatureConfigV2"
+              "$ref": "#/definitions/ToolFeatureConfig"
             },
             {
               "type": "null"
@@ -11423,7 +11423,7 @@
         "shell": {
           "anyOf": [
             {
-              "$ref": "#/definitions/ToolFeatureConfigV2"
+              "$ref": "#/definitions/ToolFeatureConfig"
             },
             {
               "type": "null"
@@ -11433,7 +11433,7 @@
         "user_input": {
           "anyOf": [
             {
-              "$ref": "#/definitions/ToolFeatureConfigV2"
+              "$ref": "#/definitions/ToolFeatureConfig"
             },
             {
               "type": "null"
@@ -11450,7 +11450,7 @@
         "web_search": {
           "anyOf": [
             {
-              "$ref": "#/definitions/WebSearchFeatureConfigV2"
+              "$ref": "#/definitions/WebSearchFeatureConfig"
             },
             {
               "type": "null"
@@ -12072,7 +12072,7 @@
       ],
       "type": "string"
     },
-    "WebSearchFeatureConfigV2": {
+    "WebSearchFeatureConfig": {
       "properties": {
         "allowed_domains": {
           "items": {

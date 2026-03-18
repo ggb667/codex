@@ -534,14 +534,14 @@ pub struct SandboxWorkspaceWrite {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export_to = "v2/")]
-pub struct ToolFeatureConfigV2 {
+pub struct ToolFeatureConfig {
     pub enabled: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export_to = "v2/")]
-pub struct WebSearchFeatureConfigV2 {
+pub struct WebSearchFeatureConfig {
     pub enabled: Option<bool>,
     #[serde(flatten)]
     pub config: WebSearchToolConfig,
@@ -552,16 +552,16 @@ pub struct WebSearchFeatureConfigV2 {
 #[ts(export_to = "v2/")]
 pub struct ToolsV2 {
     pub disable_defaults: Option<bool>,
-    pub shell: Option<ToolFeatureConfigV2>,
-    pub filesystem: Option<ToolFeatureConfigV2>,
-    pub javascript: Option<ToolFeatureConfigV2>,
-    pub agents: Option<ToolFeatureConfigV2>,
-    pub agent_jobs: Option<ToolFeatureConfigV2>,
-    pub planning: Option<ToolFeatureConfigV2>,
-    pub user_input: Option<ToolFeatureConfigV2>,
-    pub web_search: Option<WebSearchFeatureConfigV2>,
-    pub image_generation: Option<ToolFeatureConfigV2>,
-    pub document_generation: Option<ToolFeatureConfigV2>,
+    pub shell: Option<ToolFeatureConfig>,
+    pub filesystem: Option<ToolFeatureConfig>,
+    pub javascript: Option<ToolFeatureConfig>,
+    pub agents: Option<ToolFeatureConfig>,
+    pub agent_jobs: Option<ToolFeatureConfig>,
+    pub planning: Option<ToolFeatureConfig>,
+    pub user_input: Option<ToolFeatureConfig>,
+    pub web_search: Option<WebSearchFeatureConfig>,
+    pub image_generation: Option<ToolFeatureConfig>,
+    pub document_generation: Option<ToolFeatureConfig>,
     /// Legacy enablement for the `view_image` capability.
     pub view_image: Option<bool>,
 }

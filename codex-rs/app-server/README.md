@@ -115,7 +115,10 @@ Example with notification opt-out:
     },
     "capabilities": {
       "experimentalApi": true,
-      "optOutNotificationMethods": ["thread/started", "item/agentMessage/delta"]
+      "optOutNotificationMethods": [
+        "thread/started",
+        "item/agentMessage/delta"
+      ]
     }
   }
 }
@@ -298,13 +301,10 @@ When `nextCursor` is `null`, you’ve reached the final page.
 - `thread/start`, `thread/fork`, and detached review threads do not emit a separate initial `thread/status/changed`; their `thread/started` notification already carries the current `thread.status`.
 
 ```json
-{
-  "method": "thread/status/changed",
-  "params": {
+{ "method": "thread/status/changed", "params": {
     "threadId": "thr_123",
     "status": { "type": "active", "activeFlags": [] }
-  }
-}
+} }
 ```
 
 ### Example: Unsubscribe from a loaded thread
@@ -953,7 +953,10 @@ The built-in `request_permissions` tool sends an `item/permissions/requestApprov
     "reason": "Select a workspace root",
     "permissions": {
       "fileSystem": {
-        "write": ["/Users/me/project", "/Users/me/shared"]
+        "write": [
+          "/Users/me/project",
+          "/Users/me/shared"
+        ]
       }
     }
   }
@@ -969,7 +972,9 @@ The client responds with `result.permissions`, which should be the granted subse
     "scope": "session",
     "permissions": {
       "fileSystem": {
-        "write": ["/Users/me/project"]
+        "write": [
+          "/Users/me/project"
+        ]
       }
     }
   }

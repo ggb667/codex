@@ -19,9 +19,9 @@ use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::MergeStrategy;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxMode;
-use codex_app_server_protocol::ToolFeatureConfigV2;
+use codex_app_server_protocol::ToolFeatureConfig;
 use codex_app_server_protocol::ToolsV2;
-use codex_app_server_protocol::WebSearchFeatureConfigV2;
+use codex_app_server_protocol::WebSearchFeatureConfig;
 use codex_app_server_protocol::WriteStatus;
 use codex_core::config::set_project_trust_level;
 use codex_protocol::config_types::TrustLevel;
@@ -140,14 +140,14 @@ view_image = false
         tools,
         ToolsV2 {
             disable_defaults: Some(true),
-            shell: Some(ToolFeatureConfigV2 { enabled: None }),
-            filesystem: Some(ToolFeatureConfigV2 { enabled: None }),
+            shell: Some(ToolFeatureConfig { enabled: None }),
+            filesystem: Some(ToolFeatureConfig { enabled: None }),
             javascript: None,
             agents: None,
             agent_jobs: None,
             planning: None,
             user_input: None,
-            web_search: Some(WebSearchFeatureConfigV2 {
+            web_search: Some(WebSearchFeatureConfig {
                 enabled: Some(true),
                 config: WebSearchToolConfig {
                     context_size: Some(WebSearchContextSize::Low),
@@ -229,7 +229,7 @@ location = { country = "US", city = "New York", timezone = "America/New_York" }
 
     assert_eq!(
         config.tools.expect("tools present").web_search,
-        Some(WebSearchFeatureConfigV2 {
+        Some(WebSearchFeatureConfig {
             enabled: None,
             config: WebSearchToolConfig {
                 context_size: Some(WebSearchContextSize::High),
