@@ -335,14 +335,6 @@ impl ChatgptAuthRefreshContext {
                 "local ChatGPT auth must use workspace {expected_workspace}, but found {chatgpt_account_id:?}"
             ));
         }
-        if let Some(previous_account_id) = params.previous_account_id.as_deref()
-            && previous_account_id != chatgpt_account_id
-        {
-            return Err(format!(
-                "local ChatGPT auth refresh account mismatch: expected `{previous_account_id}`, got `{chatgpt_account_id}`"
-            ));
-        }
-
         Ok(ChatgptAuthTokensRefreshResponse {
             access_token,
             chatgpt_account_id,
@@ -1698,6 +1690,28 @@ mod tests {
             response.chatgpt_account_id, "workspace-1",
             "refresh response should preserve the local workspace id"
         );
+        assert_eq!(response.chatgpt_plan_type.as_deref(), Some("business"));
+        assert!(!response.access_token.is_empty());
+    }
+
+    #[test]
+    fn chatgpt_auth_refresh_context_ignores_previous_workspace_mismatch() {
+        let codex_home = TestCodexHome::new();
+        write_local_chatgpt_auth(&codex_home.path);
+        let context = ChatgptAuthRefreshContext {
+            codex_home: codex_home.path.clone(),
+            auth_credentials_store_mode: AuthCredentialsStoreMode::File,
+            forced_chatgpt_workspace_id: Some("workspace-1".to_string()),
+        };
+
+        let response = context
+            .resolve_refresh_response(&ChatgptAuthTokensRefreshParams {
+                reason: ChatgptAuthTokensRefreshReason::Unauthorized,
+                previous_account_id: Some("workspace-2".to_string()),
+            })
+            .expect("stale previous workspace should not fail local auth refresh");
+
+        assert_eq!(response.chatgpt_account_id, "workspace-1");
         assert_eq!(response.chatgpt_plan_type.as_deref(), Some("business"));
         assert!(!response.access_token.is_empty());
     }

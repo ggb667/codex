@@ -527,14 +527,7 @@ fn resolve_chatgpt_auth_tokens_refresh_response(
         auth_credentials_store_mode,
         forced_chatgpt_workspace_id,
     )?;
-    if let Some(previous_account_id) = params.previous_account_id.as_deref()
-        && previous_account_id != auth.chatgpt_account_id
-    {
-        return Err(format!(
-            "local ChatGPT auth refresh account mismatch: expected `{previous_account_id}`, got `{}`",
-            auth.chatgpt_account_id
-        ));
-    }
+    let _ = params;
     Ok(auth.to_refresh_response())
 }
 
@@ -1234,11 +1227,11 @@ mod refresh_tests {
     }
 
     #[test]
-    fn refresh_request_rejects_account_mismatch() {
+    fn refresh_request_ignores_account_mismatch() {
         let codex_home = TempDir::new().expect("tempdir");
         write_chatgpt_auth(codex_home.path());
 
-        let err = resolve_chatgpt_auth_tokens_refresh_response(
+        let response = resolve_chatgpt_auth_tokens_refresh_response(
             codex_home.path(),
             AuthCredentialsStoreMode::File,
             Some("workspace-1"),
@@ -1247,12 +1240,11 @@ mod refresh_tests {
                 previous_account_id: Some("workspace-2".to_string()),
             },
         )
-        .expect_err("mismatched account should fail");
+        .expect("stale previous workspace should not fail local auth refresh");
 
-        assert_eq!(
-            err,
-            "local ChatGPT auth refresh account mismatch: expected `workspace-2`, got `workspace-1`"
-        );
+        assert_eq!(response.chatgpt_account_id, "workspace-1");
+        assert_eq!(response.chatgpt_plan_type.as_deref(), Some("business"));
+        assert!(!response.access_token.is_empty());
     }
 }
 
@@ -1309,6 +1301,10 @@ mod tests {
     use codex_app_server_protocol::TurnCompletedNotification;
     use codex_app_server_protocol::TurnError;
     use codex_app_server_protocol::TurnStatus;
+    use codex_core::auth::AuthCredentialsStoreMode;
+    use codex_core::auth::AuthDotJson;
+    use codex_core::auth::save_auth;
+    use codex_core::token_data::TokenData;
     use codex_protocol::ThreadId;
     use codex_protocol::items::AgentMessageContent;
     use codex_protocol::items::AgentMessageItem;
