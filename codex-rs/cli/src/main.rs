@@ -331,16 +331,6 @@ struct AppServerCommand {
     )]
     listen: codex_app_server::AppServerTransport,
 
-    /// Session source stamped into new threads started by this app-server.
-    ///
-    /// Known values such as `vscode`, `cli`, `exec`, and `mcp` map to built-in
-    /// sources. Any other non-empty value is recorded as a custom source.
-    #[arg(
-        long = "session-source",
-        value_name = "SOURCE",
-        default_value = "vscode"
-    )]
-    session_source: String,
     /// Controls whether analytics are enabled by default.
     ///
     /// Analytics are disabled by default for app-server. Users have to explicitly opt in
@@ -684,17 +674,12 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
             match app_server_cli.subcommand {
                 None => {
                     let transport = app_server_cli.listen;
-                    let session_source = codex_protocol::protocol::SessionSource::from_startup_arg(
-                        app_server_cli.session_source.as_str(),
-                    )
-                    .map_err(|err| anyhow::anyhow!("invalid --session-source: {err}"))?;
                     codex_app_server::run_main_with_transport(
                         arg0_paths.clone(),
                         root_config_overrides,
                         codex_core::config_loader::LoaderOverrides::default(),
                         app_server_cli.analytics_default_enabled,
                         transport,
-                        session_source,
                     )
                     .await?;
                 }
