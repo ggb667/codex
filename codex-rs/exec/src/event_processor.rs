@@ -5,6 +5,7 @@ use codex_protocol::protocol::SessionConfiguredEvent;
 
 use crate::typed_exec_event::TypedExecEvent;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CodexStatus {
     Running,
     InitiateShutdown,
