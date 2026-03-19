@@ -26,6 +26,7 @@ pub(crate) struct EventProcessorWithHumanOutput {
     red: Style,
     yellow: Style,
     show_agent_reasoning: bool,
+    show_raw_agent_reasoning: bool,
     last_message_path: Option<PathBuf>,
     final_message: Option<String>,
     last_total_token_usage: Option<ThreadTokenUsage>,
@@ -47,6 +48,7 @@ impl EventProcessorWithHumanOutput {
             red: style(Style::new().red(), Style::new()),
             yellow: style(Style::new().yellow(), Style::new()),
             show_agent_reasoning: !config.hide_agent_reasoning,
+            show_raw_agent_reasoning: config.show_raw_agent_reasoning,
             last_message_path,
             final_message: None,
             last_total_token_usage: None,
@@ -106,12 +108,10 @@ impl EventProcessorWithHumanOutput {
                 summary, content, ..
             } => {
                 if self.show_agent_reasoning {
-                    let text = if content.is_empty() {
-                        summary.join("\n")
-                    } else {
-                        content.join("\n")
-                    };
-                    if !text.trim().is_empty() {
+                    if let Some(text) =
+                        reasoning_text(&summary, &content, self.show_raw_agent_reasoning)
+                        && !text.trim().is_empty()
+                    {
                         eprintln!("{}", text.style(self.dimmed));
                     }
                 }
@@ -314,6 +314,10 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             }
             TypedExecEvent::TurnCompleted(notification) => match notification.turn.status {
                 TurnStatus::Completed => {
+                    if self.final_message.is_none() {
+                        self.final_message =
+                            final_message_from_turn_items(notification.turn.items.as_slice());
+                    }
                     self.print_usage();
                     CodexStatus::InitiateShutdown
                 }
@@ -365,6 +369,30 @@ impl EventProcessor for EventProcessorWithHumanOutput {
     }
 }
 
+fn reasoning_text(
+    summary: &[String],
+    content: &[String],
+    show_raw_agent_reasoning: bool,
+) -> Option<String> {
+    let entries = if show_raw_agent_reasoning && !content.is_empty() {
+        content
+    } else {
+        summary
+    };
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries.join("\n"))
+    }
+}
+
+fn final_message_from_turn_items(items: &[ThreadItem]) -> Option<String> {
+    items.iter().rev().find_map(|item| match item {
+        ThreadItem::AgentMessage { text, .. } => Some(text.clone()),
+        _ => None,
+    })
+}
+
 fn should_print_final_message_to_stdout(
     final_message: Option<&str>,
     stdout_is_terminal: bool,
@@ -375,7 +403,17 @@ fn should_print_final_message_to_stdout(
 
 #[cfg(test)]
 mod tests {
+    use codex_app_server_protocol::ThreadItem;
+    use codex_app_server_protocol::Turn;
+    use codex_app_server_protocol::TurnStatus;
+    use owo_colors::Style;
+
+    use super::EventProcessorWithHumanOutput;
+    use super::final_message_from_turn_items;
+    use super::reasoning_text;
     use super::should_print_final_message_to_stdout;
+    use crate::event_processor::EventProcessor;
+    use crate::typed_exec_event::TypedExecEvent;
 
     #[test]
     fn suppresses_final_stdout_message_when_both_streams_are_terminals() {
@@ -407,5 +445,91 @@ mod tests {
     #[test]
     fn suppresses_final_stdout_message_when_missing() {
         assert!(!should_print_final_message_to_stdout(None, false, false));
+    }
+
+    #[test]
+    fn reasoning_text_prefers_summary_when_raw_reasoning_is_hidden() {
+        let text = reasoning_text(
+            &["summary".to_string()],
+            &["raw".to_string()],
+            /*show_raw_agent_reasoning*/ false,
+        );
+
+        assert_eq!(text.as_deref(), Some("summary"));
+    }
+
+    #[test]
+    fn reasoning_text_uses_raw_content_when_enabled() {
+        let text = reasoning_text(
+            &["summary".to_string()],
+            &["raw".to_string()],
+            /*show_raw_agent_reasoning*/ true,
+        );
+
+        assert_eq!(text.as_deref(), Some("raw"));
+    }
+
+    #[test]
+    fn final_message_from_turn_items_uses_latest_agent_message() {
+        let message = final_message_from_turn_items(&[
+            ThreadItem::AgentMessage {
+                id: "msg-1".to_string(),
+                text: "first".to_string(),
+                phase: None,
+                memory_citation: None,
+            },
+            ThreadItem::Plan {
+                id: "plan-1".to_string(),
+                text: "plan".to_string(),
+            },
+            ThreadItem::AgentMessage {
+                id: "msg-2".to_string(),
+                text: "second".to_string(),
+                phase: None,
+                memory_citation: None,
+            },
+        ]);
+
+        assert_eq!(message.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn turn_completed_recovers_final_message_from_turn_items() {
+        let mut processor = EventProcessorWithHumanOutput {
+            bold: Style::new(),
+            cyan: Style::new(),
+            dimmed: Style::new(),
+            green: Style::new(),
+            red: Style::new(),
+            yellow: Style::new(),
+            show_agent_reasoning: true,
+            show_raw_agent_reasoning: false,
+            last_message_path: None,
+            final_message: None,
+            last_total_token_usage: None,
+        };
+
+        let status = processor.process_event(TypedExecEvent::TurnCompleted(
+            codex_app_server_protocol::TurnCompletedNotification {
+                thread_id: "thread-1".to_string(),
+                turn: Turn {
+                    id: "turn-1".to_string(),
+                    items: vec![ThreadItem::AgentMessage {
+                        id: "msg-1".to_string(),
+                        text: "final answer".to_string(),
+                        phase: None,
+                        memory_citation: None,
+                    }],
+                    status: TurnStatus::Completed,
+                    error: None,
+                },
+            },
+        ));
+
+        assert_eq!(
+            status,
+            crate::event_processor::CodexStatus::InitiateShutdown
+        );
+        assert_eq!(processor.final_message.as_deref(), Some("final answer"));
     }
 }
