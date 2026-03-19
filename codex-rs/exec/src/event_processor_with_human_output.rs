@@ -386,10 +386,19 @@ fn reasoning_text(
 }
 
 fn final_message_from_turn_items(items: &[ThreadItem]) -> Option<String> {
-    items.iter().rev().find_map(|item| match item {
-        ThreadItem::AgentMessage { text, .. } => Some(text.clone()),
-        _ => None,
-    })
+    items
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            ThreadItem::AgentMessage { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .or_else(|| {
+            items.iter().rev().find_map(|item| match item {
+                ThreadItem::Plan { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+        })
 }
 
 fn should_print_final_message_to_stdout(
@@ -490,6 +499,27 @@ mod tests {
         ]);
 
         assert_eq!(message.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn final_message_from_turn_items_falls_back_to_latest_plan() {
+        let message = final_message_from_turn_items(&[
+            ThreadItem::Reasoning {
+                id: "reasoning-1".to_string(),
+                summary: vec!["inspect".to_string()],
+                content: Vec::new(),
+            },
+            ThreadItem::Plan {
+                id: "plan-1".to_string(),
+                text: "first plan".to_string(),
+            },
+            ThreadItem::Plan {
+                id: "plan-2".to_string(),
+                text: "final plan".to_string(),
+            },
+        ]);
+
+        assert_eq!(message.as_deref(), Some("final plan"));
     }
 
     #[test]

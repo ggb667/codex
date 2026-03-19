@@ -287,10 +287,19 @@ impl EventProcessorWithJsonOutput {
     }
 
     fn final_message_from_turn_items(items: &[ThreadItem]) -> Option<String> {
-        items.iter().rev().find_map(|item| match item {
-            ThreadItem::AgentMessage { text, .. } => Some(text.clone()),
-            _ => None,
-        })
+        items
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                ThreadItem::AgentMessage { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .or_else(|| {
+                items.iter().rev().find_map(|item| match item {
+                    ThreadItem::Plan { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+            })
     }
 
     fn thread_started_event(session_configured: &SessionConfiguredEvent) -> ThreadEvent {

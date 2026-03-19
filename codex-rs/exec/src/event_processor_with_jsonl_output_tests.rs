@@ -452,6 +452,39 @@ fn turn_completion_recovers_final_message_from_turn_items() {
 }
 
 #[test]
+fn turn_completion_falls_back_to_final_plan_text() {
+    let mut processor = EventProcessorWithJsonOutput::new(None);
+
+    let completed =
+        processor.collect_thread_events(TypedExecEvent::TurnCompleted(TurnCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn: Turn {
+                id: "turn-1".to_string(),
+                items: vec![ThreadItem::Plan {
+                    id: "plan-1".to_string(),
+                    text: "ship the typed adapter".to_string(),
+                }],
+                status: TurnStatus::Completed,
+                error: None,
+            },
+        }));
+
+    assert_eq!(
+        completed,
+        CollectedThreadEvents {
+            events: vec![ThreadEvent::TurnCompleted(TurnCompletedEvent {
+                usage: Usage::default(),
+            })],
+            status: CodexStatus::InitiateShutdown,
+        }
+    );
+    assert_eq!(
+        processor.final_message.as_deref(),
+        Some("ship the typed adapter")
+    );
+}
+
+#[test]
 fn turn_failure_prefers_structured_error_message() {
     let mut processor = EventProcessorWithJsonOutput::new(None);
 
