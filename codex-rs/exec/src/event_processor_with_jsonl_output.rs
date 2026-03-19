@@ -286,6 +286,13 @@ impl EventProcessorWithJsonOutput {
         Some(ExecThreadItem { id, details })
     }
 
+    fn final_message_from_turn_items(items: &[ThreadItem]) -> Option<String> {
+        items.iter().rev().find_map(|item| match item {
+            ThreadItem::AgentMessage { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+    }
+
     fn thread_started_event(session_configured: &SessionConfiguredEvent) -> ThreadEvent {
         ThreadEvent::ThreadStarted(ThreadStartedEvent {
             thread_id: session_configured.session_id.to_string(),
@@ -397,6 +404,11 @@ impl EventProcessorWithJsonOutput {
                 }
                 match notification.turn.status {
                     TurnStatus::Completed => {
+                        if self.final_message.is_none() {
+                            self.final_message = Self::final_message_from_turn_items(
+                                notification.turn.items.as_slice(),
+                            );
+                        }
                         events.push(ThreadEvent::TurnCompleted(TurnCompletedEvent {
                             usage: self.usage_from_last_total(),
                         }));
