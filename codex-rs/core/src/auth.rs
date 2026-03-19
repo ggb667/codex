@@ -1171,6 +1171,7 @@ impl AuthManager {
         let new_auth = self.load_auth_from_storage();
         let new_account_id = new_auth.as_ref().and_then(CodexAuth::get_account_id);
 
+        // `account_id` is the ChatGPT workspace/account boundary; if it is missing, only reload from disk when chatgpt_user_id or email still match.
         if let Some(expected_account_id) = cached_account_id.as_deref() {
             if new_account_id.as_deref() == Some(expected_account_id) {
                 tracing::info!("Reloading auth for account {expected_account_id}");
@@ -1180,7 +1181,7 @@ impl AuthManager {
                     .is_some_and(|new_auth| Self::same_refresh_identity(cached_auth, new_auth))
             {
                 tracing::info!(
-                    "Reloading auth with legacy identity fallback for refresh because the on-disk auth has no account id."
+                    "Reloading auth from an older on-disk auth file without an account id because the user still matches."
                 );
             } else {
                 let found_account_id = new_account_id.as_deref().unwrap_or("unknown");
@@ -1190,15 +1191,13 @@ impl AuthManager {
                 return ReloadOutcome::Skipped;
             }
         } else {
-            tracing::info!(
-                "Reloading auth with legacy identity guard for refresh because account id is unavailable."
-            );
+            tracing::info!("Reloading auth because account id is unavailable.");
             if !new_auth
                 .as_ref()
                 .is_some_and(|new_auth| Self::same_refresh_identity(cached_auth, new_auth))
             {
                 tracing::info!(
-                    "Skipping auth reload due to legacy identity mismatch during refresh."
+                    "Skipping auth reload because the on-disk auth is not the same user during refresh."
                 );
                 return ReloadOutcome::Skipped;
             }
@@ -1360,6 +1359,9 @@ impl AuthManager {
     /// the token. On success, reloads the auth state from disk so other components
     /// observe refreshed token. If the token refresh fails, returns the error to
     /// the caller.
+    ///
+    /// If the authority reports `refresh_token_reused`, reload local auth once
+    /// more before surfacing relogin.
     pub async fn refresh_token_from_authority(&self) -> Result<(), RefreshTokenError> {
         tracing::info!("Refreshing token");
 
