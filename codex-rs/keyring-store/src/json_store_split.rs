@@ -85,89 +85,23 @@ struct SplitJsonManifest {
 
 type SplitJsonLeafValues = Vec<(String, Vec<u8>)>;
 
-#[cfg(windows)]
 pub fn load_json_from_keyring<K: KeyringStore + ?Sized>(
     keyring_store: &K,
     service: &str,
     base_key: &str,
 ) -> Result<Option<Value>, JsonKeyringError> {
-    load_split_json_from_keyring(keyring_store, service, base_key)
-}
-
-#[cfg(not(windows))]
-pub fn load_json_from_keyring<K: KeyringStore + ?Sized>(
-    keyring_store: &K,
-    service: &str,
-    base_key: &str,
-) -> Result<Option<Value>, JsonKeyringError> {
-    if let Some(value) = load_full_json_from_keyring(keyring_store, service, base_key)? {
-        return Ok(Some(value));
-    }
-    Ok(None)
-}
-
-#[cfg(windows)]
-pub fn save_json_to_keyring<K: KeyringStore + ?Sized>(
-    keyring_store: &K,
-    service: &str,
-    base_key: &str,
-    value: &Value,
-) -> Result<(), JsonKeyringError> {
-    save_split_json_to_keyring(keyring_store, service, base_key, value)?;
-
-    Ok(())
-}
-
-#[cfg(not(windows))]
-pub fn save_json_to_keyring<K: KeyringStore + ?Sized>(
-    keyring_store: &K,
-    service: &str,
-    base_key: &str,
-    value: &Value,
-) -> Result<(), JsonKeyringError> {
-    let bytes = serde_json::to_vec(value).map_err(|err| {
-        SplitJsonKeyringError::new(format!("failed to serialize JSON record: {err}"))
-    })?;
-    save_secret_to_keyring(keyring_store, service, base_key, &bytes, "JSON record")
-}
-
-#[cfg(windows)]
-pub fn delete_json_from_keyring<K: KeyringStore + ?Sized>(
-    keyring_store: &K,
-    service: &str,
-    base_key: &str,
-) -> Result<bool, JsonKeyringError> {
-    let split_removed = delete_split_json_from_keyring(keyring_store, service, base_key)?;
-    Ok(split_removed)
-}
-
-#[cfg(not(windows))]
-pub fn delete_json_from_keyring<K: KeyringStore + ?Sized>(
-    keyring_store: &K,
-    service: &str,
-    base_key: &str,
-) -> Result<bool, JsonKeyringError> {
-    let full_removed = delete_full_json_from_keyring(keyring_store, service, base_key)?;
-    Ok(full_removed)
-}
-
-fn load_split_json_from_keyring<K: KeyringStore + ?Sized>(
-    keyring_store: &K,
-    service: &str,
-    base_key: &str,
-) -> Result<Option<Value>, SplitJsonKeyringError> {
     let Some(manifest) = load_manifest(keyring_store, service, base_key)? else {
         return Ok(None);
     };
     inflate_split_json(keyring_store, service, base_key, &manifest).map(Some)
 }
 
-fn save_split_json_to_keyring<K: KeyringStore + ?Sized>(
+pub fn save_json_to_keyring<K: KeyringStore + ?Sized>(
     keyring_store: &K,
     service: &str,
     base_key: &str,
     value: &Value,
-) -> Result<(), SplitJsonKeyringError> {
+) -> Result<(), JsonKeyringError> {
     let previous_manifest = match load_manifest(keyring_store, service, base_key) {
         Ok(manifest) => manifest,
         Err(err) => {
@@ -226,11 +160,11 @@ fn save_split_json_to_keyring<K: KeyringStore + ?Sized>(
     Ok(())
 }
 
-fn delete_split_json_from_keyring<K: KeyringStore + ?Sized>(
+pub fn delete_json_from_keyring<K: KeyringStore + ?Sized>(
     keyring_store: &K,
     service: &str,
     base_key: &str,
-) -> Result<bool, SplitJsonKeyringError> {
+) -> Result<bool, JsonKeyringError> {
     let Some(manifest) = load_manifest(keyring_store, service, base_key)? else {
         return Ok(false);
     };
@@ -252,40 +186,6 @@ fn delete_split_json_from_keyring<K: KeyringStore + ?Sized>(
     let manifest_key = layout_key(base_key, MANIFEST_ENTRY);
     removed |= delete_keyring_entry(keyring_store, service, &manifest_key, "JSON manifest")?;
     Ok(removed)
-}
-
-fn load_full_json_from_keyring<K: KeyringStore + ?Sized>(
-    keyring_store: &K,
-    service: &str,
-    base_key: &str,
-) -> Result<Option<Value>, SplitJsonKeyringError> {
-    if let Some(bytes) = load_secret_from_keyring(keyring_store, service, base_key, "JSON record")?
-    {
-        let value = serde_json::from_slice(&bytes).map_err(|err| {
-            SplitJsonKeyringError::new(format!(
-                "failed to deserialize JSON record from keyring secret: {err}"
-            ))
-        })?;
-        return Ok(Some(value));
-    }
-
-    match keyring_store.load(service, base_key) {
-        Ok(Some(serialized)) => serde_json::from_str(&serialized).map(Some).map_err(|err| {
-            SplitJsonKeyringError::new(format!(
-                "failed to deserialize JSON record from keyring password: {err}"
-            ))
-        }),
-        Ok(None) => Ok(None),
-        Err(error) => Err(credential_store_error("load", "JSON record", error)),
-    }
-}
-
-fn delete_full_json_from_keyring<K: KeyringStore + ?Sized>(
-    keyring_store: &K,
-    service: &str,
-    base_key: &str,
-) -> Result<bool, SplitJsonKeyringError> {
-    delete_keyring_entry(keyring_store, service, base_key, "JSON record")
 }
 
 fn flatten_split_json(
@@ -625,13 +525,11 @@ mod tests {
     use super::LAYOUT_VERSION;
     use super::MANIFEST_ENTRY;
     use super::delete_json_from_keyring;
-    use super::delete_split_json_from_keyring;
     use super::layout_key;
     use super::load_json_from_keyring;
-    use super::load_split_json_from_keyring;
     use super::save_json_to_keyring;
-    use super::save_split_json_to_keyring;
     use super::value_key;
+    use crate::KeyringStore;
     use crate::tests::MockKeyringStore;
     use pretty_assertions::assert_eq;
     use serde_json::json;
@@ -640,7 +538,7 @@ mod tests {
     const BASE_KEY: &str = "base";
 
     #[test]
-    fn json_storage_round_trips_using_platform_backend() {
+    fn json_storage_round_trips_using_split_backend() {
         let store = MockKeyringStore::default();
         let expected = json!({
             "token": "secret",
@@ -653,86 +551,47 @@ mod tests {
             .expect("JSON should load")
             .expect("JSON should exist");
         assert_eq!(loaded, expected);
-
-        #[cfg(windows)]
-        {
-            assert!(
-                store.saved_secret(BASE_KEY).is_none(),
-                "windows should not store the full JSON record under the base key"
-            );
-            assert!(
-                store.contains(&layout_key(BASE_KEY, MANIFEST_ENTRY)),
-                "windows should store split JSON manifest metadata"
-            );
-        }
-
-        #[cfg(not(windows))]
-        {
-            assert_eq!(
-                store.saved_secret(BASE_KEY),
-                Some(serde_json::to_vec(&expected).expect("JSON should serialize")),
-            );
-            assert!(
-                !store.contains(&layout_key(BASE_KEY, MANIFEST_ENTRY)),
-                "non-windows should not create split JSON manifest metadata"
-            );
-        }
+        assert!(
+            store.saved_secret(BASE_KEY).is_none(),
+            "split storage should not write the full record under the base key"
+        );
+        assert!(
+            store.contains(&layout_key(BASE_KEY, MANIFEST_ENTRY)),
+            "split storage should write manifest metadata"
+        );
     }
 
     #[test]
-    fn json_storage_does_not_load_compatibility_layout() {
+    fn json_storage_does_not_load_legacy_single_entry() {
         let store = MockKeyringStore::default();
         let expected = json!({
             "token": "secret",
             "nested": {"id": 9}
         });
+        store
+            .save(
+                SERVICE,
+                BASE_KEY,
+                &serde_json::to_string(&expected).expect("JSON should serialize"),
+            )
+            .expect("legacy JSON should save");
 
-        #[cfg(windows)]
-        {
-            store
-                .save(
-                    SERVICE,
-                    BASE_KEY,
-                    &serde_json::to_string(&expected).expect("JSON should serialize"),
-                )
-                .expect("full JSON should save");
-            let loaded =
-                load_json_from_keyring(&store, SERVICE, BASE_KEY).expect("JSON should load");
-            assert_eq!(loaded, None);
-        }
-
-        #[cfg(not(windows))]
-        {
-            save_split_json_to_keyring(&store, SERVICE, BASE_KEY, &expected)
-                .expect("split JSON should save");
-            let loaded =
-                load_json_from_keyring(&store, SERVICE, BASE_KEY).expect("JSON should load");
-            assert_eq!(loaded, None);
-        }
+        let loaded = load_json_from_keyring(&store, SERVICE, BASE_KEY).expect("JSON should load");
+        assert_eq!(loaded, None);
     }
 
     #[test]
-    fn json_storage_save_preserves_compatibility_layout() {
+    fn json_storage_save_preserves_legacy_single_entry() {
         let store = MockKeyringStore::default();
         let current = json!({"current": true});
-        let compat = json!({"split": true});
-
-        #[cfg(windows)]
-        {
-            store
-                .save(
-                    SERVICE,
-                    BASE_KEY,
-                    &serde_json::to_string(&compat).expect("JSON should serialize"),
-                )
-                .expect("full JSON should save");
-        }
-
-        #[cfg(not(windows))]
-        {
-            save_split_json_to_keyring(&store, SERVICE, BASE_KEY, &compat)
-                .expect("split JSON should save");
-        }
+        let legacy = json!({"legacy": true});
+        store
+            .save(
+                SERVICE,
+                BASE_KEY,
+                &serde_json::to_string(&legacy).expect("JSON should serialize"),
+            )
+            .expect("legacy JSON should save");
 
         save_json_to_keyring(&store, SERVICE, BASE_KEY, &current).expect("JSON should save");
 
@@ -740,48 +599,25 @@ mod tests {
             .expect("JSON should load")
             .expect("JSON should exist");
         assert_eq!(loaded, current);
-
-        #[cfg(windows)]
-        {
-            assert_eq!(
-                store.saved_value(BASE_KEY),
-                Some(serde_json::to_string(&compat).expect("JSON should serialize"))
-            );
-        }
-
-        #[cfg(not(windows))]
-        {
-            let compat_loaded = load_split_json_from_keyring(&store, SERVICE, BASE_KEY)
-                .expect("split JSON should load")
-                .expect("split JSON should exist");
-            assert_eq!(compat_loaded, compat);
-        }
+        assert_eq!(
+            store.saved_value(BASE_KEY),
+            Some(serde_json::to_string(&legacy).expect("JSON should serialize"))
+        );
     }
 
     #[test]
-    fn json_storage_delete_removes_only_platform_entries() {
+    fn json_storage_delete_removes_only_split_entries() {
         let store = MockKeyringStore::default();
         let current = json!({"current": true});
-        let compat = json!({"split": true});
-
-        #[cfg(windows)]
-        {
-            store
-                .save(
-                    SERVICE,
-                    BASE_KEY,
-                    &serde_json::to_string(&compat).expect("JSON should serialize"),
-                )
-                .expect("full JSON should save");
-            save_json_to_keyring(&store, SERVICE, BASE_KEY, &current).expect("JSON should save");
-        }
-
-        #[cfg(not(windows))]
-        {
-            save_json_to_keyring(&store, SERVICE, BASE_KEY, &current).expect("JSON should save");
-            save_split_json_to_keyring(&store, SERVICE, BASE_KEY, &compat)
-                .expect("split JSON should save");
-        }
+        let legacy = json!({"legacy": true});
+        store
+            .save(
+                SERVICE,
+                BASE_KEY,
+                &serde_json::to_string(&legacy).expect("JSON should serialize"),
+            )
+            .expect("legacy JSON should save");
+        save_json_to_keyring(&store, SERVICE, BASE_KEY, &current).expect("JSON should save");
 
         let removed = delete_json_from_keyring(&store, SERVICE, BASE_KEY)
             .expect("JSON delete should succeed");
@@ -792,18 +628,8 @@ mod tests {
                 .expect("JSON load should succeed")
                 .is_none()
         );
-
-        #[cfg(windows)]
-        {
-            assert!(store.contains(BASE_KEY));
-            assert!(!store.contains(&layout_key(BASE_KEY, MANIFEST_ENTRY)));
-        }
-
-        #[cfg(not(windows))]
-        {
-            assert!(!store.contains(BASE_KEY));
-            assert!(store.contains(&layout_key(BASE_KEY, MANIFEST_ENTRY)));
-        }
+        assert!(store.contains(BASE_KEY));
+        assert!(!store.contains(&layout_key(BASE_KEY, MANIFEST_ENTRY)));
     }
 
     #[test]
@@ -819,10 +645,9 @@ mod tests {
             },
         });
 
-        save_split_json_to_keyring(&store, SERVICE, BASE_KEY, &expected)
-            .expect("split JSON should save");
+        save_json_to_keyring(&store, SERVICE, BASE_KEY, &expected).expect("split JSON should save");
 
-        let loaded = load_split_json_from_keyring(&store, SERVICE, BASE_KEY)
+        let loaded = load_json_from_keyring(&store, SERVICE, BASE_KEY)
             .expect("split JSON should load")
             .expect("split JSON should exist");
         assert_eq!(loaded, expected);
@@ -833,8 +658,7 @@ mod tests {
         let store = MockKeyringStore::default();
         let expected = json!("value");
 
-        save_split_json_to_keyring(&store, SERVICE, BASE_KEY, &expected)
-            .expect("split JSON should save");
+        save_json_to_keyring(&store, SERVICE, BASE_KEY, &expected).expect("split JSON should save");
 
         let root_value_key = value_key(BASE_KEY, "");
         assert_eq!(
@@ -842,7 +666,7 @@ mod tests {
             Some("\"value\"".to_string())
         );
 
-        let loaded = load_split_json_from_keyring(&store, SERVICE, BASE_KEY)
+        let loaded = load_json_from_keyring(&store, SERVICE, BASE_KEY)
             .expect("split JSON should load")
             .expect("split JSON should exist");
         assert_eq!(loaded, expected);
@@ -858,14 +682,13 @@ mod tests {
             },
         });
 
-        save_split_json_to_keyring(&store, SERVICE, BASE_KEY, &expected)
-            .expect("split JSON should save");
+        save_json_to_keyring(&store, SERVICE, BASE_KEY, &expected).expect("split JSON should save");
 
         let manifest_key = layout_key(BASE_KEY, MANIFEST_ENTRY);
         let token_key = value_key(BASE_KEY, "/token");
         let nested_id_key = value_key(BASE_KEY, "/nested/id");
 
-        let removed = delete_split_json_from_keyring(&store, SERVICE, BASE_KEY)
+        let removed = delete_json_from_keyring(&store, SERVICE, BASE_KEY)
             .expect("split JSON delete should succeed");
 
         assert!(removed);
@@ -880,14 +703,14 @@ mod tests {
         let first = json!({"value": "first", "stale": true});
         let second = json!({"value": "second", "extra": 1});
 
-        save_split_json_to_keyring(&store, SERVICE, BASE_KEY, &first)
+        save_json_to_keyring(&store, SERVICE, BASE_KEY, &first)
             .expect("first split JSON save should succeed");
         let manifest_key = layout_key(BASE_KEY, MANIFEST_ENTRY);
         let stale_value_key = value_key(BASE_KEY, "/stale");
         assert!(store.contains(&manifest_key));
         assert!(store.contains(&stale_value_key));
 
-        save_split_json_to_keyring(&store, SERVICE, BASE_KEY, &second)
+        save_json_to_keyring(&store, SERVICE, BASE_KEY, &second)
             .expect("second split JSON save should succeed");
         assert!(!store.contains(&stale_value_key));
         assert!(store.contains(&manifest_key));
@@ -900,7 +723,7 @@ mod tests {
             Some("1".to_string())
         );
 
-        let loaded = load_split_json_from_keyring(&store, SERVICE, BASE_KEY)
+        let loaded = load_json_from_keyring(&store, SERVICE, BASE_KEY)
             .expect("split JSON should load")
             .expect("split JSON should exist");
         assert_eq!(loaded, second);

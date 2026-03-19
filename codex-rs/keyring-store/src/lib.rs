@@ -5,12 +5,18 @@ use std::fmt;
 use std::fmt::Debug;
 use tracing::trace;
 
-mod split_json;
+#[cfg(not(windows))]
+#[path = "json_store_full.rs"]
+mod json_store;
 
-pub use split_json::JsonKeyringError;
-pub use split_json::delete_json_from_keyring;
-pub use split_json::load_json_from_keyring;
-pub use split_json::save_json_to_keyring;
+#[cfg(windows)]
+#[path = "json_store_split.rs"]
+mod json_store;
+
+pub use json_store::JsonKeyringError;
+pub use json_store::delete_json_from_keyring;
+pub use json_store::load_json_from_keyring;
+pub use json_store::save_json_to_keyring;
 
 #[derive(Debug)]
 pub enum CredentialStoreError {
