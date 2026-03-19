@@ -587,50 +587,27 @@ pub struct SandboxState {
 }
 
 /// A thin wrapper around a set of running [`RmcpClient`] instances.
-pub(crate) struct McpConnectionManager {
+struct SharedMcpBackend {
     clients: HashMap<String, AsyncManagedClient>,
     server_origins: HashMap<String, String>,
-    elicitation_requests: ElicitationRequestManager,
 }
 
-impl McpConnectionManager {
-    pub(crate) fn new_uninitialized(approval_policy: &Constrained<AskForApproval>) -> Self {
+impl SharedMcpBackend {
+    fn new_uninitialized() -> Self {
         Self {
             clients: HashMap::new(),
             server_origins: HashMap::new(),
-            elicitation_requests: ElicitationRequestManager::new(approval_policy.value()),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_mcp_connection_manager_for_tests(
-        approval_policy: &Constrained<AskForApproval>,
-    ) -> Self {
-        Self::new_uninitialized(approval_policy)
-    }
-
-    pub(crate) fn has_servers(&self) -> bool {
-        !self.clients.is_empty()
-    }
-
-    pub(crate) fn server_origin(&self, server_name: &str) -> Option<&str> {
-        self.server_origins.get(server_name).map(String::as_str)
-    }
-
-    pub fn set_approval_policy(&self, approval_policy: &Constrained<AskForApproval>) {
-        if let Ok(mut policy) = self.elicitation_requests.approval_policy.lock() {
-            *policy = approval_policy.value();
         }
     }
 
     #[allow(clippy::new_ret_no_self, clippy::too_many_arguments)]
-    pub async fn new(
+    async fn new(
         mcp_servers: &HashMap<String, McpServerConfig>,
         store_mode: OAuthCredentialsStoreMode,
         auth_entries: HashMap<String, McpAuthStatusEntry>,
-        approval_policy: &Constrained<AskForApproval>,
         tx_event: Sender<Event>,
         initial_sandbox_state: SandboxState,
+        session_handle: SessionMcpHandle,
         codex_home: PathBuf,
         codex_apps_tools_cache_key: CodexAppsToolsCacheKey,
         tool_plugin_provenance: ToolPluginProvenance,
@@ -639,7 +616,7 @@ impl McpConnectionManager {
         let mut clients = HashMap::new();
         let mut server_origins = HashMap::new();
         let mut join_set = JoinSet::new();
-        let elicitation_requests = ElicitationRequestManager::new(approval_policy.value());
+        let elicitation_requests = session_handle.elicitation_requests();
         let tool_plugin_provenance = Arc::new(tool_plugin_provenance);
         let mcp_servers = mcp_servers.clone();
         for (server_name, cfg) in mcp_servers.into_iter().filter(|(_, cfg)| cfg.enabled) {
@@ -717,10 +694,9 @@ impl McpConnectionManager {
                 (server_name, outcome)
             });
         }
-        let manager = Self {
+        let backend = Self {
             clients,
             server_origins,
-            elicitation_requests: elicitation_requests.clone(),
         };
         tokio::spawn(async move {
             let outcomes = join_set.join_all().await;
@@ -744,7 +720,15 @@ impl McpConnectionManager {
                 })
                 .await;
         });
-        (manager, cancel_token)
+        (backend, cancel_token)
+    }
+
+    fn has_servers(&self) -> bool {
+        !self.clients.is_empty()
+    }
+
+    fn server_origin(&self, server_name: &str) -> Option<&str> {
+        self.server_origins.get(server_name).map(String::as_str)
     }
 
     async fn client_by_name(&self, name: &str) -> Result<ManagedClient> {
@@ -756,18 +740,7 @@ impl McpConnectionManager {
             .context("failed to get client")
     }
 
-    pub async fn resolve_elicitation(
-        &self,
-        server_name: String,
-        id: RequestId,
-        response: ElicitationResponse,
-    ) -> Result<()> {
-        self.elicitation_requests
-            .resolve(server_name, id, response)
-            .await
-    }
-
-    pub(crate) async fn wait_for_server_ready(&self, server_name: &str, timeout: Duration) -> bool {
+    async fn wait_for_server_ready(&self, server_name: &str, timeout: Duration) -> bool {
         let Some(async_managed_client) = self.clients.get(server_name) else {
             return false;
         };
@@ -778,7 +751,7 @@ impl McpConnectionManager {
         }
     }
 
-    pub(crate) async fn required_startup_failures(
+    async fn required_startup_failures(
         &self,
         required_servers: &[String],
     ) -> Vec<McpStartupFailure> {
@@ -806,7 +779,7 @@ impl McpConnectionManager {
     /// Returns a single map that contains all tools. Each key is the
     /// fully-qualified name for the tool.
     #[instrument(level = "trace", skip_all)]
-    pub async fn list_all_tools(&self) -> HashMap<String, ToolInfo> {
+    async fn list_all_tools(&self) -> HashMap<String, ToolInfo> {
         let mut tools = HashMap::new();
         for managed_client in self.clients.values() {
             let Some(server_tools) = managed_client.listed_tools().await else {
@@ -821,7 +794,7 @@ impl McpConnectionManager {
     ///
     /// On success, the refreshed tools replace the cache contents. On failure,
     /// the existing cache remains unchanged.
-    pub async fn hard_refresh_codex_apps_tools_cache(&self) -> Result<()> {
+    async fn hard_refresh_codex_apps_tools_cache(&self) -> Result<()> {
         let managed_client = self
             .clients
             .get(CODEX_APPS_MCP_SERVER_NAME)
@@ -862,7 +835,7 @@ impl McpConnectionManager {
 
     /// Returns a single map that contains all resources. Each key is the
     /// server name and the value is a vector of resources.
-    pub async fn list_all_resources(&self) -> HashMap<String, Vec<Resource>> {
+    async fn list_all_resources(&self) -> HashMap<String, Vec<Resource>> {
         let mut join_set = JoinSet::new();
 
         let clients_snapshot = &self.clients;
@@ -928,7 +901,7 @@ impl McpConnectionManager {
 
     /// Returns a single map that contains all resource templates. Each key is the
     /// server name and the value is a vector of resource templates.
-    pub async fn list_all_resource_templates(&self) -> HashMap<String, Vec<ResourceTemplate>> {
+    async fn list_all_resource_templates(&self) -> HashMap<String, Vec<ResourceTemplate>> {
         let mut join_set = JoinSet::new();
 
         let clients_snapshot = &self.clients;
@@ -997,7 +970,7 @@ impl McpConnectionManager {
     }
 
     /// Invoke the tool indicated by the (server, tool) pair.
-    pub async fn call_tool(
+    async fn call_tool(
         &self,
         server: &str,
         tool: &str,
@@ -1034,7 +1007,7 @@ impl McpConnectionManager {
     }
 
     /// List resources from the specified server.
-    pub async fn list_resources(
+    async fn list_resources(
         &self,
         server: &str,
         params: Option<PaginatedRequestParams>,
@@ -1050,7 +1023,7 @@ impl McpConnectionManager {
     }
 
     /// List resource templates from the specified server.
-    pub async fn list_resource_templates(
+    async fn list_resource_templates(
         &self,
         server: &str,
         params: Option<PaginatedRequestParams>,
@@ -1066,7 +1039,7 @@ impl McpConnectionManager {
     }
 
     /// Read a resource from the specified server.
-    pub async fn read_resource(
+    async fn read_resource(
         &self,
         server: &str,
         params: ReadResourceRequestParams,
@@ -1082,14 +1055,14 @@ impl McpConnectionManager {
             .with_context(|| format!("resources/read failed for `{server}` ({uri})"))
     }
 
-    pub async fn parse_tool_name(&self, tool_name: &str) -> Option<(String, String)> {
+    async fn parse_tool_name(&self, tool_name: &str) -> Option<(String, String)> {
         self.list_all_tools()
             .await
             .get(tool_name)
             .map(|tool| (tool.server_name.clone(), tool.tool_name.clone()))
     }
 
-    pub async fn notify_sandbox_state_change(&self, sandbox_state: &SandboxState) -> Result<()> {
+    async fn notify_sandbox_state_change(&self, sandbox_state: &SandboxState) -> Result<()> {
         let mut join_set = JoinSet::new();
 
         for async_managed_client in self.clients.values() {
@@ -1115,6 +1088,207 @@ impl McpConnectionManager {
         }
 
         Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct SessionMcpHandle {
+    elicitation_requests: ElicitationRequestManager,
+}
+
+impl SessionMcpHandle {
+    fn new(approval_policy: AskForApproval) -> Self {
+        Self {
+            elicitation_requests: ElicitationRequestManager::new(approval_policy),
+        }
+    }
+
+    fn elicitation_requests(&self) -> ElicitationRequestManager {
+        self.elicitation_requests.clone()
+    }
+
+    fn set_approval_policy(&self, approval_policy: &Constrained<AskForApproval>) {
+        if let Ok(mut policy) = self.elicitation_requests.approval_policy.lock() {
+            *policy = approval_policy.value();
+        }
+    }
+
+    async fn resolve_elicitation(
+        &self,
+        server_name: String,
+        id: RequestId,
+        response: ElicitationResponse,
+    ) -> Result<()> {
+        self.elicitation_requests
+            .resolve(server_name, id, response)
+            .await
+    }
+}
+
+/// A thin facade that keeps today's call sites stable while separating the
+/// sharable MCP backend from session-local response routing state.
+pub(crate) struct McpConnectionManager {
+    backend: Arc<SharedMcpBackend>,
+    session: SessionMcpHandle,
+}
+
+impl McpConnectionManager {
+    fn from_parts(backend: Arc<SharedMcpBackend>, session: SessionMcpHandle) -> Self {
+        Self { backend, session }
+    }
+
+    pub(crate) fn new_uninitialized(approval_policy: &Constrained<AskForApproval>) -> Self {
+        Self::from_parts(
+            Arc::new(SharedMcpBackend::new_uninitialized()),
+            SessionMcpHandle::new(approval_policy.value()),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_mcp_connection_manager_for_tests(
+        approval_policy: &Constrained<AskForApproval>,
+    ) -> Self {
+        Self::new_uninitialized(approval_policy)
+    }
+
+    pub(crate) fn has_servers(&self) -> bool {
+        self.backend.has_servers()
+    }
+
+    pub(crate) fn server_origin(&self, server_name: &str) -> Option<&str> {
+        self.backend.server_origin(server_name)
+    }
+
+    pub fn set_approval_policy(&self, approval_policy: &Constrained<AskForApproval>) {
+        self.session.set_approval_policy(approval_policy);
+    }
+
+    #[allow(clippy::new_ret_no_self, clippy::too_many_arguments)]
+    pub async fn new(
+        mcp_servers: &HashMap<String, McpServerConfig>,
+        store_mode: OAuthCredentialsStoreMode,
+        auth_entries: HashMap<String, McpAuthStatusEntry>,
+        approval_policy: &Constrained<AskForApproval>,
+        tx_event: Sender<Event>,
+        initial_sandbox_state: SandboxState,
+        codex_home: PathBuf,
+        codex_apps_tools_cache_key: CodexAppsToolsCacheKey,
+        tool_plugin_provenance: ToolPluginProvenance,
+    ) -> (Self, CancellationToken) {
+        let session = SessionMcpHandle::new(approval_policy.value());
+        let (backend, cancel_token) = SharedMcpBackend::new(
+            mcp_servers,
+            store_mode,
+            auth_entries,
+            tx_event,
+            initial_sandbox_state,
+            session.clone(),
+            codex_home,
+            codex_apps_tools_cache_key,
+            tool_plugin_provenance,
+        )
+        .await;
+        (Self::from_parts(Arc::new(backend), session), cancel_token)
+    }
+
+    pub async fn resolve_elicitation(
+        &self,
+        server_name: String,
+        id: RequestId,
+        response: ElicitationResponse,
+    ) -> Result<()> {
+        self.session
+            .resolve_elicitation(server_name, id, response)
+            .await
+    }
+
+    pub(crate) async fn wait_for_server_ready(&self, server_name: &str, timeout: Duration) -> bool {
+        self.backend
+            .wait_for_server_ready(server_name, timeout)
+            .await
+    }
+
+    pub(crate) async fn required_startup_failures(
+        &self,
+        required_servers: &[String],
+    ) -> Vec<McpStartupFailure> {
+        self.backend
+            .required_startup_failures(required_servers)
+            .await
+    }
+
+    /// Returns a single map that contains all tools. Each key is the
+    /// fully-qualified name for the tool.
+    #[instrument(level = "trace", skip_all)]
+    pub async fn list_all_tools(&self) -> HashMap<String, ToolInfo> {
+        self.backend.list_all_tools().await
+    }
+
+    /// Force-refresh codex apps tools by bypassing the in-process cache.
+    ///
+    /// On success, the refreshed tools replace the cache contents. On failure,
+    /// the existing cache remains unchanged.
+    pub async fn hard_refresh_codex_apps_tools_cache(&self) -> Result<()> {
+        self.backend.hard_refresh_codex_apps_tools_cache().await
+    }
+
+    /// Returns a single map that contains all resources. Each key is the
+    /// server name and the value is a vector of resources.
+    pub async fn list_all_resources(&self) -> HashMap<String, Vec<Resource>> {
+        self.backend.list_all_resources().await
+    }
+
+    /// Returns a single map that contains all resource templates. Each key is the
+    /// server name and the value is a vector of resource templates.
+    pub async fn list_all_resource_templates(&self) -> HashMap<String, Vec<ResourceTemplate>> {
+        self.backend.list_all_resource_templates().await
+    }
+
+    /// Invoke the tool indicated by the (server, tool) pair.
+    pub async fn call_tool(
+        &self,
+        server: &str,
+        tool: &str,
+        arguments: Option<serde_json::Value>,
+    ) -> Result<CallToolResult> {
+        self.backend.call_tool(server, tool, arguments).await
+    }
+
+    /// List resources from the specified server.
+    pub async fn list_resources(
+        &self,
+        server: &str,
+        params: Option<PaginatedRequestParams>,
+    ) -> Result<ListResourcesResult> {
+        self.backend.list_resources(server, params).await
+    }
+
+    /// List resource templates from the specified server.
+    pub async fn list_resource_templates(
+        &self,
+        server: &str,
+        params: Option<PaginatedRequestParams>,
+    ) -> Result<ListResourceTemplatesResult> {
+        self.backend.list_resource_templates(server, params).await
+    }
+
+    /// Read a resource from the specified server.
+    pub async fn read_resource(
+        &self,
+        server: &str,
+        params: ReadResourceRequestParams,
+    ) -> Result<ReadResourceResult> {
+        self.backend.read_resource(server, params).await
+    }
+
+    pub async fn parse_tool_name(&self, tool_name: &str) -> Option<(String, String)> {
+        self.backend.parse_tool_name(tool_name).await
+    }
+
+    pub async fn notify_sandbox_state_change(&self, sandbox_state: &SandboxState) -> Result<()> {
+        self.backend
+            .notify_sandbox_state_change(sandbox_state)
+            .await
     }
 }
 
@@ -2071,15 +2245,18 @@ mod tests {
                 .shared();
         let approval_policy = Constrained::allow_any(AskForApproval::OnFailure);
         let mut manager = McpConnectionManager::new_uninitialized(&approval_policy);
-        manager.clients.insert(
-            CODEX_APPS_MCP_SERVER_NAME.to_string(),
-            AsyncManagedClient {
-                client: pending_client,
-                startup_snapshot: Some(startup_tools),
-                startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
-            },
-        );
+        Arc::get_mut(&mut manager.backend)
+            .expect("test manager backend should be uniquely owned")
+            .clients
+            .insert(
+                CODEX_APPS_MCP_SERVER_NAME.to_string(),
+                AsyncManagedClient {
+                    client: pending_client,
+                    startup_snapshot: Some(startup_tools),
+                    startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
+                },
+            );
 
         let tools = manager.list_all_tools().await;
         let tool = tools
@@ -2097,15 +2274,18 @@ mod tests {
                 .shared();
         let approval_policy = Constrained::allow_any(AskForApproval::OnFailure);
         let mut manager = McpConnectionManager::new_uninitialized(&approval_policy);
-        manager.clients.insert(
-            CODEX_APPS_MCP_SERVER_NAME.to_string(),
-            AsyncManagedClient {
-                client: pending_client,
-                startup_snapshot: None,
-                startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
-            },
-        );
+        Arc::get_mut(&mut manager.backend)
+            .expect("test manager backend should be uniquely owned")
+            .clients
+            .insert(
+                CODEX_APPS_MCP_SERVER_NAME.to_string(),
+                AsyncManagedClient {
+                    client: pending_client,
+                    startup_snapshot: None,
+                    startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
+                },
+            );
 
         let timeout_result =
             tokio::time::timeout(Duration::from_millis(10), manager.list_all_tools()).await;
@@ -2120,15 +2300,18 @@ mod tests {
                 .shared();
         let approval_policy = Constrained::allow_any(AskForApproval::OnFailure);
         let mut manager = McpConnectionManager::new_uninitialized(&approval_policy);
-        manager.clients.insert(
-            CODEX_APPS_MCP_SERVER_NAME.to_string(),
-            AsyncManagedClient {
-                client: pending_client,
-                startup_snapshot: Some(Vec::new()),
-                startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
-            },
-        );
+        Arc::get_mut(&mut manager.backend)
+            .expect("test manager backend should be uniquely owned")
+            .clients
+            .insert(
+                CODEX_APPS_MCP_SERVER_NAME.to_string(),
+                AsyncManagedClient {
+                    client: pending_client,
+                    startup_snapshot: Some(Vec::new()),
+                    startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
+                },
+            );
 
         let timeout_result =
             tokio::time::timeout(Duration::from_millis(10), manager.list_all_tools()).await;
@@ -2152,15 +2335,18 @@ mod tests {
         let approval_policy = Constrained::allow_any(AskForApproval::OnFailure);
         let mut manager = McpConnectionManager::new_uninitialized(&approval_policy);
         let startup_complete = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        manager.clients.insert(
-            CODEX_APPS_MCP_SERVER_NAME.to_string(),
-            AsyncManagedClient {
-                client: failed_client,
-                startup_snapshot: Some(startup_tools),
-                startup_complete,
-                tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
-            },
-        );
+        Arc::get_mut(&mut manager.backend)
+            .expect("test manager backend should be uniquely owned")
+            .clients
+            .insert(
+                CODEX_APPS_MCP_SERVER_NAME.to_string(),
+                AsyncManagedClient {
+                    client: failed_client,
+                    startup_snapshot: Some(startup_tools),
+                    startup_complete,
+                    tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
+                },
+            );
 
         let tools = manager.list_all_tools().await;
         let tool = tools
