@@ -603,7 +603,6 @@ mod tests {
     use codex_keyring_store::CredentialStoreError;
     use codex_keyring_store::load_json_from_keyring;
     use codex_keyring_store::save_json_to_keyring;
-    use codex_keyring_store::save_split_json_to_keyring;
     use keyring::Error as KeyringError;
     use pretty_assertions::assert_eq;
     use std::sync::Mutex;
@@ -758,22 +757,6 @@ mod tests {
     }
 
     #[test]
-    fn load_oauth_tokens_supports_split_json_compatibility() -> Result<()> {
-        let _env = TempCodexHome::new();
-        let store = MockKeyringStore::default();
-        let tokens = sample_tokens();
-        let key = super::compute_store_key(&tokens.server_name, &tokens.url)?;
-        let value = serde_json::to_value(&tokens)?;
-        save_split_json_to_keyring(&store, KEYRING_SERVICE, &key, &value)?;
-
-        let loaded =
-            super::load_oauth_tokens_from_keyring(&store, &tokens.server_name, &tokens.url)?
-                .expect("tokens should load from split-json compatibility format");
-        assert_tokens_match_without_expiry(&loaded, &tokens);
-        Ok(())
-    }
-
-    #[test]
     fn load_oauth_tokens_supports_legacy_single_entry() -> Result<()> {
         let _env = TempCodexHome::new();
         let store = MockKeyringStore::default();
@@ -783,9 +766,18 @@ mod tests {
         store.save(KEYRING_SERVICE, &key, &serialized)?;
 
         let loaded =
-            super::load_oauth_tokens_from_keyring(&store, &tokens.server_name, &tokens.url)?
-                .expect("tokens should load from keyring");
-        assert_tokens_match_without_expiry(&loaded, &tokens);
+            super::load_oauth_tokens_from_keyring(&store, &tokens.server_name, &tokens.url)?;
+
+        #[cfg(not(windows))]
+        {
+            let loaded = loaded.expect("tokens should load from keyring");
+            assert_tokens_match_without_expiry(&loaded, &tokens);
+        }
+
+        #[cfg(windows)]
+        {
+            assert!(loaded.is_none());
+        }
         Ok(())
     }
 
@@ -895,15 +887,13 @@ mod tests {
     }
 
     #[test]
-    fn delete_oauth_tokens_removes_all_storage() -> Result<()> {
+    fn delete_oauth_tokens_removes_active_storage() -> Result<()> {
         let _env = TempCodexHome::new();
         let store = MockKeyringStore::default();
         let tokens = sample_tokens();
         let key = super::compute_store_key(&tokens.server_name, &tokens.url)?;
         let value = serde_json::to_value(&tokens)?;
-        save_split_json_to_keyring(&store, KEYRING_SERVICE, &key, &value)?;
-        let serialized = serde_json::to_string(&tokens)?;
-        store.save(KEYRING_SERVICE, &key, &serialized)?;
+        save_json_to_keyring(&store, KEYRING_SERVICE, &key, &value)?;
         super::save_oauth_tokens_to_file(&tokens)?;
 
         let removed = super::delete_oauth_tokens_from_keyring_and_file(
@@ -928,7 +918,7 @@ mod tests {
         let tokens = sample_tokens();
         let key = super::compute_store_key(&tokens.server_name, &tokens.url)?;
         let value = serde_json::to_value(&tokens)?;
-        save_split_json_to_keyring(&store, KEYRING_SERVICE, &key, &value)?;
+        save_json_to_keyring(&store, KEYRING_SERVICE, &key, &value)?;
         assert!(
             super::load_oauth_tokens_from_keyring(&store, &tokens.server_name, &tokens.url)?
                 .is_some()

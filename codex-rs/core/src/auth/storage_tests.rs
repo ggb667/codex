@@ -292,7 +292,16 @@ fn keyring_auth_storage_load_supports_legacy_single_entry() -> anyhow::Result<()
     )?;
 
     let loaded = storage.load()?;
-    assert_eq!(Some(expected), loaded);
+
+    #[cfg(not(windows))]
+    {
+        assert_eq!(Some(expected), loaded);
+    }
+
+    #[cfg(windows)]
+    {
+        assert_eq!(None, loaded);
+    }
     Ok(())
 }
 
@@ -304,25 +313,6 @@ fn keyring_auth_storage_load_returns_deserialized_keyring_auth() -> anyhow::Resu
     let expected = auth_with_prefix("keyring");
 
     storage.save(&expected)?;
-
-    let loaded = storage.load()?;
-    assert_eq!(Some(expected), loaded);
-    Ok(())
-}
-
-#[test]
-fn keyring_auth_storage_load_supports_split_json_compatibility() -> anyhow::Result<()> {
-    let codex_home = tempdir()?;
-    let mock_keyring = MockKeyringStore::default();
-    let storage = KeyringAuthStorage::new(
-        codex_home.path().to_path_buf(),
-        Arc::new(mock_keyring.clone()),
-    );
-    let expected = auth_with_prefix("split-compat");
-    let key = compute_store_key(codex_home.path())?;
-    let value = serde_json::to_value(&expected)?;
-
-    codex_keyring_store::save_split_json_to_keyring(&mock_keyring, KEYRING_SERVICE, &key, &value)?;
 
     let loaded = storage.load()?;
     assert_eq!(Some(expected), loaded);
