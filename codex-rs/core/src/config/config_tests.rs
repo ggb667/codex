@@ -1629,7 +1629,8 @@ fn resolve_tool_feature_overrides_profile_web_search_config_only_inherits_disabl
 }
 
 #[test]
-fn resolve_tool_feature_overrides_web_search_config_only_defaults_to_enabled_when_both_layers_present() {
+fn resolve_tool_feature_overrides_web_search_config_only_defaults_to_enabled_when_both_layers_present()
+ {
     let cfg = ConfigToml {
         tools: Some(ToolsToml {
             web_search: Some(WebSearchFeatureToml {

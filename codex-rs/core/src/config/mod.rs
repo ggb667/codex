@@ -2216,12 +2216,10 @@ fn resolve_tool_feature_overrides(
             profile.and_then(|tools| tools.web_search.as_ref()),
             base.and_then(|tools| tools.web_search.as_ref()),
         ) {
-            (Some(profile_web_search), Some(base_web_search)) => {
-                profile_web_search
-                    .enabled
-                    .or(base_web_search.enabled)
-                    .or(Some(true))
-            }
+            (Some(profile_web_search), Some(base_web_search)) => profile_web_search
+                .enabled
+                .or(base_web_search.enabled)
+                .or(Some(true)),
             (Some(profile_web_search), None) => Some(profile_web_search.is_enabled()),
             (None, Some(base_web_search)) => Some(base_web_search.is_enabled()),
             (None, None) => None,
