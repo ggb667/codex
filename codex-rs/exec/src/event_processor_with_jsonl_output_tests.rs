@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use codex_app_server_protocol::CommandAction;
+use codex_app_server_protocol::CommandExecutionSource;
 use codex_app_server_protocol::CommandExecutionStatus as ApiCommandExecutionStatus;
 use codex_app_server_protocol::ErrorNotification;
 use codex_app_server_protocol::ItemCompletedNotification;
@@ -125,6 +126,7 @@ fn command_execution_started_and_completed_translate_to_thread_events() {
         command: "ls".to_string(),
         cwd: PathBuf::from("/tmp/project"),
         process_id: Some("123".to_string()),
+        source: CommandExecutionSource::UserShell,
         status: ApiCommandExecutionStatus::InProgress,
         command_actions: Vec::<CommandAction>::new(),
         aggregated_output: None,
@@ -163,6 +165,7 @@ fn command_execution_started_and_completed_translate_to_thread_events() {
                 command: "ls".to_string(),
                 cwd: PathBuf::from("/tmp/project"),
                 process_id: Some("123".to_string()),
+                source: CommandExecutionSource::UserShell,
                 status: ApiCommandExecutionStatus::Completed,
                 command_actions: Vec::<CommandAction>::new(),
                 aggregated_output: Some("a.txt\n".to_string()),
