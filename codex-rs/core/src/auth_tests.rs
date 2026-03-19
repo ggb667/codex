@@ -279,7 +279,7 @@ async fn stale_proactive_refresh_without_account_id_still_recovers_newer_local_a
     let newer_auth = managed_auth_dot_json(
         "newer-access",
         "newer-refresh",
-        Some("account-id"),
+        None,
         "user-123",
         "user@example.com",
         Utc::now(),
@@ -291,51 +291,6 @@ async fn stale_proactive_refresh_without_account_id_still_recovers_newer_local_a
     )
     .expect("persist newer auth");
 
-    let refreshed = ctx.auth_manager.auth().await.expect("auth should exist");
-    assert_eq!(
-        refreshed.get_token_data().expect("token data").access_token,
-        "newer-access"
-    );
-
-    server.verify().await;
-}
-
-#[tokio::test]
-#[serial(codex_api_key)]
-async fn stale_proactive_refresh_with_account_id_recovers_same_user_legacy_auth() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/oauth/token"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(0)
-        .mount(&server)
-        .await;
-
-    let ctx = RefreshTokenTestContext::new(&server);
-    let stale_auth = managed_auth_dot_json(
-        "stale-access",
-        "stale-refresh",
-        Some("account-id"),
-        "user-123",
-        "user@example.com",
-        refresh_time_days_ago(31),
-    );
-    ctx.write_auth(&stale_auth);
-
-    let newer_auth = managed_auth_dot_json(
-        "newer-access",
-        "newer-refresh",
-        None,
-        "user-123",
-        "user@example.com",
-        Utc::now(),
-    );
-    save_auth(
-        ctx.codex_home.path(),
-        &newer_auth,
-        AuthCredentialsStoreMode::File,
-    )
-    .expect("persist newer legacy auth");
     let refreshed = ctx.auth_manager.auth().await.expect("auth should exist");
     assert_eq!(
         refreshed.get_token_data().expect("token data").access_token,
@@ -414,7 +369,65 @@ async fn stale_proactive_refresh_does_not_overwrite_a_different_account_on_disk(
 
 #[tokio::test]
 #[serial(codex_api_key)]
-async fn refresh_token_reused_without_account_id_recovers_same_user_that_gained_account_id() {
+async fn stale_proactive_refresh_without_account_id_does_not_adopt_auth_with_account_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let ctx = RefreshTokenTestContext::new(&server);
+    let stale_auth = managed_auth_dot_json(
+        "stale-access",
+        "stale-refresh",
+        None,
+        "user-a",
+        "user-a@example.com",
+        refresh_time_days_ago(31),
+    );
+    ctx.write_auth(&stale_auth);
+
+    let newer_auth = managed_auth_dot_json(
+        "newer-access",
+        "newer-refresh",
+        Some("account-id"),
+        "user-a",
+        "user-a@example.com",
+        Utc::now(),
+    );
+    save_auth(
+        ctx.codex_home.path(),
+        &newer_auth,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("persist same-user auth with account id");
+
+    let returned_auth = ctx.auth_manager.auth().await.expect("auth should exist");
+    assert_eq!(
+        returned_auth
+            .get_token_data()
+            .expect("token data")
+            .access_token,
+        "stale-access"
+    );
+    assert_eq!(
+        CodexAuth::from_auth_storage(ctx.codex_home.path(), AuthCredentialsStoreMode::File)
+            .expect("load auth from disk")
+            .expect("persisted auth")
+            .get_token_data()
+            .expect("token data")
+            .access_token,
+        "newer-access"
+    );
+
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial(codex_api_key)]
+async fn refresh_token_reused_without_account_id_keeps_relogin_when_disk_auth_gains_account_id() {
     let server = MockServer::start().await;
     let ctx = Arc::new(RefreshTokenTestContext::new(&server));
     let stale_auth = managed_auth_dot_json(
@@ -455,7 +468,7 @@ async fn refresh_token_reused_without_account_id_recovers_same_user_that_gained_
     ctx.auth_manager
         .refresh_token_from_authority()
         .await
-        .expect("same-user legacy auth should recover");
+        .expect_err("auth with a new account id should not be adopted");
     assert_eq!(
         ctx.auth_manager
             .auth_cached()
@@ -463,64 +476,7 @@ async fn refresh_token_reused_without_account_id_recovers_same_user_that_gained_
             .get_token_data()
             .expect("token data")
             .access_token,
-        "newer-access"
-    );
-
-    server.verify().await;
-}
-
-#[tokio::test]
-#[serial(codex_api_key)]
-async fn refresh_token_reused_with_account_id_recovers_same_user_legacy_auth() {
-    let server = MockServer::start().await;
-    let ctx = Arc::new(RefreshTokenTestContext::new(&server));
-    let stale_auth = managed_auth_dot_json(
-        "stale-access",
-        "stale-refresh",
-        Some("account-id"),
-        "user-a",
-        "user-a@example.com",
-        refresh_time_days_ago(31),
-    );
-    ctx.write_auth(&stale_auth);
-
-    let newer_auth = managed_auth_dot_json(
-        "newer-access",
-        "newer-refresh",
-        None,
-        "user-a",
-        "user-a@example.com",
-        Utc::now(),
-    );
-    let ctx_for_response = Arc::clone(&ctx);
-    Mock::given(method("POST"))
-        .and(path("/oauth/token"))
-        .respond_with(move |_: &Request| {
-            save_auth(
-                ctx_for_response.codex_home.path(),
-                &newer_auth,
-                AuthCredentialsStoreMode::File,
-            )
-            .expect("persist same-user legacy auth during reused-token response");
-            ResponseTemplate::new(401)
-                .set_body_json(json!({"error": {"code": "refresh_token_reused"}}))
-        })
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    ctx.auth_manager
-        .refresh_token_from_authority()
-        .await
-        .expect("same-user legacy auth should recover");
-    assert_eq!(
-        ctx.auth_manager
-            .auth_cached()
-            .expect("cached auth")
-            .get_token_data()
-            .expect("token data")
-            .access_token,
-        "newer-access"
+        "stale-access"
     );
 
     server.verify().await;

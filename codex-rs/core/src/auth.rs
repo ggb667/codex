@@ -1169,37 +1169,26 @@ impl AuthManager {
     fn reload_for_refresh(&self, cached_auth: &CodexAuth) -> ReloadOutcome {
         let new_auth = self.load_auth_from_storage();
 
-        // `account_id` is the ChatGPT workspace/account boundary; if it is missing, only reload from disk when chatgpt_user_id or email still match.
         if let Some(expected_account_id) = cached_auth.get_account_id() {
-            let new_account_id = new_auth.as_ref().and_then(CodexAuth::get_account_id);
-            if new_account_id.as_deref() == Some(expected_account_id.as_str()) {
-                tracing::info!("Reloading auth for account {expected_account_id}");
-            } else if new_account_id.is_none()
-                && new_auth
-                    .as_ref()
-                    .is_some_and(|new_auth| Self::same_refresh_identity(cached_auth, new_auth))
-            {
-                tracing::info!(
-                    "Reloading auth from an older on-disk auth file without an account id because the user still matches."
-                );
-            } else {
-                let found_account_id = new_account_id.as_deref().unwrap_or("unknown");
-                tracing::info!(
-                    "Skipping auth reload during refresh (expected account id: {expected_account_id}, found: {found_account_id})"
-                );
-                return ReloadOutcome::Skipped;
-            }
-        } else {
-            tracing::info!("Reloading auth because account id is unavailable.");
-            if !new_auth
-                .as_ref()
-                .is_some_and(|new_auth| Self::same_refresh_identity(cached_auth, new_auth))
-            {
-                tracing::info!(
-                    "Skipping auth reload because the on-disk auth is not the same user during refresh."
-                );
-                return ReloadOutcome::Skipped;
-            }
+            return self.reload_if_account_id_matches(Some(expected_account_id.as_str()));
+        }
+
+        // Without account_id, only reload when both auth files are missing it and the same user claims still match.
+        let Some(new_auth_ref) = new_auth.as_ref() else {
+            tracing::info!("Skipping auth reload because no auth is available on disk.");
+            return ReloadOutcome::Skipped;
+        };
+        if new_auth_ref.get_account_id().is_some() {
+            tracing::info!(
+                "Skipping auth reload because the on-disk auth has an account id and the cached auth does not."
+            );
+            return ReloadOutcome::Skipped;
+        }
+        if !Self::same_refresh_identity(cached_auth, new_auth_ref) {
+            tracing::info!(
+                "Skipping auth reload because the on-disk auth is not the same user during refresh."
+            );
+            return ReloadOutcome::Skipped;
         }
 
         let auth_changed = !Self::auths_equal_for_refresh(Some(cached_auth), new_auth.as_ref());
@@ -1212,7 +1201,7 @@ impl AuthManager {
     }
 
     fn same_refresh_identity(cached_auth: &CodexAuth, new_auth: &CodexAuth) -> bool {
-        // Older auth files may lack account_id, so fall back to stable same-user claims.
+        // Older auth files may lack account_id, so fall back to stable same-user claims only in that case.
         let cached_user_id = cached_auth.get_chatgpt_user_id();
         let new_user_id = new_auth.get_chatgpt_user_id();
         if cached_user_id.is_some() && cached_user_id == new_user_id {
