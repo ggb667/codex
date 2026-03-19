@@ -256,6 +256,59 @@ async fn stale_proactive_refresh_uses_newer_local_auth_before_spending_cached_re
 
 #[tokio::test]
 #[serial(codex_api_key)]
+async fn stale_proactive_refresh_uses_caller_snapshot_when_cache_already_changed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let ctx = RefreshTokenTestContext::new(&server);
+    let stale_auth = managed_auth_dot_json(
+        "stale-access",
+        "stale-refresh",
+        Some("account-id"),
+        "user-123",
+        "user@example.com",
+        refresh_time_days_ago(31),
+    );
+    ctx.write_auth(&stale_auth);
+    let stale_cached_auth = ctx.auth_manager.auth_cached().expect("cached auth");
+
+    let newer_auth = managed_auth_dot_json(
+        "newer-access",
+        "newer-refresh",
+        Some("account-id"),
+        "user-123",
+        "user@example.com",
+        Utc::now(),
+    );
+    ctx.write_auth(&newer_auth);
+
+    assert_eq!(
+        ctx.auth_manager
+            .refresh_if_stale(&stale_cached_auth)
+            .await
+            .expect("refresh should succeed"),
+        true
+    );
+    assert_eq!(
+        ctx.auth_manager
+            .auth_cached()
+            .expect("cached auth")
+            .get_token_data()
+            .expect("token data")
+            .access_token,
+        "newer-access"
+    );
+
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial(codex_api_key)]
 async fn stale_proactive_refresh_without_account_id_still_recovers_newer_local_auth() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

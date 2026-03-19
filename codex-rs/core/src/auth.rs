@@ -981,10 +981,11 @@ impl UnauthorizedRecovery {
 
         match self.step {
             UnauthorizedRecoveryStep::Reload => {
-                match self
-                    .manager
-                    .reload_if_account_id_matches(self.expected_account_id.as_deref())
-                {
+                let cached_auth = self.manager.auth_cached();
+                match self.manager.reload_if_account_id_matches(
+                    cached_auth.as_ref(),
+                    self.expected_account_id.as_deref(),
+                ) {
                     ReloadOutcome::ReloadedChanged => {
                         self.step = UnauthorizedRecoveryStep::RefreshToken;
                         return Ok(UnauthorizedRecoveryStepResult {
@@ -1134,7 +1135,11 @@ impl AuthManager {
         self.set_cached_auth(new_auth)
     }
 
-    fn reload_if_account_id_matches(&self, expected_account_id: Option<&str>) -> ReloadOutcome {
+    fn reload_if_account_id_matches(
+        &self,
+        cached_auth: Option<&CodexAuth>,
+        expected_account_id: Option<&str>,
+    ) -> ReloadOutcome {
         let expected_account_id = match expected_account_id {
             Some(account_id) => account_id,
             None => {
@@ -1155,9 +1160,7 @@ impl AuthManager {
         }
 
         tracing::info!("Reloading auth for account {expected_account_id}");
-        let cached_before_reload = self.auth_cached();
-        let auth_changed =
-            !Self::auths_equal_for_refresh(cached_before_reload.as_ref(), new_auth.as_ref());
+        let auth_changed = !Self::auths_equal_for_refresh(cached_auth, new_auth.as_ref());
         self.set_cached_auth(new_auth);
         if auth_changed {
             ReloadOutcome::ReloadedChanged
@@ -1170,7 +1173,10 @@ impl AuthManager {
         let new_auth = self.load_auth_from_storage();
 
         if let Some(expected_account_id) = cached_auth.get_account_id() {
-            return self.reload_if_account_id_matches(Some(expected_account_id.as_str()));
+            return self.reload_if_account_id_matches(
+                Some(cached_auth),
+                Some(expected_account_id.as_str()),
+            );
         }
 
         // Without account_id, only reload when both auth files are missing it and the same user claims still match.
@@ -1329,7 +1335,10 @@ impl AuthManager {
             .as_ref()
             .and_then(CodexAuth::get_account_id);
 
-        match self.reload_if_account_id_matches(expected_account_id.as_deref()) {
+        match self.reload_if_account_id_matches(
+            auth_before_reload.as_ref(),
+            expected_account_id.as_deref(),
+        ) {
             ReloadOutcome::ReloadedChanged => {
                 tracing::info!("Skipping token refresh because auth changed after guarded reload.");
                 Ok(())
