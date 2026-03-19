@@ -1261,7 +1261,7 @@ enabled = false
     }
 
     #[tokio::test]
-    async fn fetch_cloud_requirements_recovers_after_unauthorized_reload() {
+    async fn fetch_cloud_requirements_uses_reloaded_auth_before_unauthorized_retry() {
         let auth = managed_auth_context(
             "business",
             Some("user-12345"),
@@ -1309,11 +1309,11 @@ enabled = false
                 network: None,
             }))
         );
-        assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn fetch_cloud_requirements_recovers_after_unauthorized_reload_updates_cache_identity() {
+    async fn fetch_cloud_requirements_reloads_auth_before_updating_cache_identity() {
         let auth = managed_auth_context(
             "business",
             Some("user-12345"),
@@ -1374,7 +1374,7 @@ enabled = false
             cache_file.signed_payload.account_id,
             Some("account-12345".to_string())
         );
-        assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
