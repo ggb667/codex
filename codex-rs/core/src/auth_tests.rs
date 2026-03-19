@@ -6,15 +6,24 @@ use crate::config::ConfigBuilder;
 use crate::token_data::IdTokenInfo;
 use crate::token_data::KnownPlan as InternalKnownPlan;
 use crate::token_data::PlanType as InternalPlanType;
+use crate::token_data::TokenData;
 use codex_protocol::account::PlanType as AccountPlanType;
 
 use base64::Engine;
+use chrono::DateTime;
+use chrono::Duration;
 use codex_protocol::config_types::ForcedLoginMethod;
 use pretty_assertions::assert_eq;
 use serde::Serialize;
 use serde_json::json;
 use std::sync::Arc;
 use tempfile::tempdir;
+use wiremock::Mock;
+use wiremock::MockServer;
+use wiremock::Request;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 #[tokio::test]
 async fn refresh_without_id_token() {
@@ -199,6 +208,309 @@ fn unauthorized_recovery_reports_mode_and_step_names() {
     assert_eq!(external.step_name(), "external_refresh");
 }
 
+#[tokio::test]
+#[serial(codex_api_key)]
+async fn stale_proactive_refresh_uses_newer_local_auth_before_spending_cached_refresh_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let ctx = RefreshTokenTestContext::new(&server);
+    let stale_auth = managed_auth_dot_json(
+        "stale-access",
+        "stale-refresh",
+        Some("account-id"),
+        "user-123",
+        "user@example.com",
+        refresh_time_days_ago(31),
+    );
+    ctx.write_auth(&stale_auth);
+
+    let newer_auth = managed_auth_dot_json(
+        "newer-access",
+        "newer-refresh",
+        Some("account-id"),
+        "user-123",
+        "user@example.com",
+        Utc::now(),
+    );
+    save_auth(
+        ctx.codex_home.path(),
+        &newer_auth,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("persist newer auth");
+
+    let refreshed = ctx.auth_manager.auth().await.expect("auth should exist");
+    assert_eq!(
+        refreshed.get_token_data().expect("token data").access_token,
+        "newer-access"
+    );
+
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial(codex_api_key)]
+async fn stale_proactive_refresh_without_account_id_still_recovers_newer_local_auth() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let ctx = RefreshTokenTestContext::new(&server);
+    let stale_auth = managed_auth_dot_json(
+        "stale-access",
+        "stale-refresh",
+        None,
+        "user-123",
+        "user@example.com",
+        refresh_time_days_ago(31),
+    );
+    ctx.write_auth(&stale_auth);
+
+    let newer_auth = managed_auth_dot_json(
+        "newer-access",
+        "newer-refresh",
+        Some("account-id"),
+        "user-123",
+        "user@example.com",
+        Utc::now(),
+    );
+    save_auth(
+        ctx.codex_home.path(),
+        &newer_auth,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("persist newer auth");
+
+    let refreshed = ctx.auth_manager.auth().await.expect("auth should exist");
+    assert_eq!(
+        refreshed.get_token_data().expect("token data").access_token,
+        "newer-access"
+    );
+
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial(codex_api_key)]
+async fn refresh_token_reused_without_account_id_recovers_same_user_that_gained_account_id() {
+    let server = MockServer::start().await;
+    let ctx = Arc::new(RefreshTokenTestContext::new(&server));
+    let stale_auth = managed_auth_dot_json(
+        "stale-access",
+        "stale-refresh",
+        None,
+        "user-a",
+        "user-a@example.com",
+        refresh_time_days_ago(31),
+    );
+    ctx.write_auth(&stale_auth);
+
+    let newer_auth = managed_auth_dot_json(
+        "newer-access",
+        "newer-refresh",
+        Some("account-id"),
+        "user-a",
+        "user-a@example.com",
+        Utc::now(),
+    );
+    let ctx_for_response = Arc::clone(&ctx);
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(move |_: &Request| {
+            save_auth(
+                ctx_for_response.codex_home.path(),
+                &newer_auth,
+                AuthCredentialsStoreMode::File,
+            )
+            .expect("persist same-user auth during reused-token response");
+            ResponseTemplate::new(401)
+                .set_body_json(json!({"error": {"code": "refresh_token_reused"}}))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    ctx.auth_manager
+        .refresh_token_from_authority()
+        .await
+        .expect("same-user legacy auth should recover");
+    assert_eq!(
+        ctx.auth_manager
+            .auth_cached()
+            .expect("cached auth")
+            .get_token_data()
+            .expect("token data")
+            .access_token,
+        "newer-access"
+    );
+
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial(codex_api_key)]
+async fn refresh_token_reused_without_account_id_does_not_cross_legacy_identity_boundary() {
+    let server = MockServer::start().await;
+    let ctx = Arc::new(RefreshTokenTestContext::new(&server));
+    let stale_auth = managed_auth_dot_json(
+        "stale-access",
+        "stale-refresh",
+        None,
+        "user-a",
+        "user-a@example.com",
+        refresh_time_days_ago(31),
+    );
+    ctx.write_auth(&stale_auth);
+
+    let other_auth = managed_auth_dot_json(
+        "other-access",
+        "other-refresh",
+        None,
+        "user-b",
+        "user-b@example.com",
+        Utc::now(),
+    );
+    let ctx_for_response = Arc::clone(&ctx);
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(move |_: &Request| {
+            save_auth(
+                ctx_for_response.codex_home.path(),
+                &other_auth,
+                AuthCredentialsStoreMode::File,
+            )
+            .expect("persist other-user auth during reused-token response");
+            ResponseTemplate::new(401)
+                .set_body_json(json!({"error": {"code": "refresh_token_reused"}}))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let err = ctx
+        .auth_manager
+        .refresh_token_from_authority()
+        .await
+        .expect_err("legacy identity mismatch should still relogin");
+    assert_eq!(
+        err.failed_reason(),
+        Some(RefreshTokenFailedReason::Exhausted)
+    );
+    assert_eq!(
+        ctx.auth_manager
+            .auth_cached()
+            .expect("cached auth")
+            .get_token_data()
+            .expect("token data")
+            .access_token,
+        "stale-access"
+    );
+
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial(codex_api_key)]
+async fn refresh_token_reused_recovers_if_guarded_reload_finds_newer_auth() {
+    let server = MockServer::start().await;
+    let ctx = Arc::new(RefreshTokenTestContext::new(&server));
+    let stale_auth = managed_auth_dot_json(
+        "stale-access",
+        "stale-refresh",
+        Some("account-id"),
+        "user-123",
+        "user@example.com",
+        refresh_time_days_ago(31),
+    );
+    ctx.write_auth(&stale_auth);
+
+    let newer_auth = managed_auth_dot_json(
+        "newer-access",
+        "newer-refresh",
+        Some("account-id"),
+        "user-123",
+        "user@example.com",
+        Utc::now(),
+    );
+    let ctx_for_response = Arc::clone(&ctx);
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(move |_: &Request| {
+            save_auth(
+                ctx_for_response.codex_home.path(),
+                &newer_auth,
+                AuthCredentialsStoreMode::File,
+            )
+            .expect("persist newer auth during reused-token response");
+            ResponseTemplate::new(401)
+                .set_body_json(json!({"error": {"code": "refresh_token_reused"}}))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    ctx.auth_manager
+        .refresh_token()
+        .await
+        .expect("reload after reused token should recover");
+
+    let refreshed = ctx.auth_manager.auth_cached().expect("cached auth");
+    assert_eq!(
+        refreshed.get_token_data().expect("token data").access_token,
+        "newer-access"
+    );
+
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial(codex_api_key)]
+async fn refresh_token_reused_with_unchanged_local_auth_keeps_relogin_failure() {
+    let server = MockServer::start().await;
+    let ctx = RefreshTokenTestContext::new(&server);
+    let stale_auth = managed_auth_dot_json(
+        "stale-access",
+        "stale-refresh",
+        Some("account-id"),
+        "user-123",
+        "user@example.com",
+        refresh_time_days_ago(31),
+    );
+    ctx.write_auth(&stale_auth);
+
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_json(json!({"error": {"code": "refresh_token_reused"}})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let err = ctx
+        .auth_manager
+        .refresh_token()
+        .await
+        .expect_err("unchanged local auth should still surface relogin");
+    assert_eq!(
+        err.failed_reason(),
+        Some(RefreshTokenFailedReason::Exhausted)
+    );
+
+    server.verify().await;
+}
+
 struct AuthFileParams {
     openai_api_key: Option<String>,
     chatgpt_plan_type: Option<String>,
@@ -254,6 +566,90 @@ fn write_auth_file(params: AuthFileParams, codex_home: &Path) -> std::io::Result
     let auth_json = serde_json::to_string_pretty(&auth_json_data)?;
     std::fs::write(auth_file, auth_json)?;
     Ok(fake_jwt)
+}
+
+struct RefreshTokenTestContext {
+    codex_home: tempfile::TempDir,
+    auth_manager: Arc<AuthManager>,
+    _env_guard: EnvVarGuard,
+}
+
+impl RefreshTokenTestContext {
+    fn new(server: &MockServer) -> Self {
+        let codex_home = tempdir().expect("tempdir");
+        let endpoint = format!("{}/oauth/token", server.uri());
+        let env_guard = EnvVarGuard::set(REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR, &endpoint);
+        let auth_manager = AuthManager::shared(
+            codex_home.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        );
+        Self {
+            codex_home,
+            auth_manager,
+            _env_guard: env_guard,
+        }
+    }
+
+    fn write_auth(&self, auth_dot_json: &AuthDotJson) {
+        save_auth(
+            self.codex_home.path(),
+            auth_dot_json,
+            AuthCredentialsStoreMode::File,
+        )
+        .expect("write auth");
+        self.auth_manager.reload();
+    }
+}
+
+fn managed_auth_dot_json(
+    access_token: &str,
+    refresh_token: &str,
+    account_id: Option<&str>,
+    chatgpt_user_id: &str,
+    email: &str,
+    last_refresh: DateTime<Utc>,
+) -> AuthDotJson {
+    AuthDotJson {
+        auth_mode: Some(ApiAuthMode::Chatgpt),
+        openai_api_key: None,
+        tokens: Some(TokenData {
+            id_token: IdTokenInfo {
+                email: Some(email.to_string()),
+                chatgpt_user_id: Some(chatgpt_user_id.to_string()),
+                raw_jwt: minimal_jwt(),
+                ..IdTokenInfo::default()
+            },
+            access_token: access_token.to_string(),
+            refresh_token: refresh_token.to_string(),
+            account_id: account_id.map(str::to_owned),
+        }),
+        last_refresh: Some(last_refresh),
+    }
+}
+
+fn refresh_time_days_ago(days: i64) -> DateTime<Utc> {
+    Utc::now() - Duration::days(days)
+}
+
+fn minimal_jwt() -> String {
+    #[derive(Serialize)]
+    struct Header {
+        alg: &'static str,
+        typ: &'static str,
+    }
+
+    let header = Header {
+        alg: "none",
+        typ: "JWT",
+    };
+    let payload = json!({ "sub": "user-123" });
+
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let header_b64 = b64(&serde_json::to_vec(&header).expect("serialize header"));
+    let payload_b64 = b64(&serde_json::to_vec(&payload).expect("serialize payload"));
+    let signature_b64 = b64(b"sig");
+    format!("{header_b64}.{payload_b64}.{signature_b64}")
 }
 
 async fn build_config(

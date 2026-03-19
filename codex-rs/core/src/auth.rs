@@ -1166,6 +1166,49 @@ impl AuthManager {
         }
     }
 
+    fn reload_for_refresh(&self, cached_auth: &CodexAuth) -> ReloadOutcome {
+        match cached_auth.get_account_id() {
+            Some(expected_account_id) => {
+                self.reload_if_account_id_matches(Some(expected_account_id.as_str()))
+            }
+            None => {
+                tracing::info!(
+                    "Reloading auth with legacy identity guard for refresh because account id is unavailable."
+                );
+                let new_auth = self.load_auth_from_storage();
+                if !new_auth
+                    .as_ref()
+                    .is_some_and(|new_auth| Self::same_refresh_identity(cached_auth, new_auth))
+                {
+                    tracing::info!(
+                        "Skipping auth reload due to legacy identity mismatch during refresh."
+                    );
+                    return ReloadOutcome::Skipped;
+                }
+                let auth_changed =
+                    !Self::auths_equal_for_refresh(Some(cached_auth), new_auth.as_ref());
+                self.set_cached_auth(new_auth);
+                if auth_changed {
+                    ReloadOutcome::ReloadedChanged
+                } else {
+                    ReloadOutcome::ReloadedNoChange
+                }
+            }
+        }
+    }
+
+    fn same_refresh_identity(cached_auth: &CodexAuth, new_auth: &CodexAuth) -> bool {
+        let cached_user_id = cached_auth.get_chatgpt_user_id();
+        let new_user_id = new_auth.get_chatgpt_user_id();
+        if cached_user_id.is_some() && cached_user_id == new_user_id {
+            return true;
+        }
+
+        let cached_email = cached_auth.get_account_email();
+        let new_email = new_auth.get_account_email();
+        cached_email.is_some() && cached_email == new_email
+    }
+
     fn auths_equal_for_refresh(a: Option<&CodexAuth>, b: Option<&CodexAuth>) -> bool {
         match (a, b) {
             (None, None) => true,
@@ -1313,15 +1356,28 @@ impl AuthManager {
                 self.refresh_external_auth(ExternalAuthRefreshReason::Unauthorized)
                     .await
             }
-            CodexAuth::Chatgpt(chatgpt_auth) => {
+            CodexAuth::Chatgpt(ref chatgpt_auth) => {
                 let token_data = chatgpt_auth.current_token_data().ok_or_else(|| {
                     RefreshTokenError::Transient(std::io::Error::other(
                         "Token data is not available.",
                     ))
                 })?;
-                self.refresh_and_persist_chatgpt_token(&chatgpt_auth, token_data.refresh_token)
-                    .await?;
-                Ok(())
+                match self
+                    .refresh_and_persist_chatgpt_token(chatgpt_auth, token_data.refresh_token)
+                    .await
+                {
+                    Err(RefreshTokenError::Permanent(error))
+                        if error.reason == RefreshTokenFailedReason::Exhausted =>
+                    {
+                        match self.reload_for_refresh(&auth) {
+                            ReloadOutcome::ReloadedChanged => Ok(()),
+                            ReloadOutcome::ReloadedNoChange | ReloadOutcome::Skipped => {
+                                Err(RefreshTokenError::Permanent(error))
+                            }
+                        }
+                    }
+                    other => other,
+                }
             }
             CodexAuth::ApiKey(_) => Ok(()),
         }
@@ -1367,8 +1423,17 @@ impl AuthManager {
         if last_refresh >= Utc::now() - chrono::Duration::days(TOKEN_REFRESH_INTERVAL) {
             return Ok(false);
         }
-        self.refresh_and_persist_chatgpt_token(chatgpt_auth, tokens.refresh_token)
-            .await?;
+        match self.reload_for_refresh(auth) {
+            ReloadOutcome::ReloadedChanged => {
+                tracing::info!(
+                    "Skipping token refresh because auth changed after proactive reload."
+                );
+            }
+            ReloadOutcome::ReloadedNoChange | ReloadOutcome::Skipped => {
+                self.refresh_and_persist_chatgpt_token(chatgpt_auth, tokens.refresh_token)
+                    .await?;
+            }
+        }
         Ok(true)
     }
 
