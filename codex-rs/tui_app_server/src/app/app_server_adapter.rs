@@ -1301,10 +1301,6 @@ mod tests {
     use codex_app_server_protocol::TurnCompletedNotification;
     use codex_app_server_protocol::TurnError;
     use codex_app_server_protocol::TurnStatus;
-    use codex_core::auth::AuthCredentialsStoreMode;
-    use codex_core::auth::AuthDotJson;
-    use codex_core::auth::save_auth;
-    use codex_core::token_data::TokenData;
     use codex_protocol::ThreadId;
     use codex_protocol::items::AgentMessageContent;
     use codex_protocol::items::AgentMessageItem;
