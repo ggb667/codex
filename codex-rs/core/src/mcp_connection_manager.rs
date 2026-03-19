@@ -71,6 +71,7 @@ use serde::Serialize;
 use sha1::Digest;
 use sha1::Sha1;
 use tokio::sync::Mutex;
+use tokio::sync::OwnedMutexGuard;
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -240,6 +241,14 @@ enum CachedCodexAppsToolsLoad {
 
 type ResponderMap = HashMap<(String, RequestId), oneshot::Sender<ElicitationResponse>>;
 
+fn decline_elicitation_response() -> ElicitationResponse {
+    ElicitationResponse {
+        action: ElicitationAction::Decline,
+        content: None,
+        meta: None,
+    }
+}
+
 fn elicitation_is_rejected_by_policy(approval_policy: AskForApproval) -> bool {
     match approval_policy {
         AskForApproval::Never => true,
@@ -278,84 +287,66 @@ impl ElicitationRequestManager {
             .send(response)
             .map_err(|e| anyhow!("failed to send elicitation response: {e:?}"))
     }
+}
 
-    fn make_sender(&self, server_name: String, tx_event: Sender<Event>) -> SendElicitation {
-        let elicitation_requests = self.requests.clone();
-        let approval_policy = self.approval_policy.clone();
+#[derive(Clone)]
+struct SharedElicitationRouter {
+    active_request: Arc<Mutex<()>>,
+    active_session: Arc<StdMutex<Option<SessionMcpHandle>>>,
+}
+
+impl SharedElicitationRouter {
+    fn new() -> Self {
+        Self {
+            active_request: Arc::new(Mutex::new(())),
+            active_session: Arc::new(StdMutex::new(None)),
+        }
+    }
+
+    async fn bind_session(&self, session_handle: SessionMcpHandle) -> ActiveElicitationRequest {
+        let active_request = Arc::clone(&self.active_request).lock_owned().await;
+        if let Ok(mut active_session) = self.active_session.lock() {
+            *active_session = Some(session_handle);
+        }
+        ActiveElicitationRequest {
+            _active_request: active_request,
+            active_session: Arc::clone(&self.active_session),
+        }
+    }
+
+    fn make_sender(&self, server_name: String) -> SendElicitation {
+        let active_session = Arc::clone(&self.active_session);
         Box::new(move |id, elicitation| {
-            let elicitation_requests = elicitation_requests.clone();
-            let tx_event = tx_event.clone();
+            let active_session = Arc::clone(&active_session);
             let server_name = server_name.clone();
-            let approval_policy = approval_policy.clone();
             async move {
-                if approval_policy
-                    .lock()
-                    .is_ok_and(|policy| elicitation_is_rejected_by_policy(*policy))
-                {
-                    return Ok(ElicitationResponse {
-                        action: ElicitationAction::Decline,
-                        content: None,
-                        meta: None,
-                    });
-                }
-
-                let request = match elicitation {
-                    CreateElicitationRequestParams::FormElicitationParams {
-                        meta,
-                        message,
-                        requested_schema,
-                    } => ElicitationRequest::Form {
-                        meta: meta
-                            .map(serde_json::to_value)
-                            .transpose()
-                            .context("failed to serialize MCP elicitation metadata")?,
-                        message,
-                        requested_schema: serde_json::to_value(requested_schema)
-                            .context("failed to serialize MCP elicitation schema")?,
-                    },
-                    CreateElicitationRequestParams::UrlElicitationParams {
-                        meta,
-                        message,
-                        url,
-                        elicitation_id,
-                    } => ElicitationRequest::Url {
-                        meta: meta
-                            .map(serde_json::to_value)
-                            .transpose()
-                            .context("failed to serialize MCP elicitation metadata")?,
-                        message,
-                        url,
-                        elicitation_id,
-                    },
+                let Some(session_handle) =
+                    active_session.lock().ok().and_then(|guard| guard.clone())
+                else {
+                    warn!(
+                        "received MCP elicitation without an active session owner for server '{server_name}'"
+                    );
+                    return Ok(decline_elicitation_response());
                 };
-                let (tx, rx) = oneshot::channel();
-                {
-                    let mut lock = elicitation_requests.lock().await;
-                    lock.insert((server_name.clone(), id.clone()), tx);
-                }
-                let _ = tx_event
-                    .send(Event {
-                        id: "mcp_elicitation_request".to_string(),
-                        msg: EventMsg::ElicitationRequest(ElicitationRequestEvent {
-                            turn_id: None,
-                            server_name,
-                            id: match id.clone() {
-                                rmcp::model::NumberOrString::String(value) => {
-                                    ProtocolRequestId::String(value.to_string())
-                                }
-                                rmcp::model::NumberOrString::Number(value) => {
-                                    ProtocolRequestId::Integer(value)
-                                }
-                            },
-                            request,
-                        }),
-                    })
-                    .await;
-                rx.await
-                    .context("elicitation request channel closed unexpectedly")
+                session_handle
+                    .request_elicitation(server_name, id, elicitation)
+                    .await
             }
             .boxed()
         })
+    }
+}
+
+struct ActiveElicitationRequest {
+    _active_request: OwnedMutexGuard<()>,
+    active_session: Arc<StdMutex<Option<SessionMcpHandle>>>,
+}
+
+impl Drop for ActiveElicitationRequest {
+    fn drop(&mut self) {
+        if let Ok(mut active_session) = self.active_session.lock() {
+            *active_session = None;
+        }
     }
 }
 
@@ -367,6 +358,7 @@ struct ManagedClient {
     tool_timeout: Option<Duration>,
     server_supports_sandbox_state_capability: bool,
     codex_apps_tools_cache_context: Option<CodexAppsToolsCacheContext>,
+    elicitation_router: Option<SharedElicitationRouter>,
 }
 
 impl ManagedClient {
@@ -410,6 +402,16 @@ impl ManagedClient {
             .await?;
         Ok(())
     }
+
+    async fn bind_session(
+        &self,
+        session_handle: &SessionMcpHandle,
+    ) -> Option<ActiveElicitationRequest> {
+        match self.elicitation_router.as_ref() {
+            Some(router) => Some(router.bind_session(session_handle.clone()).await),
+            None => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -429,8 +431,7 @@ impl AsyncManagedClient {
         config: McpServerConfig,
         store_mode: OAuthCredentialsStoreMode,
         cancel_token: CancellationToken,
-        tx_event: Sender<Event>,
-        elicitation_requests: ElicitationRequestManager,
+        session_handle: SessionMcpHandle,
         codex_apps_tools_cache_context: Option<CodexAppsToolsCacheContext>,
         tool_plugin_provenance: Arc<ToolPluginProvenance>,
     ) -> Self {
@@ -441,6 +442,8 @@ impl AsyncManagedClient {
         )
         .map(|tools| filter_tools(tools, &tool_filter));
         let startup_tool_filter = tool_filter;
+        let elicitation_router =
+            elicitation_capability_for_server(&server_name).map(|_| SharedElicitationRouter::new());
         let startup_complete = Arc::new(AtomicBool::new(false));
         let startup_complete_for_fut = Arc::clone(&startup_complete);
         let fut = async move {
@@ -460,9 +463,9 @@ impl AsyncManagedClient {
                             .or(Some(DEFAULT_STARTUP_TIMEOUT)),
                         tool_timeout: config.tool_timeout_sec.unwrap_or(DEFAULT_TOOL_TIMEOUT),
                         tool_filter: startup_tool_filter,
-                        tx_event,
-                        elicitation_requests,
+                        session_handle,
                         codex_apps_tools_cache_context,
+                        elicitation_router,
                     },
                 )
                 .or_cancel(&cancel_token)
@@ -616,7 +619,6 @@ impl SharedMcpBackend {
         let mut clients = HashMap::new();
         let mut server_origins = HashMap::new();
         let mut join_set = JoinSet::new();
-        let elicitation_requests = session_handle.elicitation_requests();
         let tool_plugin_provenance = Arc::new(tool_plugin_provenance);
         let mcp_servers = mcp_servers.clone();
         for (server_name, cfg) in mcp_servers.into_iter().filter(|(_, cfg)| cfg.enabled) {
@@ -645,8 +647,7 @@ impl SharedMcpBackend {
                 cfg,
                 store_mode,
                 cancel_token.clone(),
-                tx_event.clone(),
-                elicitation_requests.clone(),
+                session_handle.clone(),
                 codex_apps_tools_cache_context,
                 Arc::clone(&tool_plugin_provenance),
             );
@@ -794,7 +795,10 @@ impl SharedMcpBackend {
     ///
     /// On success, the refreshed tools replace the cache contents. On failure,
     /// the existing cache remains unchanged.
-    async fn hard_refresh_codex_apps_tools_cache(&self) -> Result<()> {
+    async fn hard_refresh_codex_apps_tools_cache(
+        &self,
+        session_handle: &SessionMcpHandle,
+    ) -> Result<()> {
         let managed_client = self
             .clients
             .get(CODEX_APPS_MCP_SERVER_NAME)
@@ -802,6 +806,7 @@ impl SharedMcpBackend {
             .client()
             .await
             .context("failed to get client")?;
+        let _elicitation_request = managed_client.bind_session(session_handle).await;
 
         let list_start = Instant::now();
         let fetch_start = Instant::now();
@@ -835,7 +840,10 @@ impl SharedMcpBackend {
 
     /// Returns a single map that contains all resources. Each key is the
     /// server name and the value is a vector of resources.
-    async fn list_all_resources(&self) -> HashMap<String, Vec<Resource>> {
+    async fn list_all_resources(
+        &self,
+        session_handle: &SessionMcpHandle,
+    ) -> HashMap<String, Vec<Resource>> {
         let mut join_set = JoinSet::new();
 
         let clients_snapshot = &self.clients;
@@ -847,8 +855,10 @@ impl SharedMcpBackend {
             };
             let timeout = managed_client.tool_timeout;
             let client = managed_client.client.clone();
+            let session_handle = session_handle.clone();
 
             join_set.spawn(async move {
+                let _elicitation_request = managed_client.bind_session(&session_handle).await;
                 let mut collected: Vec<Resource> = Vec::new();
                 let mut cursor: Option<String> = None;
 
@@ -901,7 +911,10 @@ impl SharedMcpBackend {
 
     /// Returns a single map that contains all resource templates. Each key is the
     /// server name and the value is a vector of resource templates.
-    async fn list_all_resource_templates(&self) -> HashMap<String, Vec<ResourceTemplate>> {
+    async fn list_all_resource_templates(
+        &self,
+        session_handle: &SessionMcpHandle,
+    ) -> HashMap<String, Vec<ResourceTemplate>> {
         let mut join_set = JoinSet::new();
 
         let clients_snapshot = &self.clients;
@@ -913,8 +926,10 @@ impl SharedMcpBackend {
             };
             let client = managed_client.client.clone();
             let timeout = managed_client.tool_timeout;
+            let session_handle = session_handle.clone();
 
             join_set.spawn(async move {
+                let _elicitation_request = managed_client.bind_session(&session_handle).await;
                 let mut collected: Vec<ResourceTemplate> = Vec::new();
                 let mut cursor: Option<String> = None;
 
@@ -972,6 +987,7 @@ impl SharedMcpBackend {
     /// Invoke the tool indicated by the (server, tool) pair.
     async fn call_tool(
         &self,
+        session_handle: &SessionMcpHandle,
         server: &str,
         tool: &str,
         arguments: Option<serde_json::Value>,
@@ -982,6 +998,7 @@ impl SharedMcpBackend {
                 "tool '{tool}' is disabled for MCP server '{server}'"
             ));
         }
+        let _elicitation_request = client.bind_session(session_handle).await;
 
         let result: rmcp::model::CallToolResult = client
             .client
@@ -1009,11 +1026,13 @@ impl SharedMcpBackend {
     /// List resources from the specified server.
     async fn list_resources(
         &self,
+        session_handle: &SessionMcpHandle,
         server: &str,
         params: Option<PaginatedRequestParams>,
     ) -> Result<ListResourcesResult> {
         let managed = self.client_by_name(server).await?;
         let timeout = managed.tool_timeout;
+        let _elicitation_request = managed.bind_session(session_handle).await;
 
         managed
             .client
@@ -1025,12 +1044,14 @@ impl SharedMcpBackend {
     /// List resource templates from the specified server.
     async fn list_resource_templates(
         &self,
+        session_handle: &SessionMcpHandle,
         server: &str,
         params: Option<PaginatedRequestParams>,
     ) -> Result<ListResourceTemplatesResult> {
         let managed = self.client_by_name(server).await?;
         let client = managed.client.clone();
         let timeout = managed.tool_timeout;
+        let _elicitation_request = managed.bind_session(session_handle).await;
 
         client
             .list_resource_templates(params, timeout)
@@ -1041,6 +1062,7 @@ impl SharedMcpBackend {
     /// Read a resource from the specified server.
     async fn read_resource(
         &self,
+        session_handle: &SessionMcpHandle,
         server: &str,
         params: ReadResourceRequestParams,
     ) -> Result<ReadResourceResult> {
@@ -1048,6 +1070,7 @@ impl SharedMcpBackend {
         let client = managed.client.clone();
         let timeout = managed.tool_timeout;
         let uri = params.uri.clone();
+        let _elicitation_request = managed.bind_session(session_handle).await;
 
         client
             .read_resource(params, timeout)
@@ -1093,24 +1116,94 @@ impl SharedMcpBackend {
 
 #[derive(Clone)]
 struct SessionMcpHandle {
+    tx_event: Sender<Event>,
     elicitation_requests: ElicitationRequestManager,
 }
 
 impl SessionMcpHandle {
-    fn new(approval_policy: AskForApproval) -> Self {
+    fn new(approval_policy: AskForApproval, tx_event: Sender<Event>) -> Self {
         Self {
+            tx_event,
             elicitation_requests: ElicitationRequestManager::new(approval_policy),
         }
-    }
-
-    fn elicitation_requests(&self) -> ElicitationRequestManager {
-        self.elicitation_requests.clone()
     }
 
     fn set_approval_policy(&self, approval_policy: &Constrained<AskForApproval>) {
         if let Ok(mut policy) = self.elicitation_requests.approval_policy.lock() {
             *policy = approval_policy.value();
         }
+    }
+
+    async fn request_elicitation(
+        &self,
+        server_name: String,
+        id: RequestId,
+        elicitation: CreateElicitationRequestParams,
+    ) -> Result<ElicitationResponse> {
+        if self
+            .elicitation_requests
+            .approval_policy
+            .lock()
+            .is_ok_and(|policy| elicitation_is_rejected_by_policy(*policy))
+        {
+            return Ok(decline_elicitation_response());
+        }
+
+        let request = match elicitation {
+            CreateElicitationRequestParams::FormElicitationParams {
+                meta,
+                message,
+                requested_schema,
+            } => ElicitationRequest::Form {
+                meta: meta
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .context("failed to serialize MCP elicitation metadata")?,
+                message,
+                requested_schema: serde_json::to_value(requested_schema)
+                    .context("failed to serialize MCP elicitation schema")?,
+            },
+            CreateElicitationRequestParams::UrlElicitationParams {
+                meta,
+                message,
+                url,
+                elicitation_id,
+            } => ElicitationRequest::Url {
+                meta: meta
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .context("failed to serialize MCP elicitation metadata")?,
+                message,
+                url,
+                elicitation_id,
+            },
+        };
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut lock = self.elicitation_requests.requests.lock().await;
+            lock.insert((server_name.clone(), id.clone()), tx);
+        }
+        let _ = self
+            .tx_event
+            .send(Event {
+                id: "mcp_elicitation_request".to_string(),
+                msg: EventMsg::ElicitationRequest(ElicitationRequestEvent {
+                    turn_id: None,
+                    server_name,
+                    id: match id {
+                        rmcp::model::NumberOrString::String(value) => {
+                            ProtocolRequestId::String(value.to_string())
+                        }
+                        rmcp::model::NumberOrString::Number(value) => {
+                            ProtocolRequestId::Integer(value)
+                        }
+                    },
+                    request,
+                }),
+            })
+            .await;
+        rx.await
+            .context("elicitation request channel closed unexpectedly")
     }
 
     async fn resolve_elicitation(
@@ -1138,9 +1231,10 @@ impl McpConnectionManager {
     }
 
     pub(crate) fn new_uninitialized(approval_policy: &Constrained<AskForApproval>) -> Self {
+        let (tx_event, _rx_event) = async_channel::unbounded();
         Self::from_parts(
             Arc::new(SharedMcpBackend::new_uninitialized()),
-            SessionMcpHandle::new(approval_policy.value()),
+            SessionMcpHandle::new(approval_policy.value(), tx_event),
         )
     }
 
@@ -1175,7 +1269,7 @@ impl McpConnectionManager {
         codex_apps_tools_cache_key: CodexAppsToolsCacheKey,
         tool_plugin_provenance: ToolPluginProvenance,
     ) -> (Self, CancellationToken) {
-        let session = SessionMcpHandle::new(approval_policy.value());
+        let session = SessionMcpHandle::new(approval_policy.value(), tx_event.clone());
         let (backend, cancel_token) = SharedMcpBackend::new(
             mcp_servers,
             store_mode,
@@ -1229,19 +1323,23 @@ impl McpConnectionManager {
     /// On success, the refreshed tools replace the cache contents. On failure,
     /// the existing cache remains unchanged.
     pub async fn hard_refresh_codex_apps_tools_cache(&self) -> Result<()> {
-        self.backend.hard_refresh_codex_apps_tools_cache().await
+        self.backend
+            .hard_refresh_codex_apps_tools_cache(&self.session)
+            .await
     }
 
     /// Returns a single map that contains all resources. Each key is the
     /// server name and the value is a vector of resources.
     pub async fn list_all_resources(&self) -> HashMap<String, Vec<Resource>> {
-        self.backend.list_all_resources().await
+        self.backend.list_all_resources(&self.session).await
     }
 
     /// Returns a single map that contains all resource templates. Each key is the
     /// server name and the value is a vector of resource templates.
     pub async fn list_all_resource_templates(&self) -> HashMap<String, Vec<ResourceTemplate>> {
-        self.backend.list_all_resource_templates().await
+        self.backend
+            .list_all_resource_templates(&self.session)
+            .await
     }
 
     /// Invoke the tool indicated by the (server, tool) pair.
@@ -1251,7 +1349,9 @@ impl McpConnectionManager {
         tool: &str,
         arguments: Option<serde_json::Value>,
     ) -> Result<CallToolResult> {
-        self.backend.call_tool(server, tool, arguments).await
+        self.backend
+            .call_tool(&self.session, server, tool, arguments)
+            .await
     }
 
     /// List resources from the specified server.
@@ -1260,7 +1360,9 @@ impl McpConnectionManager {
         server: &str,
         params: Option<PaginatedRequestParams>,
     ) -> Result<ListResourcesResult> {
-        self.backend.list_resources(server, params).await
+        self.backend
+            .list_resources(&self.session, server, params)
+            .await
     }
 
     /// List resource templates from the specified server.
@@ -1269,7 +1371,9 @@ impl McpConnectionManager {
         server: &str,
         params: Option<PaginatedRequestParams>,
     ) -> Result<ListResourceTemplatesResult> {
-        self.backend.list_resource_templates(server, params).await
+        self.backend
+            .list_resource_templates(&self.session, server, params)
+            .await
     }
 
     /// Read a resource from the specified server.
@@ -1278,7 +1382,9 @@ impl McpConnectionManager {
         server: &str,
         params: ReadResourceRequestParams,
     ) -> Result<ReadResourceResult> {
-        self.backend.read_resource(server, params).await
+        self.backend
+            .read_resource(&self.session, server, params)
+            .await
     }
 
     pub async fn parse_tool_name(&self, tool_name: &str) -> Option<(String, String)> {
@@ -1488,9 +1594,9 @@ async fn start_server_task(
         startup_timeout,
         tool_timeout,
         tool_filter,
-        tx_event,
-        elicitation_requests,
+        session_handle,
         codex_apps_tools_cache_context,
+        elicitation_router,
     } = params;
     let elicitation = elicitation_capability_for_server(&server_name);
     let params = InitializeRequestParams {
@@ -1514,7 +1620,14 @@ async fn start_server_task(
         protocol_version: ProtocolVersion::V_2025_06_18,
     };
 
-    let send_elicitation = elicitation_requests.make_sender(server_name.clone(), tx_event);
+    let _active_elicitation_request = match elicitation_router.as_ref() {
+        Some(router) => Some(router.bind_session(session_handle).await),
+        None => None,
+    };
+    let send_elicitation = match elicitation_router.as_ref() {
+        Some(router) => router.make_sender(server_name.clone()),
+        None => Box::new(|_, _| async move { Ok(decline_elicitation_response()) }.boxed()),
+    };
 
     let initialize_result = client
         .initialize(params, startup_timeout, send_elicitation)
@@ -1559,6 +1672,7 @@ async fn start_server_task(
         tool_filter,
         server_supports_sandbox_state_capability,
         codex_apps_tools_cache_context,
+        elicitation_router,
     };
 
     Ok(managed)
@@ -1568,9 +1682,9 @@ struct StartServerTaskParams {
     startup_timeout: Option<Duration>, // TODO: cancel_token should handle this.
     tool_timeout: Duration,
     tool_filter: ToolFilter,
-    tx_event: Sender<Event>,
-    elicitation_requests: ElicitationRequestManager,
+    session_handle: SessionMcpHandle,
     codex_apps_tools_cache_context: Option<CodexAppsToolsCacheContext>,
+    elicitation_router: Option<SharedElicitationRouter>,
 }
 
 async fn make_rmcp_client(
@@ -2354,6 +2468,80 @@ mod tests {
             .expect("tool from startup cache");
         assert_eq!(tool.server_name, CODEX_APPS_MCP_SERVER_NAME);
         assert_eq!(tool.tool_name, "calendar_create_event");
+    }
+
+    #[tokio::test]
+    async fn shared_elicitation_router_routes_to_the_bound_session() {
+        let (tx_event, rx_event) = async_channel::unbounded();
+        let session = SessionMcpHandle::new(AskForApproval::OnRequest, tx_event);
+        let router = SharedElicitationRouter::new();
+        let _active_request = router.bind_session(session.clone()).await;
+        let send_elicitation = router.make_sender(CODEX_APPS_MCP_SERVER_NAME.to_string());
+        let request_id = RequestId::Number(7);
+        let expected_response = ElicitationResponse {
+            action: ElicitationAction::Accept,
+            content: Some(serde_json::json!({ "calendar": "primary" })),
+            meta: None,
+        };
+
+        let task = tokio::spawn(async move {
+            send_elicitation(
+                request_id,
+                CreateElicitationRequestParams::FormElicitationParams {
+                    meta: None,
+                    message: "Choose a calendar".to_string(),
+                    requested_schema: rmcp::model::ElicitationSchema::builder()
+                        .string_property("calendar", |property| property)
+                        .build()
+                        .expect("valid elicitation schema"),
+                },
+            )
+            .await
+        });
+
+        let event = rx_event.recv().await.expect("elicitation event");
+        let EventMsg::ElicitationRequest(event) = event.msg else {
+            panic!("expected elicitation request event");
+        };
+        assert_eq!(event.server_name, CODEX_APPS_MCP_SERVER_NAME);
+        assert_eq!(event.id, ProtocolRequestId::Integer(7));
+
+        session
+            .resolve_elicitation(
+                CODEX_APPS_MCP_SERVER_NAME.to_string(),
+                RequestId::Number(7),
+                expected_response.clone(),
+            )
+            .await
+            .expect("elicitation resolved");
+
+        let response = task
+            .await
+            .expect("elicitation task")
+            .expect("elicitation response");
+        assert_eq!(response, expected_response);
+    }
+
+    #[tokio::test]
+    async fn shared_elicitation_router_declines_without_an_active_session() {
+        let router = SharedElicitationRouter::new();
+        let send_elicitation = router.make_sender(CODEX_APPS_MCP_SERVER_NAME.to_string());
+
+        let response = send_elicitation(
+            RequestId::Number(8),
+            CreateElicitationRequestParams::FormElicitationParams {
+                meta: None,
+                message: "Choose a calendar".to_string(),
+                requested_schema: rmcp::model::ElicitationSchema::builder()
+                    .string_property("calendar", |property| property)
+                    .build()
+                    .expect("valid elicitation schema"),
+            },
+        )
+        .await
+        .expect("elicitation response");
+
+        assert_eq!(response, decline_elicitation_response());
     }
 
     #[test]
