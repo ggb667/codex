@@ -31,6 +31,7 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::io::Write as _;
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -75,11 +76,11 @@ impl ApplyPatchRuntime {
         let exe = req
             .codex_exe
             .clone()
-            .filter(is_codex_cli)
+            .filter(|path| is_codex_cli(path))
             .or_else(|| {
                 req.codex_exe
                     .as_ref()
-                    .and_then(resolve_adjacent_codex_cli)
+                    .and_then(|path| resolve_adjacent_codex_cli(path))
                     .filter(|path| path.is_file())
             })
             .or_else(|| resolve_current_codex_cli(_codex_home).ok().flatten());
@@ -239,14 +240,14 @@ impl ToolRuntime<ApplyPatchRequest, ExecToolCallOutput> for ApplyPatchRuntime {
     }
 }
 
-fn is_codex_cli(path: &PathBuf) -> bool {
+fn is_codex_cli(path: &Path) -> bool {
     matches!(
         path.file_name().and_then(|name| name.to_str()),
         Some("codex") | Some("codex.exe")
     )
 }
 
-fn resolve_adjacent_codex_cli(path: &PathBuf) -> Option<PathBuf> {
+fn resolve_adjacent_codex_cli(path: &Path) -> Option<PathBuf> {
     let sibling = if cfg!(windows) {
         path.with_file_name("codex.exe")
     } else {
