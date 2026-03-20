@@ -1476,7 +1476,6 @@ dependencies = [
  "codex-app-server-protocol",
  "codex-arg0",
  "codex-core",
- "codex-features",
  "codex-feedback",
  "codex-protocol",
  "futures",
