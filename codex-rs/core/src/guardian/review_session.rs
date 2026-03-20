@@ -382,7 +382,7 @@ impl GuardianReviewSessionManager {
         let spawn_cancel_token = CancellationToken::new();
         let review_session = match run_before_review_deadline_with_cancel(
             tokio::time::Instant::now() + GUARDIAN_EAGER_INIT_SPAWN_TIMEOUT,
-            None,
+            /*external_cancel*/ None,
             &spawn_cancel_token,
             Box::pin(spawn_guardian_review_session(
                 &params,
