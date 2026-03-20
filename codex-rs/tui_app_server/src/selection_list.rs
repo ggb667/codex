@@ -1,5 +1,6 @@
 use crate::render::renderable::Renderable;
 use crate::render::renderable::RowRenderable;
+use crate::ui_consts::prompt_glyph;
 use ratatui::style::Style;
 use ratatui::style::Styled as _;
 use ratatui::style::Stylize as _;
@@ -22,7 +23,7 @@ pub(crate) fn selection_option_row_with_dim(
     dim: bool,
 ) -> Box<dyn Renderable> {
     let prefix = if is_selected {
-        format!("› {}. ", index + 1)
+        format!("{} {}. ", prompt_glyph(), index + 1)
     } else {
         format!("  {}. ", index + 1)
     };

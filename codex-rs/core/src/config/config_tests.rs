@@ -239,6 +239,8 @@ fn config_toml_deserializes_model_availability_nux() {
             status_line: None,
             terminal_title: None,
             theme: None,
+            prompt_glyph: None,
+            prompt_background: None,
             model_availability_nux: ModelAvailabilityNuxConfig {
                 shown_count: HashMap::from([
                     ("gpt-bar".to_string(), 4),
@@ -904,6 +906,19 @@ fn tui_theme_defaults_to_none() {
 }
 
 #[test]
+fn tui_prompt_fields_deserialize_from_toml() {
+    let cfg = r##"
+[tui]
+prompt_glyph = "🎈"
+prompt_background = "#112233"
+"##;
+    let parsed = toml::from_str::<ConfigToml>(cfg).expect("TOML deserialization should succeed");
+    let tui = parsed.tui.expect("config should include tui section");
+    assert_eq!(tui.prompt_glyph.as_deref(), Some("🎈"));
+    assert_eq!(tui.prompt_background.as_deref(), Some("#112233"));
+}
+
+#[test]
 fn tui_config_missing_notifications_field_defaults_to_enabled() {
     let cfg = r#"
 [tui]
@@ -924,6 +939,8 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
             status_line: None,
             terminal_title: None,
             theme: None,
+            prompt_glyph: None,
+            prompt_background: None,
             model_availability_nux: ModelAvailabilityNuxConfig::default(),
         }
     );
@@ -4353,6 +4370,8 @@ fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
             tui_status_line: None,
             tui_terminal_title: None,
             tui_theme: None,
+            tui_prompt_glyph: None,
+            tui_prompt_background: None,
             otel: OtelConfig::default(),
         },
         o3_profile_config
@@ -4496,6 +4515,8 @@ fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
         tui_status_line: None,
         tui_terminal_title: None,
         tui_theme: None,
+        tui_prompt_glyph: None,
+        tui_prompt_background: None,
         otel: OtelConfig::default(),
     };
 
@@ -4637,6 +4658,8 @@ fn test_precedence_fixture_with_zdr_profile() -> std::io::Result<()> {
         tui_status_line: None,
         tui_terminal_title: None,
         tui_theme: None,
+        tui_prompt_glyph: None,
+        tui_prompt_background: None,
         otel: OtelConfig::default(),
     };
 
@@ -4764,6 +4787,8 @@ fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
         tui_status_line: None,
         tui_terminal_title: None,
         tui_theme: None,
+        tui_prompt_glyph: None,
+        tui_prompt_background: None,
         otel: OtelConfig::default(),
     };
 

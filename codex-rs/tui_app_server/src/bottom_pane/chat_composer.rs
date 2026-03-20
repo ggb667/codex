@@ -213,6 +213,7 @@ use crate::clipboard_paste::pasted_image_format;
 use crate::history_cell;
 use crate::tui::FrameRequester;
 use crate::ui_consts::LIVE_PREFIX_COLS;
+use crate::ui_consts::prompt_glyph;
 use codex_chatgpt::connectors;
 use codex_chatgpt::connectors::AppInfo;
 use codex_core::plugins::PluginCapabilitySummary;
@@ -4414,9 +4415,9 @@ impl ChatComposer {
         }
         if !textarea_rect.is_empty() {
             let prompt = if self.input_enabled {
-                "›".bold()
+                Span::from(prompt_glyph()).bold()
             } else {
-                "›".dim()
+                Span::from(prompt_glyph()).dim()
             };
             buf.set_span(
                 textarea_rect.x - LIVE_PREFIX_COLS,
