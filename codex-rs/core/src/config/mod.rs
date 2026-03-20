@@ -362,6 +362,12 @@ pub struct Config {
     /// Syntax highlighting theme override (kebab-case name).
     pub tui_theme: Option<String>,
 
+    /// Prompt glyph rendered for the composer and selection cursors.
+    pub tui_prompt_glyph: Option<String>,
+
+    /// Background color override for user prompt surfaces.
+    pub tui_prompt_background: Option<String>,
+
     /// The directory that should be treated as the current working directory
     /// for the session. All relative paths inside the business-logic layer are
     /// resolved against this path.
@@ -2824,6 +2830,8 @@ impl Config {
                 .unwrap_or_default(),
             tui_status_line: cfg.tui.as_ref().and_then(|t| t.status_line.clone()),
             tui_theme: cfg.tui.as_ref().and_then(|t| t.theme.clone()),
+            tui_prompt_glyph: cfg.tui.as_ref().and_then(|t| t.prompt_glyph.clone()),
+            tui_prompt_background: cfg.tui.as_ref().and_then(|t| t.prompt_background.clone()),
             otel: {
                 let t: OtelConfigToml = cfg.otel.unwrap_or_default();
                 let log_user_prompt = t.log_user_prompt.unwrap_or(false);

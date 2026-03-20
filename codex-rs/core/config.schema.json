@@ -1657,6 +1657,16 @@
           "default": true,
           "description": "Enable desktop notifications from the TUI when the terminal is unfocused. Defaults to `true`."
         },
+        "prompt_background": {
+          "default": null,
+          "description": "Background color override for user prompt surfaces.\n\nAccepts a `#RRGGBB` hex color when set.",
+          "type": "string"
+        },
+        "prompt_glyph": {
+          "default": null,
+          "description": "Prompt glyph rendered for the composer and selection cursors.\n\nDefaults to `›` when unset.",
+          "type": "string"
+        },
         "show_tooltips": {
           "default": true,
           "description": "Show startup tooltips in the TUI welcome screen. Defaults to `true`.",

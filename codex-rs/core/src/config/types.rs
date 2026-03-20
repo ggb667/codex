@@ -759,6 +759,18 @@ pub struct Tui {
     #[serde(default)]
     pub theme: Option<String>,
 
+    /// Prompt glyph rendered for the composer and selection cursors.
+    ///
+    /// Defaults to `›` when unset.
+    #[serde(default)]
+    pub prompt_glyph: Option<String>,
+
+    /// Background color override for user prompt surfaces.
+    ///
+    /// Accepts a `#RRGGBB` hex color when set.
+    #[serde(default)]
+    pub prompt_background: Option<String>,
+
     /// Startup tooltip availability NUX state persisted by the TUI.
     #[serde(default)]
     pub model_availability_nux: ModelAvailabilityNuxConfig,
