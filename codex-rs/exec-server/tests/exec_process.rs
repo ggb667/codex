@@ -10,6 +10,7 @@ use codex_exec_server::ExecParams;
 use codex_exec_server::ExecProcess;
 use codex_exec_server::ExecResponse;
 use codex_exec_server::ReadParams;
+use codex_exec_server::TerminateResponse;
 use pretty_assertions::assert_eq;
 use test_case::test_case;
 
@@ -84,4 +85,37 @@ async fn assert_exec_process_starts_and_exits(use_remote: bool) -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_process_starts_and_exits(use_remote: bool) -> Result<()> {
     assert_exec_process_starts_and_exits(use_remote).await
+}
+
+async fn assert_exec_process_terminates_running_process(use_remote: bool) -> Result<()> {
+    let context = create_process_context(use_remote).await?;
+    let response = context
+        .process
+        .start(ExecParams {
+            process_id: "proc-io".to_string(),
+            argv: vec!["sleep".to_string(), "60".to_string()],
+            cwd: std::env::current_dir()?,
+            env: Default::default(),
+            tty: false,
+            arg0: None,
+        })
+        .await?;
+    assert_eq!(
+        response,
+        ExecResponse {
+            process_id: "proc-io".to_string(),
+        }
+    );
+
+    let terminate = context.process.terminate("proc-io").await?;
+    assert_eq!(terminate, TerminateResponse { running: true });
+
+    Ok(())
+}
+
+#[test_case(false ; "local")]
+#[test_case(true ; "remote")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_process_terminates_running_process(use_remote: bool) -> Result<()> {
+    assert_exec_process_terminates_running_process(use_remote).await
 }
