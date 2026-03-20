@@ -543,6 +543,12 @@ pub struct Config {
     /// Syntax highlighting theme override (kebab-case name).
     pub tui_theme: Option<String>,
 
+    /// Prompt glyph rendered for the composer and selection cursors.
+    pub tui_prompt_glyph: Option<String>,
+
+    /// Background color override for user prompt surfaces.
+    pub tui_prompt_background: Option<String>,
+
     /// Terminal resize-reflow tuning knobs.
     pub terminal_resize_reflow: TerminalResizeReflowConfig,
 
@@ -3102,6 +3108,8 @@ impl Config {
                 .unwrap_or(true),
             tui_terminal_title: cfg.tui.as_ref().and_then(|t| t.terminal_title.clone()),
             tui_theme: cfg.tui.as_ref().and_then(|t| t.theme.clone()),
+            tui_prompt_glyph: cfg.tui.as_ref().and_then(|t| t.prompt_glyph.clone()),
+            tui_prompt_background: cfg.tui.as_ref().and_then(|t| t.prompt_background.clone()),
             terminal_resize_reflow,
             tui_keymap: cfg
                 .tui

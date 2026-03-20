@@ -656,6 +656,18 @@ pub struct Tui {
     #[serde(default)]
     pub theme: Option<String>,
 
+    /// Prompt glyph rendered for the composer and selection cursors.
+    ///
+    /// Defaults to `›` when unset.
+    #[serde(default)]
+    pub prompt_glyph: Option<String>,
+
+    /// Background color override for user prompt surfaces.
+    ///
+    /// Accepts a `#RRGGBB` hex color when set.
+    #[serde(default)]
+    pub prompt_background: Option<String>,
+
     /// Keybinding overrides for the TUI.
     ///
     /// This supports rebinding selected actions globally and by context.
