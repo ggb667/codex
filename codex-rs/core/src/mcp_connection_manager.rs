@@ -1203,6 +1203,12 @@ pub(crate) struct SharedMcpBackendPool {
     backends: Mutex<HashMap<SharedMcpBackendCacheKey, std::sync::Weak<SharedMcpBackendLeaseInner>>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SharedMcpBackendAcquireMode {
+    ReuseExisting,
+    ForceCreate,
+}
+
 impl SharedMcpBackendPool {
     pub(crate) fn new() -> Self {
         Self::default()
@@ -1212,6 +1218,7 @@ impl SharedMcpBackendPool {
     async fn acquire_or_create(
         &self,
         key: SharedMcpBackendCacheKey,
+        acquire_mode: SharedMcpBackendAcquireMode,
         mcp_servers: &HashMap<String, McpServerConfig>,
         store_mode: OAuthCredentialsStoreMode,
         auth_entries: HashMap<String, McpAuthStatusEntry>,
@@ -1223,8 +1230,13 @@ impl SharedMcpBackendPool {
         tool_plugin_provenance: ToolPluginProvenance,
     ) -> SharedMcpBackendLease {
         let mut backends = self.backends.lock().await;
-        if let Some(existing) = backends.get(&key).and_then(std::sync::Weak::upgrade) {
-            return SharedMcpBackendLease { inner: existing };
+        match acquire_mode {
+            SharedMcpBackendAcquireMode::ReuseExisting => {
+                if let Some(existing) = backends.get(&key).and_then(std::sync::Weak::upgrade) {
+                    return SharedMcpBackendLease { inner: existing };
+                }
+            }
+            SharedMcpBackendAcquireMode::ForceCreate => {}
         }
 
         let (backend, cancel_token) = SharedMcpBackend::new(
@@ -1432,6 +1444,7 @@ impl McpConnectionManager {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new_with_pool(
         pool: &SharedMcpBackendPool,
+        acquire_mode: SharedMcpBackendAcquireMode,
         mcp_servers: &HashMap<String, McpServerConfig>,
         store_mode: OAuthCredentialsStoreMode,
         auth_entries: HashMap<String, McpAuthStatusEntry>,
@@ -1448,6 +1461,7 @@ impl McpConnectionManager {
         let lease = pool
             .acquire_or_create(
                 key,
+                acquire_mode,
                 mcp_servers,
                 store_mode,
                 auth_entries,
@@ -2835,6 +2849,7 @@ mod tests {
         let (tx_event_1, _rx_event_1) = async_channel::unbounded();
         let manager_1 = McpConnectionManager::new_with_pool(
             &pool,
+            SharedMcpBackendAcquireMode::ReuseExisting,
             &mcp_servers,
             OAuthCredentialsStoreMode::Auto,
             HashMap::new(),
@@ -2853,6 +2868,7 @@ mod tests {
         let (tx_event_2, _rx_event_2) = async_channel::unbounded();
         let manager_2 = McpConnectionManager::new_with_pool(
             &pool,
+            SharedMcpBackendAcquireMode::ReuseExisting,
             &mcp_servers,
             OAuthCredentialsStoreMode::Auto,
             HashMap::new(),
@@ -2887,6 +2903,7 @@ mod tests {
         let (tx_event_1, _rx_event_1) = async_channel::unbounded();
         let manager_1 = McpConnectionManager::new_with_pool(
             &pool,
+            SharedMcpBackendAcquireMode::ReuseExisting,
             &mcp_servers,
             OAuthCredentialsStoreMode::Auto,
             HashMap::new(),
@@ -2905,6 +2922,7 @@ mod tests {
         let (tx_event_2, _rx_event_2) = async_channel::unbounded();
         let manager_2 = McpConnectionManager::new_with_pool(
             &pool,
+            SharedMcpBackendAcquireMode::ReuseExisting,
             &mcp_servers,
             OAuthCredentialsStoreMode::File,
             HashMap::new(),
@@ -2922,6 +2940,77 @@ mod tests {
         .await;
 
         assert!(!Arc::ptr_eq(&manager_1.backend, &manager_2.backend));
+    }
+
+    #[tokio::test]
+    async fn shared_mcp_backend_pool_force_create_replaces_pool_entry_for_same_key() {
+        let pool = SharedMcpBackendPool::new();
+        let mcp_servers = HashMap::new();
+        let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+        let codex_home = tempdir().expect("tempdir");
+        let sandbox_state = SandboxState {
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            codex_linux_sandbox_exe: None,
+            sandbox_cwd: codex_home.path().to_path_buf(),
+            use_linux_sandbox_bwrap: false,
+        };
+        let cache_key = CodexAppsToolsCacheKey {
+            account_id: None,
+            chatgpt_user_id: None,
+            is_workspace_account: false,
+        };
+
+        let (tx_event_1, _rx_event_1) = async_channel::unbounded();
+        let manager_1 = McpConnectionManager::new_with_pool(
+            &pool,
+            SharedMcpBackendAcquireMode::ReuseExisting,
+            &mcp_servers,
+            OAuthCredentialsStoreMode::Auto,
+            HashMap::new(),
+            &approval_policy,
+            tx_event_1,
+            sandbox_state.clone(),
+            codex_home.path().to_path_buf(),
+            cache_key.clone(),
+            ToolPluginProvenance::default(),
+        )
+        .await;
+
+        let (tx_event_2, _rx_event_2) = async_channel::unbounded();
+        let manager_2 = McpConnectionManager::new_with_pool(
+            &pool,
+            SharedMcpBackendAcquireMode::ForceCreate,
+            &mcp_servers,
+            OAuthCredentialsStoreMode::Auto,
+            HashMap::new(),
+            &approval_policy,
+            tx_event_2,
+            sandbox_state.clone(),
+            codex_home.path().to_path_buf(),
+            cache_key.clone(),
+            ToolPluginProvenance::default(),
+        )
+        .await;
+
+        let (tx_event_3, _rx_event_3) = async_channel::unbounded();
+        let manager_3 = McpConnectionManager::new_with_pool(
+            &pool,
+            SharedMcpBackendAcquireMode::ReuseExisting,
+            &mcp_servers,
+            OAuthCredentialsStoreMode::Auto,
+            HashMap::new(),
+            &approval_policy,
+            tx_event_3,
+            sandbox_state,
+            codex_home.path().to_path_buf(),
+            cache_key,
+            ToolPluginProvenance::default(),
+        )
+        .await;
+
+        assert!(!Arc::ptr_eq(&manager_1.backend, &manager_2.backend));
+        assert!(Arc::ptr_eq(&manager_2.backend, &manager_3.backend));
+        assert!(!Arc::ptr_eq(&manager_1.backend, &manager_3.backend));
     }
 
     #[test]
