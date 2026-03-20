@@ -1087,6 +1087,23 @@ impl Session {
         per_turn_config
     }
 
+    fn sandbox_state_for_session_configuration(
+        session_configuration: &SessionConfiguration,
+    ) -> SandboxState {
+        SandboxState {
+            sandbox_policy: session_configuration.sandbox_policy.get().clone(),
+            codex_linux_sandbox_exe: session_configuration
+                .original_config_do_not_use
+                .codex_linux_sandbox_exe
+                .clone(),
+            sandbox_cwd: session_configuration.cwd.clone(),
+            use_linux_sandbox_bwrap: session_configuration
+                .original_config_do_not_use
+                .features
+                .enabled(Feature::UseLinuxSandboxBwrap),
+        }
+    }
+
     pub(crate) async fn codex_home(&self) -> PathBuf {
         let state = self.state.lock().await;
         state.session_configuration.codex_home().clone()
@@ -2152,23 +2169,29 @@ impl Session {
     ) -> ConstraintResult<Arc<TurnContext>> {
         let (
             session_configuration,
-            sandbox_policy_changed,
+            sandbox_state,
+            sandbox_state_changed,
             previous_cwd,
             codex_home,
             session_source,
         ) = {
             let mut state = self.state.lock().await;
-            match state.session_configuration.clone().apply(&updates) {
+            let previous_session_configuration = state.session_configuration.clone();
+            match previous_session_configuration.apply(&updates) {
                 Ok(next) => {
-                    let previous_cwd = state.session_configuration.cwd.clone();
-                    let sandbox_policy_changed =
-                        state.session_configuration.sandbox_policy != next.sandbox_policy;
+                    let previous_cwd = previous_session_configuration.cwd.clone();
+                    let previous_sandbox_state = Self::sandbox_state_for_session_configuration(
+                        &previous_session_configuration,
+                    );
+                    let sandbox_state = Self::sandbox_state_for_session_configuration(&next);
+                    let sandbox_state_changed = previous_sandbox_state != sandbox_state;
                     let codex_home = next.codex_home.clone();
                     let session_source = next.session_source.clone();
                     state.session_configuration = next.clone();
                     (
                         next,
-                        sandbox_policy_changed,
+                        sandbox_state,
+                        sandbox_state_changed,
                         previous_cwd,
                         codex_home,
                         session_source,
@@ -2201,7 +2224,8 @@ impl Session {
                 sub_id,
                 session_configuration,
                 updates.final_output_json_schema,
-                sandbox_policy_changed,
+                sandbox_state,
+                sandbox_state_changed,
             )
             .await)
     }
@@ -2211,25 +2235,59 @@ impl Session {
         sub_id: String,
         session_configuration: SessionConfiguration,
         final_output_json_schema: Option<Option<Value>>,
-        sandbox_policy_changed: bool,
+        sandbox_state: SandboxState,
+        sandbox_state_changed: bool,
     ) -> Arc<TurnContext> {
         let per_turn_config = Self::build_per_turn_config(&session_configuration);
-        self.services
-            .mcp_connection_manager
-            .read()
-            .await
-            .set_approval_policy(&session_configuration.approval_policy);
 
-        if sandbox_policy_changed {
-            let sandbox_state = SandboxState {
-                sandbox_policy: per_turn_config.permissions.sandbox_policy.get().clone(),
-                codex_linux_sandbox_exe: per_turn_config.codex_linux_sandbox_exe.clone(),
-                sandbox_cwd: per_turn_config.cwd.clone(),
-                use_linux_sandbox_bwrap: per_turn_config
-                    .features
-                    .enabled(Feature::UseLinuxSandboxBwrap),
-            };
-            if let Err(e) = self
+        if sandbox_state_changed {
+            if let Some(shared_mcp_backend_pool) = self.services.shared_mcp_backend_pool.as_ref() {
+                let auth = self.services.auth_manager.auth().await;
+                let config = session_configuration.original_config_do_not_use.clone();
+                let mcp_servers = self
+                    .services
+                    .mcp_manager
+                    .effective_servers(config.as_ref(), auth.as_ref());
+                let auth_statuses = compute_auth_statuses(
+                    mcp_servers.iter(),
+                    config.mcp_oauth_credentials_store_mode,
+                )
+                .await;
+                let tool_plugin_provenance = self
+                    .services
+                    .mcp_manager
+                    .tool_plugin_provenance(config.as_ref());
+                {
+                    let mut guard = self.services.mcp_startup_cancellation_token.lock().await;
+                    guard.cancel();
+                    *guard = CancellationToken::new();
+                }
+                let rebuilt_manager = McpConnectionManager::new_with_pool(
+                    shared_mcp_backend_pool.as_ref(),
+                    SharedMcpBackendAcquireMode::ReuseExisting,
+                    &mcp_servers,
+                    config.mcp_oauth_credentials_store_mode,
+                    auth_statuses,
+                    &session_configuration.approval_policy,
+                    self.get_tx_event(),
+                    sandbox_state.clone(),
+                    config.codex_home.clone(),
+                    codex_apps_tools_cache_key(auth.as_ref()),
+                    tool_plugin_provenance,
+                )
+                .await;
+                let cancel_token = CancellationToken::new();
+                {
+                    let mut guard = self.services.mcp_startup_cancellation_token.lock().await;
+                    if guard.is_cancelled() {
+                        cancel_token.cancel();
+                    }
+                    *guard = cancel_token;
+                }
+
+                let mut manager = self.services.mcp_connection_manager.write().await;
+                *manager = rebuilt_manager;
+            } else if let Err(e) = self
                 .services
                 .mcp_connection_manager
                 .read()
@@ -2240,6 +2298,11 @@ impl Session {
                 warn!("Failed to notify sandbox state change to MCP servers: {e:#}");
             }
         }
+        self.services
+            .mcp_connection_manager
+            .read()
+            .await
+            .set_approval_policy(&session_configuration.approval_policy);
 
         let model_info = self
             .services
@@ -2428,8 +2491,14 @@ impl Session {
             let state = self.state.lock().await;
             state.session_configuration.clone()
         };
-        self.new_turn_from_configuration(sub_id, session_configuration, None, false)
-            .await
+        self.new_turn_from_configuration(
+            sub_id,
+            session_configuration.clone(),
+            None,
+            Self::sandbox_state_for_session_configuration(&session_configuration),
+            false,
+        )
+        .await
     }
 
     async fn build_settings_update_items(
