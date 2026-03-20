@@ -948,6 +948,9 @@ mod tests {
         let _env = TempCodexHome::new();
         let store = KeyringStoreWithError::fail_delete(MockKeyringStore::default());
         let tokens = sample_tokens();
+        let key = super::compute_store_key(&tokens.server_name, &tokens.url)?;
+        let value = serde_json::to_value(&tokens)?;
+        save_json_to_keyring(&store, KEYRING_SERVICE, &key, &value)?;
         super::save_oauth_tokens_to_file(&tokens).unwrap();
 
         let result = super::delete_oauth_tokens_from_keyring_and_file(
