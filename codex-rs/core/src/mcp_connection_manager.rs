@@ -1114,6 +1114,137 @@ impl SharedMcpBackend {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct SharedMcpBackendCacheKey(String);
+
+fn canonicalize_json_value(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(canonicalize_json_value).collect())
+        }
+        serde_json::Value::Object(object) => {
+            let mut entries = object.into_iter().collect::<Vec<_>>();
+            entries.sort_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+
+            let mut canonical = serde_json::Map::with_capacity(entries.len());
+            for (key, value) in entries {
+                canonical.insert(key, canonicalize_json_value(value));
+            }
+
+            serde_json::Value::Object(canonical)
+        }
+        other => other,
+    }
+}
+
+impl SharedMcpBackendCacheKey {
+    pub(crate) fn new(
+        mcp_servers: &HashMap<String, McpServerConfig>,
+        store_mode: OAuthCredentialsStoreMode,
+        codex_apps_tools_cache_key: &CodexAppsToolsCacheKey,
+    ) -> Self {
+        let mut servers = mcp_servers
+            .iter()
+            .filter(|(_, config)| config.enabled)
+            .map(|(name, config)| {
+                (
+                    name,
+                    canonicalize_json_value(serde_json::to_value(config).unwrap_or_else(|error| {
+                        panic!("serializing MCP server config for cache key: {error}")
+                    })),
+                )
+            })
+            .collect::<Vec<_>>();
+        servers.sort_by(|(left_name, _), (right_name, _)| left_name.cmp(right_name));
+        let payload = canonicalize_json_value(serde_json::json!({
+            "codexAppsToolsCacheKey": codex_apps_tools_cache_key,
+            "storeMode": store_mode,
+            "servers": servers,
+        }));
+        Self(serde_json::to_string(&payload).unwrap_or_else(|error| {
+            panic!("serializing shared MCP backend cache key payload: {error}")
+        }))
+    }
+}
+
+#[derive(Clone)]
+struct SharedMcpBackendLease {
+    inner: Arc<SharedMcpBackendLeaseInner>,
+}
+
+impl SharedMcpBackendLease {
+    fn new(backend: SharedMcpBackend, cancel_token: CancellationToken) -> Self {
+        Self {
+            inner: Arc::new(SharedMcpBackendLeaseInner {
+                backend: Arc::new(backend),
+                cancel_token,
+            }),
+        }
+    }
+
+    fn backend(&self) -> Arc<SharedMcpBackend> {
+        Arc::clone(&self.inner.backend)
+    }
+}
+
+struct SharedMcpBackendLeaseInner {
+    backend: Arc<SharedMcpBackend>,
+    cancel_token: CancellationToken,
+}
+
+impl Drop for SharedMcpBackendLeaseInner {
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct SharedMcpBackendPool {
+    backends: Mutex<HashMap<SharedMcpBackendCacheKey, std::sync::Weak<SharedMcpBackendLeaseInner>>>,
+}
+
+impl SharedMcpBackendPool {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn acquire_or_create(
+        &self,
+        key: SharedMcpBackendCacheKey,
+        mcp_servers: &HashMap<String, McpServerConfig>,
+        store_mode: OAuthCredentialsStoreMode,
+        auth_entries: HashMap<String, McpAuthStatusEntry>,
+        tx_event: Sender<Event>,
+        initial_sandbox_state: SandboxState,
+        session_handle: SessionMcpHandle,
+        codex_home: PathBuf,
+        codex_apps_tools_cache_key: CodexAppsToolsCacheKey,
+        tool_plugin_provenance: ToolPluginProvenance,
+    ) -> SharedMcpBackendLease {
+        let mut backends = self.backends.lock().await;
+        if let Some(existing) = backends.get(&key).and_then(std::sync::Weak::upgrade) {
+            return SharedMcpBackendLease { inner: existing };
+        }
+
+        let (backend, cancel_token) = SharedMcpBackend::new(
+            mcp_servers,
+            store_mode,
+            auth_entries,
+            tx_event,
+            initial_sandbox_state,
+            session_handle,
+            codex_home,
+            codex_apps_tools_cache_key,
+            tool_plugin_provenance,
+        )
+        .await;
+        let lease = SharedMcpBackendLease::new(backend, cancel_token);
+        backends.insert(key, Arc::downgrade(&lease.inner));
+        lease
+    }
+}
+
 #[derive(Clone)]
 struct SessionMcpHandle {
     tx_event: Sender<Event>,
@@ -1223,11 +1354,20 @@ impl SessionMcpHandle {
 pub(crate) struct McpConnectionManager {
     backend: Arc<SharedMcpBackend>,
     session: SessionMcpHandle,
+    _shared_backend_lease: Option<SharedMcpBackendLease>,
 }
 
 impl McpConnectionManager {
-    fn from_parts(backend: Arc<SharedMcpBackend>, session: SessionMcpHandle) -> Self {
-        Self { backend, session }
+    fn from_parts(
+        backend: Arc<SharedMcpBackend>,
+        session: SessionMcpHandle,
+        shared_backend_lease: Option<SharedMcpBackendLease>,
+    ) -> Self {
+        Self {
+            backend,
+            session,
+            _shared_backend_lease: shared_backend_lease,
+        }
     }
 
     pub(crate) fn new_uninitialized(approval_policy: &Constrained<AskForApproval>) -> Self {
@@ -1235,6 +1375,7 @@ impl McpConnectionManager {
         Self::from_parts(
             Arc::new(SharedMcpBackend::new_uninitialized()),
             SessionMcpHandle::new(approval_policy.value(), tx_event),
+            None,
         )
     }
 
@@ -1282,7 +1423,43 @@ impl McpConnectionManager {
             tool_plugin_provenance,
         )
         .await;
-        (Self::from_parts(Arc::new(backend), session), cancel_token)
+        (
+            Self::from_parts(Arc::new(backend), session, None),
+            cancel_token,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn new_with_pool(
+        pool: &SharedMcpBackendPool,
+        mcp_servers: &HashMap<String, McpServerConfig>,
+        store_mode: OAuthCredentialsStoreMode,
+        auth_entries: HashMap<String, McpAuthStatusEntry>,
+        approval_policy: &Constrained<AskForApproval>,
+        tx_event: Sender<Event>,
+        initial_sandbox_state: SandboxState,
+        codex_home: PathBuf,
+        codex_apps_tools_cache_key: CodexAppsToolsCacheKey,
+        tool_plugin_provenance: ToolPluginProvenance,
+    ) -> Self {
+        let session = SessionMcpHandle::new(approval_policy.value(), tx_event.clone());
+        let key =
+            SharedMcpBackendCacheKey::new(mcp_servers, store_mode, &codex_apps_tools_cache_key);
+        let lease = pool
+            .acquire_or_create(
+                key,
+                mcp_servers,
+                store_mode,
+                auth_entries,
+                tx_event,
+                initial_sandbox_state,
+                session.clone(),
+                codex_home,
+                codex_apps_tools_cache_key,
+                tool_plugin_provenance,
+            )
+            .await;
+        Self::from_parts(lease.backend(), session, Some(lease))
     }
 
     pub async fn resolve_elicitation(
@@ -2542,6 +2719,209 @@ mod tests {
         .expect("elicitation response");
 
         assert_eq!(response, decline_elicitation_response());
+    }
+
+    #[test]
+    fn shared_mcp_backend_cache_key_is_stable_for_equivalent_configs() {
+        let mut http_headers_1 = HashMap::new();
+        http_headers_1.insert("Authorization".to_string(), "Bearer one".to_string());
+        http_headers_1.insert("ChatGPT-Account-ID".to_string(), "account-1".to_string());
+        let mut http_headers_2 = HashMap::new();
+        http_headers_2.insert("ChatGPT-Account-ID".to_string(), "account-1".to_string());
+        http_headers_2.insert("Authorization".to_string(), "Bearer one".to_string());
+
+        let mut env_http_headers_1 = HashMap::new();
+        env_http_headers_1.insert("X-Test-Header".to_string(), "TEST_HEADER".to_string());
+        env_http_headers_1.insert("X-Other-Header".to_string(), "OTHER_HEADER".to_string());
+        let mut env_http_headers_2 = HashMap::new();
+        env_http_headers_2.insert("X-Other-Header".to_string(), "OTHER_HEADER".to_string());
+        env_http_headers_2.insert("X-Test-Header".to_string(), "TEST_HEADER".to_string());
+
+        let server_1 = McpServerConfig {
+            transport: McpServerTransportConfig::StreamableHttp {
+                url: "https://example.com/mcp".to_string(),
+                bearer_token_env_var: None,
+                http_headers: Some(http_headers_1),
+                env_http_headers: Some(env_http_headers_1),
+            },
+            enabled: true,
+            required: false,
+            disabled_reason: None,
+            startup_timeout_sec: Some(Duration::from_secs(30)),
+            tool_timeout_sec: Some(Duration::from_secs(60)),
+            enabled_tools: Some(vec!["tool-a".to_string()]),
+            disabled_tools: Some(vec!["tool-b".to_string()]),
+            scopes: Some(vec!["scope-a".to_string()]),
+            oauth_resource: Some("resource-a".to_string()),
+        };
+        let server_2 = McpServerConfig {
+            transport: McpServerTransportConfig::StreamableHttp {
+                url: "https://example.com/mcp".to_string(),
+                bearer_token_env_var: None,
+                http_headers: Some(http_headers_2),
+                env_http_headers: Some(env_http_headers_2),
+            },
+            enabled: true,
+            required: false,
+            disabled_reason: None,
+            startup_timeout_sec: Some(Duration::from_secs(30)),
+            tool_timeout_sec: Some(Duration::from_secs(60)),
+            enabled_tools: Some(vec!["tool-a".to_string()]),
+            disabled_tools: Some(vec!["tool-b".to_string()]),
+            scopes: Some(vec!["scope-a".to_string()]),
+            oauth_resource: Some("resource-a".to_string()),
+        };
+
+        let mut left_servers = HashMap::new();
+        left_servers.insert("beta".to_string(), server_1.clone());
+        left_servers.insert("alpha".to_string(), server_1);
+
+        let mut right_servers = HashMap::new();
+        right_servers.insert("alpha".to_string(), server_2.clone());
+        right_servers.insert("beta".to_string(), server_2);
+
+        let codex_apps_tools_cache_key = CodexAppsToolsCacheKey {
+            account_id: Some("account-1".to_string()),
+            chatgpt_user_id: Some("user-1".to_string()),
+            is_workspace_account: false,
+        };
+
+        assert_eq!(
+            SharedMcpBackendCacheKey::new(
+                &left_servers,
+                OAuthCredentialsStoreMode::Auto,
+                &codex_apps_tools_cache_key,
+            ),
+            SharedMcpBackendCacheKey::new(
+                &right_servers,
+                OAuthCredentialsStoreMode::Auto,
+                &codex_apps_tools_cache_key,
+            ),
+        );
+    }
+
+    #[test]
+    fn shared_mcp_backend_cache_key_separates_codex_apps_cache_scope() {
+        let servers = HashMap::new();
+        let left_user = CodexAppsToolsCacheKey {
+            account_id: Some("account-1".to_string()),
+            chatgpt_user_id: Some("user-1".to_string()),
+            is_workspace_account: false,
+        };
+        let right_user = CodexAppsToolsCacheKey {
+            account_id: Some("account-2".to_string()),
+            chatgpt_user_id: Some("user-2".to_string()),
+            is_workspace_account: true,
+        };
+
+        assert_ne!(
+            SharedMcpBackendCacheKey::new(&servers, OAuthCredentialsStoreMode::Auto, &left_user),
+            SharedMcpBackendCacheKey::new(&servers, OAuthCredentialsStoreMode::Auto, &right_user),
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_mcp_backend_pool_reuses_backend_for_same_key() {
+        let pool = SharedMcpBackendPool::new();
+        let mcp_servers = HashMap::new();
+        let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+        let codex_home = tempdir().expect("tempdir");
+        let sandbox_state = SandboxState {
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            codex_linux_sandbox_exe: None,
+            sandbox_cwd: codex_home.path().to_path_buf(),
+            use_linux_sandbox_bwrap: false,
+        };
+        let (tx_event_1, _rx_event_1) = async_channel::unbounded();
+        let manager_1 = McpConnectionManager::new_with_pool(
+            &pool,
+            &mcp_servers,
+            OAuthCredentialsStoreMode::Auto,
+            HashMap::new(),
+            &approval_policy,
+            tx_event_1,
+            sandbox_state.clone(),
+            codex_home.path().to_path_buf(),
+            CodexAppsToolsCacheKey {
+                account_id: None,
+                chatgpt_user_id: None,
+                is_workspace_account: false,
+            },
+            ToolPluginProvenance::default(),
+        )
+        .await;
+        let (tx_event_2, _rx_event_2) = async_channel::unbounded();
+        let manager_2 = McpConnectionManager::new_with_pool(
+            &pool,
+            &mcp_servers,
+            OAuthCredentialsStoreMode::Auto,
+            HashMap::new(),
+            &approval_policy,
+            tx_event_2,
+            sandbox_state,
+            codex_home.path().to_path_buf(),
+            CodexAppsToolsCacheKey {
+                account_id: None,
+                chatgpt_user_id: None,
+                is_workspace_account: false,
+            },
+            ToolPluginProvenance::default(),
+        )
+        .await;
+
+        assert!(Arc::ptr_eq(&manager_1.backend, &manager_2.backend));
+    }
+
+    #[tokio::test]
+    async fn shared_mcp_backend_pool_separates_backends_for_different_keys() {
+        let pool = SharedMcpBackendPool::new();
+        let mcp_servers = HashMap::new();
+        let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+        let codex_home = tempdir().expect("tempdir");
+        let sandbox_state = SandboxState {
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            codex_linux_sandbox_exe: None,
+            sandbox_cwd: codex_home.path().to_path_buf(),
+            use_linux_sandbox_bwrap: false,
+        };
+        let (tx_event_1, _rx_event_1) = async_channel::unbounded();
+        let manager_1 = McpConnectionManager::new_with_pool(
+            &pool,
+            &mcp_servers,
+            OAuthCredentialsStoreMode::Auto,
+            HashMap::new(),
+            &approval_policy,
+            tx_event_1,
+            sandbox_state.clone(),
+            codex_home.path().to_path_buf(),
+            CodexAppsToolsCacheKey {
+                account_id: None,
+                chatgpt_user_id: None,
+                is_workspace_account: false,
+            },
+            ToolPluginProvenance::default(),
+        )
+        .await;
+        let (tx_event_2, _rx_event_2) = async_channel::unbounded();
+        let manager_2 = McpConnectionManager::new_with_pool(
+            &pool,
+            &mcp_servers,
+            OAuthCredentialsStoreMode::File,
+            HashMap::new(),
+            &approval_policy,
+            tx_event_2,
+            sandbox_state,
+            codex_home.path().to_path_buf(),
+            CodexAppsToolsCacheKey {
+                account_id: None,
+                chatgpt_user_id: None,
+                is_workspace_account: false,
+            },
+            ToolPluginProvenance::default(),
+        )
+        .await;
+
+        assert!(!Arc::ptr_eq(&manager_1.backend, &manager_2.backend));
     }
 
     #[test]
