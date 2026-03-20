@@ -5,6 +5,9 @@ import type { JsonValue } from "../serde_json/JsonValue";
 import type { GuardianApprovalReview } from "./GuardianApprovalReview";
 
 /**
+ * Deprecated: Use the parent item-specific
+ * `item/*/guardianApprovalReview/*` notifications instead.
+ *
  * [UNSTABLE] Temporary notification payload for guardian automatic approval
  * review. This shape is expected to change soon.
  *

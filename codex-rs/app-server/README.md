@@ -875,10 +875,16 @@ All items emit shared lifecycle events:
 
 - `item/started` — emits the full `item` when a new unit of work begins so the UI can render it immediately; the `item.id` in this payload matches the `itemId` used by deltas.
 - `item/completed` — sends the final `item` once that work itself finishes (for example, after a tool call or message completes); treat this as the authoritative execution/result state.
-- `item/autoApprovalReview/started` — [UNSTABLE] temporary guardian notification carrying `{threadId, turnId, targetItemId, review, action?}` when guardian approval review begins. This shape is expected to change soon.
-- `item/autoApprovalReview/completed` — [UNSTABLE] temporary guardian notification carrying `{threadId, turnId, targetItemId, review, action?}` when guardian approval review resolves. This shape is expected to change soon.
+- `item/commandExecution/guardianApprovalReview/started` — [UNSTABLE, experimental API] temporary guardian notification carrying `{threadId, turnId, itemId, review, action?}` when guardian approval review begins for a `commandExecution` item.
+- `item/commandExecution/guardianApprovalReview/completed` — [UNSTABLE, experimental API] temporary guardian notification carrying `{threadId, turnId, itemId, review, action?}` when guardian approval review resolves for a `commandExecution` item.
+- `item/fileChange/guardianApprovalReview/started` — [UNSTABLE, experimental API] temporary guardian notification carrying `{threadId, turnId, itemId, review, action?}` when guardian approval review begins for a `fileChange` item.
+- `item/fileChange/guardianApprovalReview/completed` — [UNSTABLE, experimental API] temporary guardian notification carrying `{threadId, turnId, itemId, review, action?}` when guardian approval review resolves for a `fileChange` item.
+- `item/mcpToolCall/guardianApprovalReview/started` — [UNSTABLE, experimental API] temporary guardian notification carrying `{threadId, turnId, itemId, review, action?}` when guardian approval review begins for an `mcpToolCall` item.
+- `item/mcpToolCall/guardianApprovalReview/completed` — [UNSTABLE, experimental API] temporary guardian notification carrying `{threadId, turnId, itemId, review, action?}` when guardian approval review resolves for an `mcpToolCall` item.
+- `item/autoApprovalReview/started` — [UNSTABLE] deprecated compatibility alias carrying `{threadId, turnId, targetItemId, review, action?}` when guardian approval review begins.
+- `item/autoApprovalReview/completed` — [UNSTABLE] deprecated compatibility alias carrying `{threadId, turnId, targetItemId, review, action?}` when guardian approval review resolves.
 
-`review` is [UNSTABLE] and currently has `{status, riskScore?, riskLevel?, rationale?}`, where `status` is one of `inProgress`, `approved`, `denied`, or `aborted`. `action` is the guardian action summary payload from core when available and is intended to support temporary standalone pending-review UI. These notifications are separate from the target item's own `item/completed` lifecycle and are intentionally temporary while the guardian app protocol is still being designed.
+`review` is [UNSTABLE] and currently has `{status, riskScore?, riskLevel?, rationale?}`, where `status` is one of `inProgress`, `approved`, `denied`, or `aborted`. `action` is the guardian action summary payload from core when available and is intended to support temporary pending-review UI. Parent-scoped guardian notifications are emitted when app-server can map the guardian review to a concrete parent item; the deprecated top-level alias remains for older clients and for review kinds that are not yet parent-scoped.
 
 There are additional item-specific events:
 
