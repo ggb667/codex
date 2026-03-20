@@ -533,10 +533,10 @@ impl ToolsConfig {
         }
 
         if self.tool_feature_overrides.disable_defaults {
-            return false;
+            false
+        } else {
+            self.is_tool_feature_enabled_by_default(feature)
         }
-
-        self.is_tool_feature_enabled_by_default(feature)
     }
 
     fn is_tool_feature_enabled_by_default(&self, feature: ToolFeatureKey) -> bool {

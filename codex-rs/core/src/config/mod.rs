@@ -2104,22 +2104,21 @@ fn resolve_web_search_mode(
     features: &Features,
     tool_feature_overrides: &ToolFeatureOverrides,
 ) -> Option<WebSearchMode> {
-    let explicit_mode = || config_profile.web_search.or(config_toml.web_search);
-    let feature_default_mode = || {
-        if features.enabled(Feature::WebSearchCached) {
-            Some(WebSearchMode::Cached)
-        } else if features.enabled(Feature::WebSearchRequest) {
-            Some(WebSearchMode::Live)
-        } else {
-            None
-        }
-    };
-
     match tool_feature_overrides.web_search {
-        Some(true) => explicit_mode().or_else(feature_default_mode),
         Some(false) => Some(WebSearchMode::Disabled),
         None if tool_feature_overrides.disable_defaults => Some(WebSearchMode::Disabled),
-        None => explicit_mode().or_else(feature_default_mode),
+        None | Some(true) => config_profile
+            .web_search
+            .or(config_toml.web_search)
+            .or_else(|| {
+                if features.enabled(Feature::WebSearchCached) {
+                    Some(WebSearchMode::Cached)
+                } else if features.enabled(Feature::WebSearchRequest) {
+                    Some(WebSearchMode::Live)
+                } else {
+                    None
+                }
+            }),
     }
 }
 

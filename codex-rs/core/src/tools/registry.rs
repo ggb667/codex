@@ -40,6 +40,7 @@ pub(crate) enum BuiltinToolKey {
     Artifacts,
     CloseAgent,
     CodeMode,
+    ContainerExec,
     ExecCommand,
     GrepFiles,
     ImageGeneration,
@@ -48,6 +49,7 @@ pub(crate) enum BuiltinToolKey {
     ListDir,
     ListMcpResources,
     ListMcpResourceTemplates,
+    LocalShell,
     ReadFile,
     ReadMcpResource,
     RequestPermissions,
@@ -56,6 +58,8 @@ pub(crate) enum BuiltinToolKey {
     ResumeAgent,
     SearchToolBm25,
     SendInput,
+    Shell,
+    ShellCommand,
     SpawnAgent,
     SpawnAgentsOnCsv,
     TestSyncTool,
@@ -82,11 +86,12 @@ pub(crate) enum ToolFeatureKey {
 }
 
 impl BuiltinToolKey {
-    pub(crate) const ALL: [Self; 28] = [
+    pub(crate) const ALL: [Self; 32] = [
         Self::ApplyPatch,
         Self::Artifacts,
         Self::CloseAgent,
         Self::CodeMode,
+        Self::ContainerExec,
         Self::ExecCommand,
         Self::GrepFiles,
         Self::ImageGeneration,
@@ -95,6 +100,7 @@ impl BuiltinToolKey {
         Self::ListDir,
         Self::ListMcpResources,
         Self::ListMcpResourceTemplates,
+        Self::LocalShell,
         Self::ReadFile,
         Self::ReadMcpResource,
         Self::RequestPermissions,
@@ -103,6 +109,8 @@ impl BuiltinToolKey {
         Self::ResumeAgent,
         Self::SearchToolBm25,
         Self::SendInput,
+        Self::Shell,
+        Self::ShellCommand,
         Self::SpawnAgent,
         Self::SpawnAgentsOnCsv,
         Self::TestSyncTool,
@@ -120,13 +128,11 @@ impl BuiltinToolKey {
     pub(crate) const fn invocation_names(self) -> &'static [&'static str] {
         match self {
             Self::CodeMode => &[PUBLIC_TOOL_NAME],
-            Self::ExecCommand => &[
-                SHELL_TOOL_NAME,
-                EXEC_COMMAND_TOOL_NAME,
-                CONTAINER_EXEC_TOOL_NAME,
-                LOCAL_SHELL_TOOL_NAME,
-                SHELL_COMMAND_TOOL_NAME,
-            ],
+            Self::ContainerExec => &[CONTAINER_EXEC_TOOL_NAME],
+            Self::ExecCommand => &[EXEC_COMMAND_TOOL_NAME],
+            Self::LocalShell => &[LOCAL_SHELL_TOOL_NAME],
+            Self::Shell => &[SHELL_TOOL_NAME],
+            Self::ShellCommand => &[SHELL_COMMAND_TOOL_NAME],
             Self::WriteStdin => &[WRITE_STDIN_TOOL_NAME],
             Self::ListMcpResources => &["list_mcp_resources"],
             Self::ListMcpResourceTemplates => &["list_mcp_resource_templates"],
@@ -177,7 +183,14 @@ impl ToolFeatureKey {
 
     pub(crate) const fn builtin_tool_keys(self) -> &'static [BuiltinToolKey] {
         match self {
-            Self::Shell => &[BuiltinToolKey::ExecCommand, BuiltinToolKey::WriteStdin],
+            Self::Shell => &[
+                BuiltinToolKey::ContainerExec,
+                BuiltinToolKey::ExecCommand,
+                BuiltinToolKey::LocalShell,
+                BuiltinToolKey::Shell,
+                BuiltinToolKey::ShellCommand,
+                BuiltinToolKey::WriteStdin,
+            ],
             Self::Filesystem => &[
                 BuiltinToolKey::ApplyPatch,
                 BuiltinToolKey::GrepFiles,
