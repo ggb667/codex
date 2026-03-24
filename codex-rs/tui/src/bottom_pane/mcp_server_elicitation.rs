@@ -43,6 +43,7 @@ use crate::render::renderable::Renderable;
 use crate::text_formatting::format_json_compact;
 use crate::text_formatting::truncate_text;
 use crate::ui_consts::prompt_glyph;
+use crate::ui_consts::prompt_padding;
 
 const ANSWER_PLACEHOLDER: &str = "Type your answer";
 const OPTIONAL_ANSWER_PLACEHOLDER: &str = "Type your answer (optional)";
@@ -880,7 +881,7 @@ impl McpServerElicitationOverlay {
                 let prefix = if selected_idx.is_some_and(|selected| selected == idx) {
                     prompt_glyph()
                 } else {
-                    " ".to_string()
+                    prompt_padding()
                 };
                 let number = idx + 1;
                 let prefix_label = format!("{prefix} {number}. ");
