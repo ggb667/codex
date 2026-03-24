@@ -21,6 +21,7 @@ use crate::keymap::ListKeymap;
 use crate::render::renderable::ColumnRenderable;
 use crate::render::renderable::Renderable;
 use crate::ui_consts::prompt_glyph;
+use crate::ui_consts::prompt_padding;
 
 use super::CancellationEvent;
 use super::bottom_pane_view::BottomPaneView;
@@ -503,7 +504,7 @@ impl ListSelectionView {
                     let prefix = if is_selected {
                         prompt_glyph()
                     } else {
-                        " ".to_string()
+                        prompt_padding()
                     };
                     let name = item.name.as_str();
                     let marker = if item.is_current {
