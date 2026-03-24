@@ -30,6 +30,7 @@ use crate::render::Insets;
 use crate::render::RectExt as _;
 use crate::style::user_message_style;
 use crate::ui_consts::prompt_glyph;
+use crate::ui_consts::prompt_padding;
 use crate::wrapping::RtOptions;
 use crate::wrapping::adaptive_wrap_lines;
 
@@ -352,7 +353,7 @@ impl AppLinkView {
                 let prefix = if self.selected_action == index {
                     prompt_glyph()
                 } else {
-                    " ".to_string()
+                    prompt_padding()
                 };
                 GenericDisplayRow {
                     name: format!("{prefix} {}. {label}", index + 1),

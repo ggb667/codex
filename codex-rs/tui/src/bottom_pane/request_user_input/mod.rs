@@ -30,6 +30,7 @@ use crate::bottom_pane::selection_popup_common::measure_rows_height;
 use crate::history_cell;
 use crate::render::renderable::Renderable;
 use crate::ui_consts::prompt_glyph;
+use crate::ui_consts::prompt_padding;
 
 use codex_protocol::protocol::Op;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
@@ -281,7 +282,7 @@ impl RequestUserInputOverlay {
                         let prefix = if selected {
                             prompt_glyph()
                         } else {
-                            " ".to_string()
+                            prompt_padding()
                         };
                         let label = opt.label.as_str();
                         let number = idx + 1;
@@ -302,7 +303,7 @@ impl RequestUserInputOverlay {
                     let prefix = if selected {
                         prompt_glyph()
                     } else {
-                        " ".to_string()
+                        prompt_padding()
                     };
                     let number = idx + 1;
                     let prefix_label = format!("{prefix} {number}. ");
@@ -835,7 +836,7 @@ impl RequestUserInputOverlay {
                 let prefix = if idx == selected {
                     prompt_glyph()
                 } else {
-                    " ".to_string()
+                    prompt_padding()
                 };
                 let number = idx + 1;
                 GenericDisplayRow {
