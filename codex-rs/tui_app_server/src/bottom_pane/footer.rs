@@ -45,7 +45,7 @@ use crate::key_hint;
 use crate::key_hint::KeyBinding;
 use crate::render::line_utils::prefix_lines;
 use crate::status::format_tokens_compact;
-use crate::ui_consts::footer_indent_cols;
+use crate::ui_consts::FOOTER_INDENT_COLS;
 use crossterm::event::KeyCode;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -213,8 +213,8 @@ pub(crate) fn footer_height(props: &FooterProps) -> u16 {
 pub(crate) fn render_footer_line(area: Rect, buf: &mut Buffer, line: Line<'static>) {
     Paragraph::new(prefix_lines(
         vec![line],
-        " ".repeat(footer_indent_cols()).into(),
-        " ".repeat(footer_indent_cols()).into(),
+        " ".repeat(FOOTER_INDENT_COLS).into(),
+        " ".repeat(FOOTER_INDENT_COLS).into(),
     ))
     .render(area, buf);
 }
@@ -243,14 +243,14 @@ pub(crate) fn render_footer_from_props(
             show_shortcuts_hint,
             show_queue_hint,
         ),
-        " ".repeat(footer_indent_cols()).into(),
-        " ".repeat(footer_indent_cols()).into(),
+        " ".repeat(FOOTER_INDENT_COLS).into(),
+        " ".repeat(FOOTER_INDENT_COLS).into(),
     ))
     .render(area, buf);
 }
 
 pub(crate) fn left_fits(area: Rect, left_width: u16) -> bool {
-    let max_width = area.width.saturating_sub(footer_indent_cols() as u16);
+    let max_width = area.width.saturating_sub(FOOTER_INDENT_COLS as u16);
     left_width <= max_width
 }
 
@@ -483,7 +483,7 @@ fn right_aligned_x(area: Rect, content_width: u16) -> Option<u16> {
         return None;
     }
 
-    let right_padding = footer_indent_cols() as u16;
+    let right_padding = FOOTER_INDENT_COLS as u16;
     let max_width = area.width.saturating_sub(right_padding);
     if content_width == 0 || max_width == 0 {
         return None;
@@ -503,7 +503,7 @@ fn right_aligned_x(area: Rect, content_width: u16) -> Option<u16> {
 
 pub(crate) fn max_left_width_for_right(area: Rect, right_width: u16) -> Option<u16> {
     let context_x = right_aligned_x(area, right_width)?;
-    let left_start = area.x + footer_indent_cols() as u16;
+    let left_start = area.x + FOOTER_INDENT_COLS as u16;
 
     // minimal one column gap between left and right
     let gap = FOOTER_CONTEXT_GAP_COLS;
@@ -522,7 +522,7 @@ pub(crate) fn can_show_left_with_context(area: Rect, left_width: u16, context_wi
     if left_width == 0 {
         return true;
     }
-    let left_extent = footer_indent_cols() as u16 + left_width + FOOTER_CONTEXT_GAP_COLS;
+    let left_extent = FOOTER_INDENT_COLS as u16 + left_width + FOOTER_CONTEXT_GAP_COLS;
     left_extent <= context_x.saturating_sub(area.x)
 }
 
@@ -1106,8 +1106,7 @@ mod tests {
                 } else {
                     collaboration_mode_indicator
                 };
-                let available_width =
-                    area.width.saturating_sub(footer_indent_cols() as u16) as usize;
+                let available_width = area.width.saturating_sub(FOOTER_INDENT_COLS as u16) as usize;
                 let mut truncated_status_line = if status_line_active
                     && matches!(
                         props.mode,

@@ -19,7 +19,6 @@ use crate::render::renderable::ColumnRenderable;
 use crate::render::renderable::Renderable;
 use crate::style::user_message_style;
 use crate::ui_consts::prompt_glyph;
-use crate::ui_consts::prompt_padding;
 
 use codex_core::features::Feature;
 
@@ -89,7 +88,7 @@ impl ExperimentalFeaturesView {
             let prefix = if selected_idx == Some(idx) {
                 prompt_glyph()
             } else {
-                prompt_padding()
+                " ".to_string()
             };
             let marker = if item.enabled { 'x' } else { ' ' };
             let name = format!("{prefix} [{marker}] {}", item.name);

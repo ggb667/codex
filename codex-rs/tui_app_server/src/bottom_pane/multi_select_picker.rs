@@ -55,7 +55,6 @@ use crate::render::renderable::Renderable;
 use crate::style::user_message_style;
 use crate::text_formatting::truncate_text;
 use crate::ui_consts::prompt_glyph;
-use crate::ui_consts::prompt_padding;
 
 /// Maximum display length for item names before truncation.
 const ITEM_NAME_TRUNCATE_LEN: usize = 21;
@@ -260,7 +259,7 @@ impl MultiSelectPicker {
                     let prefix = if is_selected {
                         prompt_glyph()
                     } else {
-                        prompt_padding()
+                        " ".to_string()
                     };
                     let marker = if item.enabled { 'x' } else { ' ' };
                     let item_name = truncate_text(&item.name, ITEM_NAME_TRUNCATE_LEN);

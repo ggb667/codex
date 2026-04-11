@@ -30,8 +30,7 @@ use crate::style::user_message_style;
 use crate::text_formatting::format_and_truncate_tool_result;
 use crate::text_formatting::truncate_text;
 use crate::tooltips;
-use crate::ui_consts::live_prefix_cols;
-use crate::ui_consts::live_prefix_spaces;
+use crate::ui_consts::LIVE_PREFIX_COLS;
 use crate::ui_consts::prompt_glyph_with_space;
 use crate::update_action::UpdateAction;
 use crate::version::CODEX_CLI_VERSION;
@@ -291,7 +290,7 @@ impl HistoryCell for UserHistoryCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let wrap_width = width
             .saturating_sub(
-                live_prefix_cols() + 1, /* keep a one-column right margin for wrapping */
+                LIVE_PREFIX_COLS + 1, /* keep a one-column right margin for wrapping */
             )
             .max(1);
 
@@ -352,8 +351,8 @@ impl HistoryCell for UserHistoryCell {
         if let Some(wrapped_remote_images) = wrapped_remote_images {
             lines.extend(prefix_lines(
                 wrapped_remote_images,
-                live_prefix_spaces().into(),
-                live_prefix_spaces().into(),
+                "  ".into(),
+                "  ".into(),
             ));
             if wrapped_message.is_some() {
                 lines.push(Line::from("").style(style));
@@ -363,8 +362,8 @@ impl HistoryCell for UserHistoryCell {
         if let Some(wrapped_message) = wrapped_message {
             lines.extend(prefix_lines(
                 wrapped_message,
-                Span::from(prompt_glyph_with_space()).bold().dim(),
-                live_prefix_spaces().into(),
+                Span::from(prompt_glyph_with_space()).bold().dim().into(),
+                "  ".into(),
             ));
         }
 

@@ -23,7 +23,6 @@ use crate::skills_helpers::match_skill;
 use crate::skills_helpers::truncate_skill_name;
 use crate::style::user_message_style;
 use crate::ui_consts::prompt_glyph;
-use crate::ui_consts::prompt_padding;
 use codex_protocol::protocol::Op;
 
 use super::CancellationEvent;
@@ -140,7 +139,7 @@ impl SkillsToggleView {
                     let prefix = if is_selected {
                         prompt_glyph()
                     } else {
-                        prompt_padding()
+                        " ".to_string()
                     };
                     let marker = if item.enabled { 'x' } else { ' ' };
                     let item_name = truncate_skill_name(&item.name);
