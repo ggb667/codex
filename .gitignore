@@ -92,3 +92,5 @@ CHANGELOG.ignore.md
 __pycache__/
 *.pyc
 
+# Project-local pony runtime
+/pony/

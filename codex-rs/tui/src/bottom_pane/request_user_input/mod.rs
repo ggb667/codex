@@ -29,6 +29,8 @@ use crate::bottom_pane::selection_popup_common::GenericDisplayRow;
 use crate::bottom_pane::selection_popup_common::measure_rows_height;
 use crate::history_cell;
 use crate::render::renderable::Renderable;
+use crate::ui_consts::prompt_glyph;
+use crate::ui_consts::prompt_padding;
 
 #[cfg(test)]
 use codex_protocol::protocol::Op;
@@ -278,7 +280,11 @@ impl RequestUserInputOverlay {
                     .enumerate()
                     .map(|(idx, opt)| {
                         let selected = selected_idx.is_some_and(|sel| sel == idx);
-                        let prefix = if selected { '›' } else { ' ' };
+                        let prefix = if selected {
+                            prompt_glyph()
+                        } else {
+                            prompt_padding()
+                        };
                         let label = opt.label.as_str();
                         let number = idx + 1;
                         let prefix_label = format!("{prefix} {number}. ");
@@ -295,7 +301,11 @@ impl RequestUserInputOverlay {
                 if Self::other_option_enabled_for_question(question) {
                     let idx = options.len();
                     let selected = selected_idx.is_some_and(|sel| sel == idx);
-                    let prefix = if selected { '›' } else { ' ' };
+                    let prefix = if selected {
+                        prompt_glyph()
+                    } else {
+                        prompt_padding()
+                    };
                     let number = idx + 1;
                     let prefix_label = format!("{prefix} {number}. ");
                     let wrap_indent = UnicodeWidthStr::width(prefix_label.as_str());
@@ -823,7 +833,11 @@ impl RequestUserInputOverlay {
             .iter()
             .enumerate()
             .map(|(idx, (label, description))| {
-                let prefix = if idx == selected { '›' } else { ' ' };
+                let prefix = if idx == selected {
+                    prompt_glyph()
+                } else {
+                    prompt_padding()
+                };
                 let number = idx + 1;
                 GenericDisplayRow {
                     name: format!("{prefix} {number}. {label}"),

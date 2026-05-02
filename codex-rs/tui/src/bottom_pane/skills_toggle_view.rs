@@ -22,6 +22,8 @@ use crate::render::renderable::Renderable;
 use crate::skills_helpers::match_skill;
 use crate::skills_helpers::truncate_skill_name;
 use crate::style::user_message_style;
+use crate::ui_consts::prompt_glyph;
+use crate::ui_consts::prompt_padding;
 
 use super::CancellationEvent;
 use super::bottom_pane_view::BottomPaneView;
@@ -134,7 +136,11 @@ impl SkillsToggleView {
             .filter_map(|(visible_idx, actual_idx)| {
                 self.items.get(*actual_idx).map(|item| {
                     let is_selected = self.state.selected_idx == Some(visible_idx);
-                    let prefix = if is_selected { '›' } else { ' ' };
+                    let prefix = if is_selected {
+                        prompt_glyph()
+                    } else {
+                        prompt_padding()
+                    };
                     let marker = if item.enabled { 'x' } else { ' ' };
                     let item_name = truncate_skill_name(&item.name);
                     let name = format!("{prefix} [{marker}] {item_name}");

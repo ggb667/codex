@@ -88,4 +88,17 @@ developer message Codex inserts when realtime becomes active. It only affects
 the realtime start message in prompt history and does not change websocket
 backend prompt settings or the realtime end/inactive message.
 
+## TUI prompt appearance
+
+Use the `[tui]` table in `~/.codex/config.toml` to customize the prompt surface:
+
+```toml
+[tui]
+prompt_glyph = "❯"
+prompt_background = "#112233"
+```
+
+- `prompt_glyph` overrides the prompt glyph shown in the composer and selection cursors. When unset, Codex uses `›`.
+- `prompt_background` overrides the background color for user prompt surfaces, including the active composer and historical user message cells. The value must be a `#RRGGBB` hex color. Invalid values are ignored with a warning.
+
 Ctrl+C/Ctrl+D quitting uses a ~1 second double-press hint (`ctrl + c again to quit`).
