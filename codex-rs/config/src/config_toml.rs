@@ -250,10 +250,12 @@ pub struct ConfigToml {
     /// Optional absolute path to patched zsh used by zsh-exec-bridge-backed shell execution.
     pub zsh_path: Option<AbsolutePathBuf>,
 
-    /// Profile to use from the `profiles` map.
+    /// Deprecated: user config must not set `profile` in `config.toml`.
+    #[schemars(skip)]
     pub profile: Option<String>,
 
-    /// Named profiles to facilitate switching between different configurations.
+    /// Deprecated: user config must not define `[profiles.*]` in `config.toml`.
+    #[schemars(skip)]
     #[serde(default)]
     pub profiles: HashMap<String, ConfigProfile>,
 

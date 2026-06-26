@@ -28,13 +28,13 @@ pub(crate) fn set_prompt_glyph(glyph: Option<String>) {
         .unwrap_or_else(|| DEFAULT_PROMPT_GLYPH.to_string());
     *prompt_glyph_lock()
         .write()
-        .expect("prompt glyph lock poisoned") = glyph;
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = glyph;
 }
 
 pub(crate) fn prompt_glyph() -> String {
     prompt_glyph_lock()
         .read()
-        .expect("prompt glyph lock poisoned")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
 }
 

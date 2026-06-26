@@ -25,7 +25,7 @@ pub fn proposed_plan_style() -> Style {
 pub fn user_message_style_for(terminal_bg: Option<(u8, u8, u8)>) -> Style {
     if let Some(color) = *user_message_bg_override_lock()
         .read()
-        .expect("user message background lock poisoned")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
     {
         return Style::default().bg(color);
     }
@@ -65,7 +65,7 @@ pub(crate) fn set_user_message_bg_override(value: Option<String>) -> Option<Stri
             Err(err) => {
                 *user_message_bg_override_lock()
                     .write()
-                    .expect("user message background lock poisoned") = None;
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                 return Some(format!("Ignoring tui.prompt_background={value:?}: {err}"));
             }
         },
@@ -74,7 +74,7 @@ pub(crate) fn set_user_message_bg_override(value: Option<String>) -> Option<Stri
 
     *user_message_bg_override_lock()
         .write()
-        .expect("user message background lock poisoned") = override_color;
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = override_color;
     None
 }
 
@@ -102,6 +102,7 @@ mod tests {
     use ratatui::style::Color;
 
     #[test]
+    #[allow(clippy::disallowed_methods)]
     fn parse_hex_color_accepts_hash_prefixed_rgb() {
         assert_eq!(parse_hex_color("#112233"), Ok(Color::Rgb(0x11, 0x22, 0x33)));
     }

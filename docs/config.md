@@ -133,4 +133,33 @@ prompt_background = "#112233"
 - `prompt_glyph` overrides the prompt glyph shown in the composer and selection cursors. When unset, Codex uses `›`.
 - `prompt_background` overrides the background color for user prompt surfaces, including the active composer and historical user message cells. The value must be a `#RRGGBB` hex color. Invalid values are ignored with a warning.
 
+## Profiles
+
+Profiles now live in standalone files under `~/.codex/`.
+
+Example:
+
+`~/.codex/twi_coordinator.config.toml`
+
+```toml
+model_provider = "openai"
+model = "gpt-5.5"
+model_reasoning_effort = "high"
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+```
+
+Launch with:
+
+```bash
+codex --profile twi_coordinator
+```
+
+Legacy profile config inside `~/.codex/config.toml` is rejected. Remove both:
+
+- `profile = "name"`
+- `[profiles.name]`
+
+and move those settings into `~/.codex/name.config.toml`.
+
 Ctrl+C/Ctrl+D quitting uses a ~1 second double-press hint (`ctrl + c again to quit`).

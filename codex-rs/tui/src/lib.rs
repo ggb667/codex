@@ -9,7 +9,7 @@ use crate::legacy_core::config::ConfigBuilder;
 use crate::legacy_core::config::ConfigOverrides;
 use crate::legacy_core::config::find_codex_home;
 use crate::legacy_core::config::load_config_as_toml_with_cli_overrides;
-use crate::legacy_core::config::resolve_oss_provider;
+use crate::legacy_core::config::resolve_oss_provider_from_profile;
 use crate::legacy_core::format_exec_policy_error_with_source;
 use crate::legacy_core::windows_sandbox::WindowsSandboxLevelExt;
 use crate::session_resume::ResolveCwdOutcome;
@@ -809,11 +809,13 @@ pub async fn run_main(
     .await;
 
     let model_provider_override = if cli.oss {
-        let resolved = resolve_oss_provider(
+        let resolved = resolve_oss_provider_from_profile(
             cli.oss_provider.as_deref(),
             &config_toml,
             cli.config_profile.clone(),
-        );
+            &codex_home,
+        )
+        .await;
 
         if let Some(provider) = resolved {
             Some(provider)

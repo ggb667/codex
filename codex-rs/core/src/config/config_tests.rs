@@ -3216,18 +3216,14 @@ async fn project_profiles_are_ignored() -> std::io::Result<()> {
         codex_home.path().join(CONFIG_TOML_FILE),
         format!(
             r#"
-profile = "global"
-
-[profiles.global]
-model = "gpt-global"
-
-[profiles.project]
-model = "gpt-project"
-
 [projects."{workspace_key}"]
 trust_level = "trusted"
 "#,
         ),
+    )?;
+    std::fs::write(
+        codex_home.path().join("global.config.toml"),
+        "model = \"gpt-global\"\n",
     )?;
     let project_config_dir = workspace.path().join(".codex");
     std::fs::create_dir_all(&project_config_dir)?;
@@ -3245,6 +3241,7 @@ model = "gpt-project-local"
         .codex_home(codex_home.path().to_path_buf())
         .harness_overrides(ConfigOverrides {
             cwd: Some(workspace.path().to_path_buf()),
+            config_profile: Some("global".to_string()),
             ..Default::default()
         })
         .build()
@@ -3263,6 +3260,63 @@ model = "gpt-project-local"
         "expected warning for ignored project-local profile keys: {:?}",
         config.startup_warnings
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn cli_profile_loads_external_profile_file() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        "model = \"base\"\n",
+    )?;
+    std::fs::write(
+        codex_home.path().join("twi_coordinator.config.toml"),
+        "model = \"gpt-5.5\"\napproval_policy = \"on-request\"\n",
+    )?;
+
+    let config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .harness_overrides(ConfigOverrides {
+            config_profile: Some("twi_coordinator".to_string()),
+            ..Default::default()
+        })
+        .build()
+        .await?;
+
+    assert_eq!(config.active_profile.as_deref(), Some("twi_coordinator"));
+    assert_eq!(config.model.as_deref(), Some("gpt-5.5"));
+    assert_eq!(
+        config.approvals_reviewer,
+        ApprovalsReviewer::User,
+        "approval policy should still resolve from the external profile without changing unrelated defaults"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_config_rejects_legacy_profile_keys() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        r#"profile = "legacy"
+
+[profiles.legacy]
+model = "gpt-5.5"
+"#,
+    )?;
+
+    let err = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await
+        .expect_err("legacy profile config should fail");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(err.to_string().contains("legacy profile config"));
+    assert!(err.to_string().contains("legacy.config.toml"));
 
     Ok(())
 }
@@ -6234,10 +6288,6 @@ fn create_test_fixture() -> std::io::Result<PrecedenceTestFixture> {
 model = "o3"
 approval_policy = "untrusted"
 
-# Can be used to determine which profile to use if not specified by
-# `ConfigOverrides`.
-profile = "gpt3"
-
 [analytics]
 enabled = true
 
@@ -6689,21 +6739,6 @@ async fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
 
     assert_eq!(expected_gpt3_profile_config, gpt3_profile_config);
 
-    // Verify that loading without specifying a profile in ConfigOverrides
-    // uses the default profile from the config file (which is "gpt3").
-    let default_profile_overrides = ConfigOverrides {
-        cwd: Some(fixture.cwd_path()),
-        ..Default::default()
-    };
-
-    let default_profile_config = Config::load_from_base_config_with_overrides(
-        fixture.cfg.clone(),
-        default_profile_overrides,
-        fixture.codex_home(),
-    )
-    .await?;
-
-    assert_eq!(expected_gpt3_profile_config, default_profile_config);
     Ok(())
 }
 
@@ -7415,35 +7450,36 @@ async fn derive_sandbox_policy_preserves_windows_downgrade_for_unsupported_fallb
     Ok(())
 }
 
-#[test]
-fn test_resolve_oss_provider_explicit_override() {
+#[tokio::test]
+async fn test_resolve_oss_provider_explicit_override() {
     let config_toml = ConfigToml::default();
-    let result = resolve_oss_provider(
+    let codex_home = TempDir::new().expect("tempdir");
+    let result = resolve_oss_provider_from_profile(
         Some("custom-provider"),
         &config_toml,
         /*config_profile*/ None,
-    );
+        codex_home.path(),
+    )
+    .await;
     assert_eq!(result, Some("custom-provider".to_string()));
 }
 
-#[test]
-fn test_resolve_oss_provider_from_profile() {
-    let mut profiles = std::collections::HashMap::new();
-    let profile = ConfigProfile {
-        oss_provider: Some("profile-provider".to_string()),
-        ..Default::default()
-    };
-    profiles.insert("test-profile".to_string(), profile);
-    let config_toml = ConfigToml {
-        profiles,
-        ..Default::default()
-    };
+#[tokio::test]
+async fn test_resolve_oss_provider_from_profile() {
+    let codex_home = TempDir::new().expect("tempdir");
+    std::fs::write(
+        codex_home.path().join("test-profile.config.toml"),
+        "oss_provider = \"profile-provider\"\n",
+    )
+    .expect("write external profile");
 
-    let result = resolve_oss_provider(
+    let result = resolve_oss_provider_from_profile(
         /*explicit_provider*/ None,
-        &config_toml,
+        &ConfigToml::default(),
         Some("test-profile".to_string()),
-    );
+        codex_home.path(),
+    )
+    .await;
     assert_eq!(result, Some("profile-provider".to_string()));
 }
 
@@ -7462,22 +7498,26 @@ fn test_resolve_oss_provider_from_global_config() {
     assert_eq!(result, Some("global-provider".to_string()));
 }
 
-#[test]
-fn test_resolve_oss_provider_profile_fallback_to_global() {
-    let mut profiles = std::collections::HashMap::new();
-    let profile = ConfigProfile::default(); // No oss_provider set
-    profiles.insert("test-profile".to_string(), profile);
+#[tokio::test]
+async fn test_resolve_oss_provider_profile_fallback_to_global() {
+    let codex_home = TempDir::new().expect("tempdir");
+    std::fs::write(
+        codex_home.path().join("test-profile.config.toml"),
+        "model = \"gpt-5.5\"\n",
+    )
+    .expect("write external profile");
     let config_toml = ConfigToml {
         oss_provider: Some("global-provider".to_string()),
-        profiles,
         ..Default::default()
     };
 
-    let result = resolve_oss_provider(
+    let result = resolve_oss_provider_from_profile(
         /*explicit_provider*/ None,
         &config_toml,
         Some("test-profile".to_string()),
-    );
+        codex_home.path(),
+    )
+    .await;
     assert_eq!(result, Some("global-provider".to_string()));
 }
 
@@ -7492,25 +7532,26 @@ fn test_resolve_oss_provider_none_when_not_configured() {
     assert_eq!(result, None);
 }
 
-#[test]
-fn test_resolve_oss_provider_explicit_overrides_all() {
-    let mut profiles = std::collections::HashMap::new();
-    let profile = ConfigProfile {
-        oss_provider: Some("profile-provider".to_string()),
-        ..Default::default()
-    };
-    profiles.insert("test-profile".to_string(), profile);
+#[tokio::test]
+async fn test_resolve_oss_provider_explicit_overrides_all() {
+    let codex_home = TempDir::new().expect("tempdir");
+    std::fs::write(
+        codex_home.path().join("test-profile.config.toml"),
+        "oss_provider = \"profile-provider\"\n",
+    )
+    .expect("write external profile");
     let config_toml = ConfigToml {
         oss_provider: Some("global-provider".to_string()),
-        profiles,
         ..Default::default()
     };
 
-    let result = resolve_oss_provider(
+    let result = resolve_oss_provider_from_profile(
         Some("explicit-provider"),
         &config_toml,
         Some("test-profile".to_string()),
-    );
+        codex_home.path(),
+    )
+    .await;
     assert_eq!(result, Some("explicit-provider".to_string()));
 }
 
@@ -8183,20 +8224,23 @@ async fn prompt_instruction_blocks_can_be_disabled_from_config_and_profiles() ->
         r#"include_permissions_instructions = false
 include_apps_instructions = false
 include_environment_context = false
-profile = "chatty"
 
 [skills]
 include_instructions = false
-
-[profiles.chatty]
-include_permissions_instructions = true
-include_environment_context = true
 "#,
+    )?;
+    std::fs::write(
+        codex_home.path().join("chatty.config.toml"),
+        "include_permissions_instructions = true\ninclude_environment_context = true\n",
     )?;
 
     let config = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .harness_overrides(ConfigOverrides {
+            config_profile: Some("chatty".to_string()),
+            ..Default::default()
+        })
         .build()
         .await?;
 
@@ -8252,18 +8296,19 @@ async fn approvals_reviewer_can_be_set_in_config_without_guardian_approval() -> 
 async fn approvals_reviewer_can_be_set_in_profile_without_guardian_approval() -> std::io::Result<()>
 {
     let codex_home = TempDir::new()?;
+    std::fs::write(codex_home.path().join(CONFIG_TOML_FILE), "")?;
     std::fs::write(
-        codex_home.path().join(CONFIG_TOML_FILE),
-        r#"profile = "guardian"
-
-[profiles.guardian]
-approvals_reviewer = "guardian_subagent"
-"#,
+        codex_home.path().join("guardian.config.toml"),
+        "approvals_reviewer = \"guardian_subagent\"\n",
     )?;
 
     let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .harness_overrides(ConfigOverrides {
+            config_profile: Some("guardian".to_string()),
+            ..Default::default()
+        })
         .build()
         .await?;
 
@@ -8329,18 +8374,19 @@ async fn root_approvals_reviewer_falls_back_when_disallowed_by_requirements() ->
 async fn profile_approvals_reviewer_falls_back_when_disallowed_by_requirements()
 -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
+    std::fs::write(codex_home.path().join(CONFIG_TOML_FILE), "")?;
     std::fs::write(
-        codex_home.path().join(CONFIG_TOML_FILE),
-        r#"profile = "default"
-
-[profiles.default]
-approvals_reviewer = "user"
-"#,
+        codex_home.path().join("default.config.toml"),
+        "approvals_reviewer = \"user\"\n",
     )?;
 
     let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .harness_overrides(ConfigOverrides {
+            config_profile: Some("default".to_string()),
+            ..Default::default()
+        })
         .cloud_requirements(CloudRequirementsLoader::new(async {
             Ok(Some(codex_config::ConfigRequirementsToml {
                 allowed_approvals_reviewers: Some(vec![ApprovalsReviewer::AutoReview]),
@@ -8421,26 +8467,28 @@ smart_approvals = true
 #[tokio::test]
 async fn smart_approvals_alias_is_ignored_in_profiles() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
+    std::fs::write(codex_home.path().join(CONFIG_TOML_FILE), "")?;
     std::fs::write(
-        codex_home.path().join(CONFIG_TOML_FILE),
-        r#"profile = "guardian"
-
-[profiles.guardian.features]
-smart_approvals = true
-"#,
+        codex_home.path().join("guardian.config.toml"),
+        "[features]\nsmart_approvals = true\n",
     )?;
 
     let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .harness_overrides(ConfigOverrides {
+            config_profile: Some("guardian".to_string()),
+            ..Default::default()
+        })
         .build()
         .await?;
 
     assert!(config.features.enabled(Feature::GuardianApproval));
     assert_eq!(config.approvals_reviewer, ApprovalsReviewer::User);
 
-    let serialized = tokio::fs::read_to_string(codex_home.path().join(CONFIG_TOML_FILE)).await?;
-    assert!(serialized.contains("[profiles.guardian.features]"));
+    let serialized =
+        tokio::fs::read_to_string(codex_home.path().join("guardian.config.toml")).await?;
+    assert!(serialized.contains("[features]"));
     assert!(serialized.contains("smart_approvals = true"));
     assert!(!serialized.contains("guardian_approval"));
     assert!(!serialized.contains("approvals_reviewer"));
@@ -8498,9 +8546,7 @@ async fn profile_multi_agent_v2_config_overrides_base() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     std::fs::write(
         codex_home.path().join(CONFIG_TOML_FILE),
-        r#"profile = "no_hint"
-
-[features.multi_agent_v2]
+        r#"[features.multi_agent_v2]
 max_concurrent_threads_per_session = 4
 min_wait_timeout_ms = 3000
 usage_hint_enabled = true
@@ -8508,8 +8554,11 @@ usage_hint_text = "base hint"
 root_agent_usage_hint_text = "base root hint"
 subagent_usage_hint_text = "base subagent hint"
 hide_spawn_agent_metadata = true
-
-[profiles.no_hint.features.multi_agent_v2]
+"#,
+    )?;
+    std::fs::write(
+        codex_home.path().join("no_hint.config.toml"),
+        r#"[features.multi_agent_v2]
 max_concurrent_threads_per_session = 6
 min_wait_timeout_ms = 1500
 usage_hint_enabled = false
@@ -8523,6 +8572,10 @@ hide_spawn_agent_metadata = false
     let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .harness_overrides(ConfigOverrides {
+            config_profile: Some("no_hint".to_string()),
+            ..Default::default()
+        })
         .build()
         .await?;
 

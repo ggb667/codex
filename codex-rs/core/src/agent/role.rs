@@ -221,6 +221,9 @@ mod reload {
                 config.config_layer_stack.requirements_toml().clone(),
             )?,
         )?;
+        if merged_config.profiles.is_empty() {
+            return Ok(None);
+        }
         let resolved_profile =
             merged_config.get_config_profile(Some(active_profile_name.to_string()))?;
         Ok(Some(ConfigLayerEntry::new(

@@ -69,7 +69,6 @@ use crate::render::renderable::Renderable;
 use crate::style::user_message_style;
 use crate::text_formatting::truncate_text;
 use crate::ui_consts::prompt_glyph;
-use crate::ui_consts::prompt_padding;
 
 /// Maximum display length for item names before truncation.
 const ITEM_NAME_TRUNCATE_LEN: usize = 21;

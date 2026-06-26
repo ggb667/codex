@@ -29,7 +29,7 @@ pub struct SharedCliOptions {
     #[arg(long = "local-provider")]
     pub oss_provider: Option<String>,
 
-    /// Configuration profile from config.toml to specify default options.
+    /// Configuration profile loaded from `$CODEX_HOME/<name>.config.toml`.
     #[arg(long = "profile", short = 'p')]
     pub config_profile: Option<String>,
 

@@ -8,6 +8,7 @@ use crate::windows_sandbox::WindowsSandboxLevelExt;
 use crate::windows_sandbox::resolve_windows_sandbox_mode;
 use crate::windows_sandbox::resolve_windows_sandbox_private_desktop;
 use codex_config::CloudRequirementsLoader;
+use codex_config::ConfigLayerEntry;
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
 use codex_config::ConfigLayerStackOrdering;
@@ -178,6 +179,7 @@ pub(crate) const DEFAULT_AGENT_JOB_MAX_RUNTIME_SECONDS: Option<u64> = None;
 const LOCAL_DEV_BUILD_VERSION: &str = "0.0.0";
 
 pub const CONFIG_TOML_FILE: &str = "config.toml";
+const PROFILE_CONFIG_SUFFIX: &str = ".config.toml";
 
 fn resolve_sqlite_home_env(resolved_cwd: &Path) -> Option<PathBuf> {
     let raw = std::env::var(codex_state::SQLITE_HOME_ENV).ok()?;
@@ -956,7 +958,7 @@ impl ConfigBuilder {
             None => AbsolutePathBuf::current_dir()?,
         };
         harness_overrides.cwd = Some(cwd.to_path_buf());
-        let config_layer_stack = load_config_layers_state(
+        let mut config_layer_stack = load_config_layers_state(
             LOCAL_FS.as_ref(),
             &codex_home,
             Some(cwd),
@@ -968,6 +970,12 @@ impl ConfigBuilder {
                 .unwrap_or(&codex_config::NoopThreadConfigLoader),
         )
         .await?;
+        reject_legacy_user_profile_config(&config_layer_stack, &codex_home)?;
+        if let Some(profile_name) = harness_overrides.config_profile.as_deref() {
+            let profile_layer =
+                load_external_profile_layer(LOCAL_FS.as_ref(), &codex_home, profile_name).await?;
+            config_layer_stack = insert_config_layer(config_layer_stack, profile_layer)?;
+        }
         let merged_toml = config_layer_stack.effective_config();
 
         // Note that each layer in ConfigLayerStack should have resolved
@@ -1042,6 +1050,135 @@ impl ConfigBuilder {
     pub(crate) fn without_managed_config_for_tests() -> Self {
         Self::default().loader_overrides(LoaderOverrides::without_managed_config_for_tests())
     }
+}
+
+fn reject_legacy_user_profile_config(
+    config_layer_stack: &ConfigLayerStack,
+    codex_home: &AbsolutePathBuf,
+) -> std::io::Result<()> {
+    let Some(user_layer) = config_layer_stack.get_user_layer() else {
+        return Ok(());
+    };
+    let Some(table) = user_layer.config.as_table() else {
+        return Ok(());
+    };
+    if !table.contains_key("profile") && !table.contains_key("profiles") {
+        return Ok(());
+    }
+
+    let user_config_path = match &user_layer.name {
+        ConfigLayerSource::User { file } => file,
+        _ => {
+            return Ok(());
+        }
+    };
+    let example_profile_path = codex_home.join(format!("NAME{PROFILE_CONFIG_SUFFIX}"));
+    Err(std::io::Error::new(
+        ErrorKind::InvalidData,
+        format!(
+            "legacy profile config in {} is no longer supported; move each profile into its own file such as {} and launch with `codex --profile NAME`",
+            user_config_path.display(),
+            example_profile_path.display(),
+        ),
+    ))
+}
+
+async fn load_external_profile_layer(
+    fs: &dyn ExecutorFileSystem,
+    codex_home: &AbsolutePathBuf,
+    profile_name: &str,
+) -> std::io::Result<ConfigLayerEntry> {
+    let profile = load_external_profile(fs, codex_home, profile_name).await?;
+    Ok(ConfigLayerEntry::new(
+        ConfigLayerSource::SessionFlags,
+        TomlValue::try_from(profile).map_err(|err| {
+            std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("failed to serialize external profile `{profile_name}`: {err}"),
+            )
+        })?,
+    ))
+}
+
+async fn load_external_profile(
+    fs: &dyn ExecutorFileSystem,
+    codex_home: &AbsolutePathBuf,
+    profile_name: &str,
+) -> std::io::Result<ConfigProfile> {
+    if profile_name.is_empty()
+        || profile_name.contains(std::path::MAIN_SEPARATOR)
+        || profile_name.contains('/')
+        || profile_name.contains('\\')
+    {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("invalid config profile name `{profile_name}`"),
+        ));
+    }
+
+    let profile_path = codex_home.join(format!("{profile_name}{PROFILE_CONFIG_SUFFIX}"));
+    let contents = fs
+        .read_file_text(&profile_path, /*sandbox*/ None)
+        .await
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                std::io::Error::new(
+                    ErrorKind::NotFound,
+                    format!(
+                        "config profile `{profile_name}` not found at {}",
+                        profile_path.display()
+                    ),
+                )
+            } else {
+                std::io::Error::new(
+                    err.kind(),
+                    format!("failed to read {}: {err}", profile_path.display()),
+                )
+            }
+        })?;
+    let _guard = AbsolutePathBufGuard::new(codex_home.as_path());
+    toml::from_str::<ConfigProfile>(&contents).map_err(|err| {
+        std::io::Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "failed to parse config profile `{profile_name}` from {}: {err}",
+                profile_path.display()
+            ),
+        )
+    })
+}
+
+async fn load_external_profile_from_disk(
+    codex_home: &Path,
+    profile_name: &str,
+) -> std::io::Result<ConfigProfile> {
+    let codex_home = AbsolutePathBuf::from_absolute_path(codex_home)?;
+    load_external_profile(LOCAL_FS.as_ref(), &codex_home, profile_name).await
+}
+
+fn insert_config_layer(
+    config_layer_stack: ConfigLayerStack,
+    layer: ConfigLayerEntry,
+) -> std::io::Result<ConfigLayerStack> {
+    let mut layers: Vec<ConfigLayerEntry> = config_layer_stack
+        .get_layers(
+            ConfigLayerStackOrdering::LowestPrecedenceFirst,
+            /*include_disabled*/ true,
+        )
+        .into_iter()
+        .cloned()
+        .collect();
+    let insertion_index = layers.partition_point(|existing| existing.name <= layer.name);
+    layers.insert(insertion_index, layer);
+    let stack = ConfigLayerStack::new(
+        layers,
+        config_layer_stack.requirements().clone(),
+        config_layer_stack.requirements_toml().clone(),
+    )?
+    .with_user_and_project_exec_policy_rules_ignored(
+        config_layer_stack.ignore_user_and_project_exec_policy_rules(),
+    );
+    Ok(stack)
 }
 
 impl Config {
@@ -1823,21 +1960,37 @@ pub fn resolve_oss_provider(
         // Explicit provider specified (e.g., via --local-provider)
         Some(provider.to_string())
     } else {
-        // Check profile config first, then global config
         let profile = config_toml.get_config_profile(config_profile).ok();
         if let Some(profile) = &profile {
-            // Check if profile has an oss provider
             if let Some(profile_oss_provider) = &profile.oss_provider {
                 Some(profile_oss_provider.clone())
-            }
-            // If not then check if the toml has an oss provider
-            else {
+            } else {
                 config_toml.oss_provider.clone()
             }
         } else {
             config_toml.oss_provider.clone()
         }
     }
+}
+
+pub async fn resolve_oss_provider_from_profile(
+    explicit_provider: Option<&str>,
+    config_toml: &ConfigToml,
+    config_profile: Option<String>,
+    codex_home: &Path,
+) -> Option<String> {
+    if let Some(provider) = explicit_provider {
+        return Some(provider.to_string());
+    }
+
+    if let Some(profile_name) = config_profile.as_deref()
+        && let Ok(profile) = load_external_profile_from_disk(codex_home, profile_name).await
+        && profile.oss_provider.is_some()
+    {
+        return profile.oss_provider;
+    }
+
+    config_toml.oss_provider.clone()
 }
 
 /// Resolve the web search mode from explicit config and feature flags.
@@ -2102,19 +2255,11 @@ impl Config {
             .as_ref()
             .or(cfg.profile.as_ref())
             .cloned();
-        let config_profile = match active_profile_name.as_ref() {
-            Some(key) => cfg
-                .profiles
-                .get(key)
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("config profile `{key}` not found"),
-                    )
-                })?
-                .clone(),
-            None => ConfigProfile::default(),
-        };
+        let config_profile = active_profile_name
+            .as_ref()
+            .and_then(|key| cfg.profiles.get(key))
+            .cloned()
+            .unwrap_or_default();
         let tool_suggest = resolve_tool_suggest_config(&cfg, &config_layer_stack);
         let feature_overrides = FeatureOverrides {
             include_apply_patch_tool: include_apply_patch_tool_override,

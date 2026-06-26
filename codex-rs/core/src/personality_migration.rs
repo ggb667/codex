@@ -1,5 +1,6 @@
 use crate::config::edit::ConfigEditsBuilder;
 use codex_config::config_toml::ConfigToml;
+use codex_config::profile_toml::ConfigProfile;
 use codex_protocol::config_types::Personality;
 use codex_thread_store::ListThreadsParams;
 use codex_thread_store::LocalThreadStore;
@@ -30,9 +31,7 @@ pub async fn maybe_migrate_personality(
         return Ok(PersonalityMigrationStatus::SkippedMarker);
     }
 
-    let config_profile = config_toml
-        .get_config_profile(/*override_profile*/ None)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    let config_profile = ConfigProfile::default();
     if config_toml.personality.is_some() || config_profile.personality.is_some() {
         create_marker(&marker_path).await?;
         return Ok(PersonalityMigrationStatus::SkippedExplicitPersonality);
