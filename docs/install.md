@@ -49,6 +49,39 @@ just test
 cargo test --all-features
 ```
 
+### Use this fork with Agenic Pony System
+
+If you want the local fork maintained by `ggb667` together with the standalone
+`agenic-pony-system` runtime, install them as two separate repos:
+
+```bash
+git clone https://github.com/ggb667/codex.git
+cd codex
+git checkout main
+
+git clone https://github.com/ggb667/agenic-pony-system.git
+cd agenic-pony-system
+git checkout main
+```
+
+Then, from inside the target project you want to pony-enable:
+
+```bash
+/path/to/agenic-pony-system/scripts/install-project.sh
+/path/to/agenic-pony-system/scripts/install-warp-launch-configs.sh
+```
+
+Or explicitly:
+
+```bash
+/path/to/agenic-pony-system/scripts/install-project.sh /path/to/project
+/path/to/agenic-pony-system/scripts/install-warp-launch-configs.sh /path/to/project
+```
+
+If you want GitHub MCP inside pony-launched Codex sessions, create a per-project
+launch env file containing `GITHUB_PAT_TOKEN` under the path described by
+`agenic-pony-system` documentation or `pony/bin/pony-launch-env-status`.
+
 ## Tracing / verbose logging
 
 Codex is written in Rust, so it honors the `RUST_LOG` environment variable to configure its logging behavior.
