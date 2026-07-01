@@ -1092,7 +1092,10 @@ impl App {
         if let Err(err) = pony_ipc::append_registry_heartbeat(&identity) {
             tracing::debug!(error = %err, "failed to write initial pony IPC heartbeat");
         }
-        self.pony_ipc_task = Some(Self::spawn_pony_ipc_task(self.app_event_tx.clone(), identity.clone()));
+        self.pony_ipc_task = Some(Self::spawn_pony_ipc_task(
+            self.app_event_tx.clone(),
+            identity.clone(),
+        ));
         self.pony_ipc_identity = Some(identity);
     }
 
@@ -1159,7 +1162,8 @@ impl App {
     fn handle_pony_send(&mut self, target: String, text: String) {
         let Some(identity) = self.pony_ipc_identity.as_ref() else {
             self.chat_widget.add_error_message(
-                "Pony IPC is unavailable because this Codex session has no pony identity.".to_string(),
+                "Pony IPC is unavailable because this Codex session has no pony identity."
+                    .to_string(),
             );
             return;
         };
@@ -1170,10 +1174,8 @@ impl App {
                 } else {
                     pony_ipc::display_pony_name(&target)
                 };
-                self.chat_widget.add_info_message(
-                    format!("Sent pony message to {recipient}."),
-                    Some(text),
-                );
+                self.chat_widget
+                    .add_info_message(format!("Sent pony message to {recipient}."), Some(text));
             }
             Err(err) => {
                 self.chat_widget
@@ -1187,7 +1189,10 @@ impl App {
             Ok(entries) if entries.is_empty() => {
                 self.chat_widget.add_info_message(
                     "No live pony Codex sessions found.".to_string(),
-                    Some("Live sessions heartbeat into the temp registry every 6 seconds.".to_string()),
+                    Some(
+                        "Live sessions heartbeat into the temp registry every 6 seconds."
+                            .to_string(),
+                    ),
                 );
             }
             Ok(entries) => {

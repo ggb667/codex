@@ -5125,7 +5125,9 @@ impl ChatWidget {
                 self.app_event_tx.send(AppEvent::OpenAgentPicker);
             }
             SlashCommand::Pony => {
-                self.add_error_message("Usage: /pony list | /pony <pony-name|all> <message>".to_string());
+                self.add_error_message(
+                    "Usage: /pony list | /pony <pony-name|all> <message>".to_string(),
+                );
             }
             SlashCommand::Approvals => {
                 self.open_permissions_popup();

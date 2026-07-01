@@ -59,7 +59,11 @@ pub(crate) struct PonyChatEntry {
 
 impl PonyChatEntry {
     pub(crate) fn prompt_text(&self) -> String {
-        format!("[{}] says {}", display_pony_name(&self.from_pony_name), self.text)
+        format!(
+            "[{}] says {}",
+            display_pony_name(&self.from_pony_name),
+            self.text
+        )
     }
 }
 
@@ -211,9 +215,12 @@ pub(crate) fn display_pony_name(name: &str) -> String {
 pub(crate) fn canonicalize_pony_name(name: &str) -> String {
     let normalized = name.trim().to_ascii_uppercase().replace([' ', '-'], "_");
     match normalized.as_str() {
-        "TIA" | "CELESTIA" | "PRINCESS" | "CELLY" | "SUNBUTT" | "PRINCESS_CELESTIA_SOL_INVICTUS" => {
-            "PRINCESS_CELESTIA_SOL_INVICTUS".to_string()
-        }
+        "TIA"
+        | "CELESTIA"
+        | "PRINCESS"
+        | "CELLY"
+        | "SUNBUTT"
+        | "PRINCESS_CELESTIA_SOL_INVICTUS" => "PRINCESS_CELESTIA_SOL_INVICTUS".to_string(),
         "TWI" | "TWILIGHT" | "TWILIGHT_SPARKLE" => "TWILIGHT_SPARKLE".to_string(),
         "AJ" | "APPLEJACK" => "APPLEJACK".to_string(),
         "FS" | "FLUTTERSHY" | "SHY" | "FLUTTERS" => "FLUTTERSHY".to_string(),
@@ -374,7 +381,9 @@ fn latest_chat_timestamp(path: &Path) -> io::Result<Option<DateTime<Utc>>> {
 
 fn append_json_line<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     let Some(parent) = path.parent() else {
-        return Err(io::Error::other("missing parent directory for pony IPC log"));
+        return Err(io::Error::other(
+            "missing parent directory for pony IPC log",
+        ));
     };
     fs::create_dir_all(parent)?;
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
@@ -475,7 +484,8 @@ fn normalize_target(target: &str) -> String {
 }
 
 fn target_matches(target: &str, pony_name: &str) -> bool {
-    target == BROADCAST_TARGET || canonicalize_pony_name(target) == canonicalize_pony_name(pony_name)
+    target == BROADCAST_TARGET
+        || canonicalize_pony_name(target) == canonicalize_pony_name(pony_name)
 }
 
 fn is_stale(timestamp: DateTime<Utc>) -> bool {
@@ -617,7 +627,8 @@ mod tests {
         let first = read_new_messages_at(&chat_path, &lock_path, &identity, &mut seen_ids).unwrap();
         assert_eq!(first, vec![fresh.clone()]);
 
-        let second = read_new_messages_at(&chat_path, &lock_path, &identity, &mut seen_ids).unwrap();
+        let second =
+            read_new_messages_at(&chat_path, &lock_path, &identity, &mut seen_ids).unwrap();
         assert!(second.is_empty());
     }
 
