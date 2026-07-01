@@ -17,6 +17,7 @@ concurrency:
   cancel-in-progress: ${{ github.ref_name != 'main' }}
 jobs:
   test:
+    if: ${{ github.repository == 'openai/codex' || matrix.os != 'macos-15' }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -134,6 +135,7 @@ jobs:
           key: bazel-cache-${{ matrix.target }}-${{ hashFiles('MODULE.bazel', 'codex-rs/Cargo.lock', 'codex-rs/Cargo.toml') }}
 
   clippy:
+    if: ${{ github.repository == 'openai/codex' || matrix.os != 'macos-15' }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
