@@ -82,6 +82,9 @@ If you want GitHub MCP inside pony-launched Codex sessions, create a per-project
 launch env file containing `GITHUB_PAT_TOKEN` under the path described by
 `agenic-pony-system` documentation or `pony/bin/pony-launch-env-status`.
 
+For the fork-specific direct pony-to-pony TUI messaging lane, see
+[`docs/pony-ipc.md`](./pony-ipc.md).
+
 ## Tracing / verbose logging
 
 Codex is written in Rust, so it honors the `RUST_LOG` environment variable to configure its logging behavior.

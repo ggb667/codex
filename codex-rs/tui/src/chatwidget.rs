@@ -56,6 +56,8 @@ use crate::mention_codec::LinkedMention;
 use crate::mention_codec::encode_history_mentions;
 use crate::model_catalog::ModelCatalog;
 use crate::multi_agents;
+use crate::pony_ipc;
+use crate::pony_ipc::PonySendCommand;
 use crate::status::RateLimitWindowDisplay;
 use crate::status::StatusAccountDisplay;
 use crate::status::StatusHistoryHandle;
@@ -5122,6 +5124,9 @@ impl ChatWidget {
             SlashCommand::Agent | SlashCommand::MultiAgents => {
                 self.app_event_tx.send(AppEvent::OpenAgentPicker);
             }
+            SlashCommand::Pony => {
+                self.add_error_message("Usage: /pony list | /pony <pony-name|all> <message>".to_string());
+            }
             SlashCommand::Approvals => {
                 self.open_permissions_popup();
             }
@@ -5368,6 +5373,27 @@ impl ChatWidget {
 
         let trimmed = args.trim();
         match cmd {
+            SlashCommand::Pony => {
+                let Some((prepared_args, _prepared_elements)) = self
+                    .bottom_pane
+                    .prepare_inline_args_submission(/*record_history*/ false)
+                else {
+                    return;
+                };
+                match pony_ipc::parse_send_command(&prepared_args) {
+                    Ok(PonySendCommand::List) => {
+                        self.app_event_tx.send(AppEvent::PonyListActive);
+                        self.bottom_pane.drain_pending_submission_state();
+                    }
+                    Ok(PonySendCommand::Send { target, text }) => {
+                        self.app_event_tx.send(AppEvent::PonySend { target, text });
+                        self.bottom_pane.drain_pending_submission_state();
+                    }
+                    Err(err) => {
+                        self.add_error_message(err);
+                    }
+                }
+            }
             SlashCommand::Fast => {
                 if trimmed.is_empty() {
                     self.dispatch_command(cmd);
@@ -10322,6 +10348,19 @@ impl ChatWidget {
 
     pub(crate) fn composer_is_empty(&self) -> bool {
         self.bottom_pane.composer_is_empty()
+    }
+
+    pub(crate) fn can_accept_synthetic_message(&self) -> bool {
+        self.composer_is_empty() && self.no_modal_or_popup_active()
+    }
+
+    pub(crate) fn try_submit_synthetic_message(&mut self, text: String) -> Result<(), String> {
+        if !self.can_accept_synthetic_message() {
+            return Err("composer is busy or a modal prompt is active".to_string());
+        }
+        self.set_composer_text(text, Vec::new(), Vec::new());
+        self.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        Ok(())
     }
 
     #[cfg(test)]

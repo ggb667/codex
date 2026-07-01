@@ -30,6 +30,7 @@ use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::StatusLineItem;
 use crate::bottom_pane::TerminalTitleItem;
 use crate::history_cell::HistoryCell;
+use crate::pony_ipc::PonyChatEntry;
 
 use codex_config::types::ApprovalsReviewer;
 use codex_features::Feature;
@@ -507,6 +508,15 @@ pub(crate) enum AppEvent {
         text: String,
         collaboration_mode: CollaborationModeMask,
     },
+
+    PonySend {
+        target: String,
+        text: String,
+    },
+
+    PonyListActive,
+
+    PonyMessageReceived(PonyChatEntry),
 
     /// Open the approval popup.
     FullScreenApprovalRequest(ApprovalRequest),

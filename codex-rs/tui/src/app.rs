@@ -42,6 +42,9 @@ use crate::multi_agents::format_agent_picker_item_name;
 use crate::multi_agents::next_agent_shortcut_matches;
 use crate::multi_agents::previous_agent_shortcut_matches;
 use crate::pager_overlay::Overlay;
+use crate::pony_ipc;
+use crate::pony_ipc::PonyChatEntry;
+use crate::pony_ipc::PonyIdentity;
 use crate::read_session_model;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::Renderable;
@@ -133,6 +136,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
@@ -1003,6 +1007,9 @@ pub(crate) struct App {
     primary_session_configured: Option<ThreadSessionState>,
     pending_primary_events: VecDeque<ThreadBufferedEvent>,
     pending_app_server_requests: PendingAppServerRequests,
+    pony_ipc_identity: Option<PonyIdentity>,
+    pony_ipc_task: Option<JoinHandle<()>>,
+    pending_pony_messages: VecDeque<PendingPonyMessage>,
 }
 
 #[derive(Default)]
@@ -1047,6 +1054,11 @@ enum ActiveTurnSteerRace {
     ExpectedTurnMismatch { actual_turn_id: String },
 }
 
+struct PendingPonyMessage {
+    message: PonyChatEntry,
+    queue_id: Option<String>,
+}
+
 fn active_turn_steer_race(error: &TypedRequestError) -> Option<ActiveTurnSteerRace> {
     let TypedRequestError::Server { method, source } = error else {
         return None;
@@ -1073,6 +1085,129 @@ fn active_turn_steer_race(error: &TypedRequestError) -> Option<ActiveTurnSteerRa
 }
 
 impl App {
+    fn maybe_start_pony_ipc(&mut self) {
+        let Some(identity) = pony_ipc::pony_identity_from_env(self.config.cwd.as_ref()) else {
+            return;
+        };
+        if let Err(err) = pony_ipc::append_registry_heartbeat(&identity) {
+            tracing::debug!(error = %err, "failed to write initial pony IPC heartbeat");
+        }
+        self.pony_ipc_task = Some(Self::spawn_pony_ipc_task(self.app_event_tx.clone(), identity.clone()));
+        self.pony_ipc_identity = Some(identity);
+    }
+
+    fn spawn_pony_ipc_task(app_event_tx: AppEventSender, identity: PonyIdentity) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut seen_ids = HashSet::new();
+            loop {
+                if let Err(err) = pony_ipc::append_registry_heartbeat(&identity) {
+                    tracing::debug!(error = %err, "failed to refresh pony IPC heartbeat");
+                }
+                match pony_ipc::read_new_messages(&identity, &mut seen_ids) {
+                    Ok(messages) => {
+                        for message in messages {
+                            app_event_tx.send(AppEvent::PonyMessageReceived(message));
+                        }
+                    }
+                    Err(err) => {
+                        tracing::debug!(error = %err, "failed to read pony IPC messages");
+                    }
+                }
+                tokio::time::sleep(pony_ipc::PONY_IPC_POLL_INTERVAL).await;
+            }
+        })
+    }
+
+    fn try_deliver_pending_pony_messages(&mut self) {
+        while self.chat_widget.can_accept_synthetic_message() {
+            let Some(pending) = self.pending_pony_messages.pop_front() else {
+                break;
+            };
+            if let Err(err) = self
+                .chat_widget
+                .try_submit_synthetic_message(pending.message.prompt_text())
+            {
+                tracing::debug!(error = %err, from = %pending.message.from_pony_name, "failed to inject pony IPC message");
+                self.pending_pony_messages.push_front(pending);
+                break;
+            }
+            if let (Some(identity), Some(queue_id)) =
+                (self.pony_ipc_identity.as_ref(), pending.queue_id.as_deref())
+            {
+                if let Err(err) = pony_ipc::remove_queued_message(identity, queue_id) {
+                    tracing::debug!(error = %err, queue_id, "failed to clear persisted pony queue item after direct delivery");
+                }
+            }
+        }
+    }
+
+    fn queue_or_buffer_pony_message(&mut self, message: PonyChatEntry) {
+        let queue_id = self
+            .pony_ipc_identity
+            .as_ref()
+            .and_then(|identity| match pony_ipc::persist_incoming_message(identity, &message) {
+                Ok(queue_id) => queue_id,
+                Err(err) => {
+                    tracing::debug!(error = %err, from = %message.from_pony_name, "failed to persist incoming pony message into project runtime queue");
+                    None
+                }
+            });
+        self.pending_pony_messages
+            .push_back(PendingPonyMessage { message, queue_id });
+    }
+
+    fn handle_pony_send(&mut self, target: String, text: String) {
+        let Some(identity) = self.pony_ipc_identity.as_ref() else {
+            self.chat_widget.add_error_message(
+                "Pony IPC is unavailable because this Codex session has no pony identity.".to_string(),
+            );
+            return;
+        };
+        match pony_ipc::append_chat_message(identity, &target, &text) {
+            Ok(_entry) => {
+                let recipient = if target == "*" {
+                    "all ponies".to_string()
+                } else {
+                    pony_ipc::display_pony_name(&target)
+                };
+                self.chat_widget.add_info_message(
+                    format!("Sent pony message to {recipient}."),
+                    Some(text),
+                );
+            }
+            Err(err) => {
+                self.chat_widget
+                    .add_error_message(format!("Failed to send pony message: {err}"));
+            }
+        }
+    }
+
+    fn handle_pony_list_active(&mut self) {
+        match pony_ipc::read_live_registry() {
+            Ok(entries) if entries.is_empty() => {
+                self.chat_widget.add_info_message(
+                    "No live pony Codex sessions found.".to_string(),
+                    Some("Live sessions heartbeat into the temp registry every 6 seconds.".to_string()),
+                );
+            }
+            Ok(entries) => {
+                let mut lines = vec![Line::from("Live pony Codex sessions:")];
+                for entry in entries {
+                    lines.push(Line::from(format!(
+                        "- {} [{}] {}",
+                        pony_ipc::display_pony_name(&entry.pony_name),
+                        entry.git_branch,
+                        entry.path,
+                    )));
+                }
+                self.chat_widget.add_plain_history_lines(lines);
+            }
+            Err(err) => {
+                self.chat_widget
+                    .add_error_message(format!("Failed to read pony registry: {err}"));
+            }
+        }
+    }
     pub fn chatwidget_init_for_forked_or_resumed_thread(
         &self,
         tui: &mut tui::Tui,
@@ -3794,7 +3929,11 @@ impl App {
             primary_session_configured: None,
             pending_primary_events: VecDeque::new(),
             pending_app_server_requests: PendingAppServerRequests::default(),
+            pony_ipc_identity: None,
+            pony_ipc_task: None,
+            pending_pony_messages: VecDeque::new(),
         };
+        app.maybe_start_pony_ipc();
         if let Some(started) = initial_started_thread {
             app.enqueue_primary_thread_session(started.session, started.turns)
                 .await?;
@@ -3987,6 +4126,7 @@ impl App {
                     }
                     // Allow widgets to process any pending timers before rendering.
                     self.chat_widget.pre_draw_tick();
+                    self.try_deliver_pending_pony_messages();
                     tui.draw(
                         self.chat_widget.desired_height(tui.terminal.size()?.width),
                         |frame| {
@@ -5368,6 +5508,15 @@ impl App {
                 self.chat_widget
                     .submit_user_message_with_mode(text, collaboration_mode);
             }
+            AppEvent::PonySend { target, text } => {
+                self.handle_pony_send(target, text);
+            }
+            AppEvent::PonyListActive => {
+                self.handle_pony_list_active();
+            }
+            AppEvent::PonyMessageReceived(message) => {
+                self.queue_or_buffer_pony_message(message);
+            }
             AppEvent::ManageSkillsClosed => {
                 self.chat_widget.handle_manage_skills_closed();
             }
@@ -5525,6 +5674,7 @@ impl App {
                 }
             }
         }
+        self.try_deliver_pending_pony_messages();
         Ok(AppRunControl::Continue)
     }
 
@@ -6195,6 +6345,9 @@ fn mcp_inventory_maps_from_statuses(statuses: Vec<McpServerStatus>) -> McpInvent
 
 impl Drop for App {
     fn drop(&mut self) {
+        if let Some(task) = self.pony_ipc_task.take() {
+            task.abort();
+        }
         if let Err(err) = self.chat_widget.clear_managed_terminal_title() {
             tracing::debug!(error = %err, "failed to clear terminal title on app drop");
         }
@@ -9105,6 +9258,9 @@ guardian_approval = true
             primary_session_configured: None,
             pending_primary_events: VecDeque::new(),
             pending_app_server_requests: PendingAppServerRequests::default(),
+            pony_ipc_identity: None,
+            pony_ipc_task: None,
+            pending_pony_messages: VecDeque::new(),
         }
     }
 
@@ -9159,6 +9315,9 @@ guardian_approval = true
                 primary_session_configured: None,
                 pending_primary_events: VecDeque::new(),
                 pending_app_server_requests: PendingAppServerRequests::default(),
+                pony_ipc_identity: None,
+                pony_ipc_task: None,
+                pending_pony_messages: VecDeque::new(),
             },
             rx,
             op_rx,
