@@ -1056,7 +1056,6 @@ enum ActiveTurnSteerRace {
 
 struct PendingPonyMessage {
     message: PonyChatEntry,
-    queue_id: Option<String>,
 }
 
 fn active_turn_steer_race(error: &TypedRequestError) -> Option<ActiveTurnSteerRace> {
@@ -1106,9 +1105,19 @@ impl App {
                 if let Err(err) = pony_ipc::append_registry_heartbeat(&identity) {
                     tracing::debug!(error = %err, "failed to refresh pony IPC heartbeat");
                 }
-                match pony_ipc::read_new_messages(&identity, &mut seen_ids) {
+                match pony_ipc::read_new_messages(&identity) {
                     Ok(messages) => {
                         for message in messages {
+                            if !seen_ids.insert(message.id.clone()) {
+                                continue;
+                            }
+                            if let Err(err) =
+                                pony_ipc::append_incoming_message_to_mailbox(&identity, &message)
+                            {
+                                tracing::debug!(error = %err, from = %message.from_pony_name, "failed to append pony letter to mailbox");
+                                seen_ids.remove(&message.id);
+                                continue;
+                            }
                             app_event_tx.send(AppEvent::PonyMessageReceived(message));
                         }
                     }
@@ -1134,29 +1143,12 @@ impl App {
                 self.pending_pony_messages.push_front(pending);
                 break;
             }
-            if let (Some(identity), Some(queue_id)) =
-                (self.pony_ipc_identity.as_ref(), pending.queue_id.as_deref())
-            {
-                if let Err(err) = pony_ipc::remove_queued_message(identity, queue_id) {
-                    tracing::debug!(error = %err, queue_id, "failed to clear persisted pony queue item after direct delivery");
-                }
-            }
         }
     }
 
     fn queue_or_buffer_pony_message(&mut self, message: PonyChatEntry) {
-        let queue_id = self
-            .pony_ipc_identity
-            .as_ref()
-            .and_then(|identity| match pony_ipc::persist_incoming_message(identity, &message) {
-                Ok(queue_id) => queue_id,
-                Err(err) => {
-                    tracing::debug!(error = %err, from = %message.from_pony_name, "failed to persist incoming pony message into project runtime queue");
-                    None
-                }
-            });
         self.pending_pony_messages
-            .push_back(PendingPonyMessage { message, queue_id });
+            .push_back(PendingPonyMessage { message });
     }
 
     fn handle_pony_send(&mut self, target: String, text: String) {

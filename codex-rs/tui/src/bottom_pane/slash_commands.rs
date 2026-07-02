@@ -42,7 +42,11 @@ pub(crate) fn builtins_for_input(flags: BuiltinCommandFlags) -> Vec<(&'static st
 
 /// Find a single built-in command by exact name, after applying the gating rules.
 pub(crate) fn find_builtin_command(name: &str, flags: BuiltinCommandFlags) -> Option<SlashCommand> {
-    let cmd = SlashCommand::from_str(name).ok()?;
+    let cmd = if name.eq_ignore_ascii_case("pony") {
+        SlashCommand::Tell
+    } else {
+        SlashCommand::from_str(name).ok()?
+    };
     builtins_for_input(flags)
         .into_iter()
         .any(|(_, visible_cmd)| visible_cmd == cmd)
@@ -101,6 +105,14 @@ mod tests {
         assert_eq!(
             find_builtin_command("clean", all_enabled_flags()),
             Some(SlashCommand::Stop)
+        );
+    }
+
+    #[test]
+    fn pony_command_alias_resolves_for_dispatch() {
+        assert_eq!(
+            find_builtin_command("pony", all_enabled_flags()),
+            Some(SlashCommand::Tell)
         );
     }
 

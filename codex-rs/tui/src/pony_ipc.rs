@@ -4,7 +4,6 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -52,18 +51,49 @@ pub(crate) struct PonyChatEntry {
     pub(crate) id: String,
     pub(crate) from_instance_id: String,
     pub(crate) from_pony_name: String,
+    pub(crate) from_symbol: String,
     pub(crate) to: String,
-    pub(crate) text: String,
+    pub(crate) subject: String,
+    pub(crate) body: String,
     pub(crate) created_at: DateTime<Utc>,
 }
 
 impl PonyChatEntry {
     pub(crate) fn prompt_text(&self) -> String {
+        let sender = self.display_sender();
+        if self.body.is_empty() {
+            format!("{sender} letter\nSubject: {}", self.subject)
+        } else {
+            format!(
+                "{sender} letter\nSubject: {}\nBody:\n{}",
+                self.subject, self.body
+            )
+        }
+    }
+
+    pub(crate) fn mailbox_markdown(&self) -> String {
+        let body = if self.body.is_empty() {
+            "_empty_".to_string()
+        } else {
+            self.body.clone()
+        };
         format!(
-            "[{}] says {}",
-            display_pony_name(&self.from_pony_name),
-            self.text
+            "## {}\n- FROM: {}\n- TO: {}\n- SUBJECT: {}\n- BODY:\n```text\n{}\n```\n\n",
+            self.created_at.to_rfc3339(),
+            self.display_sender(),
+            display_pony_name(&self.to),
+            self.subject,
+            body
         )
+    }
+
+    fn display_sender(&self) -> String {
+        let pony = display_pony_name(&self.from_pony_name);
+        if self.from_symbol.is_empty() {
+            pony
+        } else {
+            format!("{} {}", self.from_symbol, pony)
+        }
     }
 }
 
@@ -154,53 +184,19 @@ pub(crate) fn read_live_registry() -> io::Result<Vec<PonyRegistryEntry>> {
     read_live_registry_at(&registry_path, &lock_path)
 }
 
-pub(crate) fn read_new_messages(
-    identity: &PonyIdentity,
-    seen_ids: &mut HashSet<String>,
-) -> io::Result<Vec<PonyChatEntry>> {
+pub(crate) fn read_new_messages(identity: &PonyIdentity) -> io::Result<Vec<PonyChatEntry>> {
     let chat_path = pony_chat_log_path();
     let lock_path = pony_chat_lock_path();
-    read_new_messages_at(&chat_path, &lock_path, identity, seen_ids)
+    read_new_messages_at(&chat_path, &lock_path, identity)
 }
 
-pub(crate) fn persist_incoming_message(
+pub(crate) fn append_incoming_message_to_mailbox(
     identity: &PonyIdentity,
     message: &PonyChatEntry,
-) -> io::Result<Option<String>> {
+) -> io::Result<()> {
     let project_root = Path::new(&identity.project_path);
-    let Some(script_path) = queue_runtime_script_path(project_root) else {
-        return Ok(None);
-    };
-    let requester = display_pony_name(&message.from_pony_name);
-    let body = message.prompt_text();
-    let output = Command::new(&script_path)
-        .current_dir(project_root)
-        .arg("enqueue")
-        .arg("agent")
-        .arg(&requester)
-        .arg(&body)
-        .output()?;
-    ensure_queue_runtime_success("enqueue", &output)?;
-    refresh_pending_notice(project_root, &script_path)?;
-    let queue_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if queue_id.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(queue_id))
-}
-
-pub(crate) fn remove_queued_message(identity: &PonyIdentity, queue_id: &str) -> io::Result<()> {
-    let project_root = Path::new(&identity.project_path);
-    let Some(script_path) = queue_runtime_script_path(project_root) else {
-        return Ok(());
-    };
-    let output = Command::new(&script_path)
-        .current_dir(project_root)
-        .arg("pop")
-        .arg(queue_id)
-        .output()?;
-    ensure_queue_runtime_success("pop", &output)?;
-    refresh_pending_notice(project_root, &script_path)
+    let mailbox_path = pony_mailbox_path(project_root, &identity.pony_name);
+    append_text_block(&mailbox_path, &message.mailbox_markdown())
 }
 
 pub(crate) fn display_pony_name(name: &str) -> String {
@@ -244,14 +240,14 @@ fn canonicalize_target_pony_name(name: &str) -> Result<String, String> {
         | "RAINBOW_DASH"
         | "SPIKE" => Ok(canonical),
         _ => Err(format!(
-            "Unknown pony '{}'. Usage: /pony list | /pony <pony-name|all> <message>",
+            "Unknown pony '{}'. Usage: /tell list | /tell <pony-name|all> <message>",
             name.trim()
         )),
     }
 }
 
 fn pony_usage() -> &'static str {
-    "Usage: /pony list | /pony <pony-name|all> <message>"
+    "Usage: /tell list | /tell <pony-name|all> <message>"
 }
 
 fn append_registry_heartbeat_at(
@@ -271,12 +267,18 @@ fn append_chat_message_at(
     text: &str,
 ) -> io::Result<PonyChatEntry> {
     maybe_reset_stale_chat_log(chat_path, lock_path)?;
+    let trimmed = text.trim();
+    let (subject, body) = split_subject_and_body(trimmed);
     let entry = PonyChatEntry {
         id: Uuid::new_v4().to_string(),
         from_instance_id: identity.instance_id.clone(),
         from_pony_name: identity.pony_name.clone(),
+        from_symbol: pony_symbol_for_name(&identity.pony_name)
+            .unwrap_or("")
+            .to_string(),
         to: normalize_target(target),
-        text: text.trim().to_string(),
+        subject,
+        body,
         created_at: Utc::now(),
     };
     append_json_line(chat_path, &entry)?;
@@ -308,15 +310,11 @@ fn read_new_messages_at(
     chat_path: &Path,
     lock_path: &Path,
     identity: &PonyIdentity,
-    seen_ids: &mut HashSet<String>,
 ) -> io::Result<Vec<PonyChatEntry>> {
     maybe_reset_stale_chat_log(chat_path, lock_path)?;
     let mut messages = Vec::new();
     for entry in read_jsonl::<PonyChatEntry>(chat_path)? {
         if is_stale(entry.created_at) {
-            continue;
-        }
-        if !seen_ids.insert(entry.id.clone()) {
             continue;
         }
         if entry.from_instance_id == identity.instance_id {
@@ -452,27 +450,66 @@ fn pony_chat_lock_path() -> PathBuf {
     std::env::temp_dir().join("codex-pony-chat.cleanup.lock")
 }
 
-fn queue_runtime_script_path(project_root: &Path) -> Option<PathBuf> {
-    let path = project_root.join("pony/scripts/queue-runtime.sh");
-    path.is_file().then_some(path)
-}
-
-fn refresh_pending_notice(project_root: &Path, script_path: &Path) -> io::Result<()> {
-    let output = Command::new(script_path)
-        .current_dir(project_root)
-        .arg("pending-notice")
-        .output()?;
-    ensure_queue_runtime_success("pending-notice", &output)
-}
-
-fn ensure_queue_runtime_success(action: &str, output: &std::process::Output) -> io::Result<()> {
-    if output.status.success() {
-        return Ok(());
+fn split_subject_and_body(text: &str) -> (String, String) {
+    let mut split_at = text.len();
+    let mut chars_seen = 0usize;
+    for (idx, ch) in text.char_indices() {
+        if matches!(ch, '.' | '!' | '?' | '\n') {
+            split_at = idx;
+            break;
+        }
+        chars_seen += 1;
+        if chars_seen == 25 {
+            split_at = idx + ch.len_utf8();
+            break;
+        }
     }
-    Err(io::Error::other(format!(
-        "queue-runtime.sh {action} failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    )))
+    let subject = text[..split_at].trim_end().to_string();
+    let body = text[split_at..].to_string();
+    (subject, body)
+}
+
+fn pony_symbol_for_name(name: &str) -> Option<&'static str> {
+    match canonicalize_pony_name(name).as_str() {
+        "PRINCESS_CELESTIA_SOL_INVICTUS" => Some("☀︎"),
+        "TWILIGHT_SPARKLE" => Some("✶"),
+        "APPLEJACK" => Some("🍎"),
+        "FLUTTERSHY" => Some("🦋"),
+        "PINKIE_PIE" => Some("🎈"),
+        "RARITY" => Some("💎"),
+        "RAINBOW_DASH" => Some("⚡"),
+        "SPIKE" => Some("🐲"),
+        _ => None,
+    }
+}
+
+fn pony_mailbox_path(project_root: &Path, pony_name: &str) -> PathBuf {
+    project_root
+        .join("pony/team.coordination")
+        .join(format!("{}.mailbox.md", pony_mailbox_stem(pony_name)))
+}
+
+fn pony_mailbox_stem(pony_name: &str) -> &'static str {
+    match canonicalize_pony_name(pony_name).as_str() {
+        "PRINCESS_CELESTIA_SOL_INVICTUS" => "celestia",
+        "TWILIGHT_SPARKLE" => "twi",
+        "APPLEJACK" => "aj",
+        "FLUTTERSHY" => "fs",
+        "PINKIE_PIE" => "pinkie",
+        "RARITY" => "rarity",
+        "RAINBOW_DASH" => "rd",
+        "SPIKE" => "spike",
+        _ => "unknown",
+    }
+}
+
+fn append_text_block(path: &Path, block: &str) -> io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Err(io::Error::other("missing parent directory for mailbox"));
+    };
+    fs::create_dir_all(parent)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(block.as_bytes())
 }
 
 fn normalize_target(target: &str) -> String {
@@ -599,37 +636,74 @@ mod tests {
             id: "msg-1".to_string(),
             from_instance_id: "uuid-2".to_string(),
             from_pony_name: "PINKIE_PIE".to_string(),
+            from_symbol: "🎈".to_string(),
             to: "TWILIGHT_SPARKLE".to_string(),
-            text: "check in".to_string(),
+            subject: "check in".to_string(),
+            body: String::new(),
             created_at: Utc::now(),
         };
         let stale = PonyChatEntry {
             id: "msg-2".to_string(),
             from_instance_id: "uuid-3".to_string(),
             from_pony_name: "APPLEJACK".to_string(),
+            from_symbol: "🍎".to_string(),
             to: "TWILIGHT_SPARKLE".to_string(),
-            text: "old message".to_string(),
+            subject: "old message".to_string(),
+            body: String::new(),
             created_at: Utc::now() - ChronoDuration::hours(2),
         };
         let own = PonyChatEntry {
             id: "msg-3".to_string(),
             from_instance_id: identity.instance_id.clone(),
             from_pony_name: identity.pony_name.clone(),
+            from_symbol: "✶".to_string(),
             to: "TWILIGHT_SPARKLE".to_string(),
-            text: "self".to_string(),
+            subject: "self".to_string(),
+            body: String::new(),
             created_at: Utc::now(),
         };
         append_json_line(&chat_path, &fresh).unwrap();
         append_json_line(&chat_path, &stale).unwrap();
         append_json_line(&chat_path, &own).unwrap();
 
-        let mut seen_ids = HashSet::new();
-        let first = read_new_messages_at(&chat_path, &lock_path, &identity, &mut seen_ids).unwrap();
+        let first = read_new_messages_at(&chat_path, &lock_path, &identity).unwrap();
         assert_eq!(first, vec![fresh.clone()]);
 
-        let second =
-            read_new_messages_at(&chat_path, &lock_path, &identity, &mut seen_ids).unwrap();
-        assert!(second.is_empty());
+        let second = read_new_messages_at(&chat_path, &lock_path, &identity).unwrap();
+        assert_eq!(second, vec![fresh]);
+    }
+
+    #[test]
+    fn parse_send_command_splits_subject_and_body() {
+        let entry = append_chat_message_at(
+            Path::new("/tmp/chat.jsonl"),
+            Path::new("/tmp/chat.lock"),
+            &sample_identity(),
+            "TWILIGHT_SPARKLE",
+            "databases should use RDS. Please update the schema tonight.",
+        )
+        .unwrap();
+        assert_eq!(entry.subject, "databases should use RDS");
+        assert_eq!(entry.body, ". Please update the schema tonight.");
+        assert_eq!(entry.from_symbol, "✶");
+    }
+
+    #[test]
+    fn mailbox_markdown_uses_sender_symbol() {
+        let entry = PonyChatEntry {
+            id: "msg-4".to_string(),
+            from_instance_id: "uuid-4".to_string(),
+            from_pony_name: "APPLEJACK".to_string(),
+            from_symbol: "🍎".to_string(),
+            to: "TWILIGHT_SPARKLE".to_string(),
+            subject: "databases should use RDS".to_string(),
+            body: " Please update the schema tonight.".to_string(),
+            created_at: Utc::now(),
+        };
+        let rendered = entry.mailbox_markdown();
+        assert!(rendered.contains("FROM: 🍎 Applejack"));
+        assert!(rendered.contains("SUBJECT: databases should use RDS"));
+        assert!(rendered.contains("Please update the schema tonight."));
     }
 
     #[test]

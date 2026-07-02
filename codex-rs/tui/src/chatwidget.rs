@@ -5124,9 +5124,9 @@ impl ChatWidget {
             SlashCommand::Agent | SlashCommand::MultiAgents => {
                 self.app_event_tx.send(AppEvent::OpenAgentPicker);
             }
-            SlashCommand::Pony => {
+            SlashCommand::Tell => {
                 self.add_error_message(
-                    "Usage: /pony list | /pony <pony-name|all> <message>".to_string(),
+                    "Usage: /tell list | /tell <pony-name|all> <message>".to_string(),
                 );
             }
             SlashCommand::Approvals => {
@@ -5375,7 +5375,7 @@ impl ChatWidget {
 
         let trimmed = args.trim();
         match cmd {
-            SlashCommand::Pony => {
+            SlashCommand::Tell => {
                 let Some((prepared_args, _prepared_elements)) = self
                     .bottom_pane
                     .prepare_inline_args_submission(/*record_history*/ false)

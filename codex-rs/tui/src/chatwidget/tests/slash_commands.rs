@@ -52,7 +52,7 @@ async fn slash_pony_send_clears_composer_and_emits_event() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     chat.bottom_pane
-        .set_composer_text("/pony rd do a ls -la".to_string(), Vec::new(), Vec::new());
+        .set_composer_text("/tell rd do a ls -la".to_string(), Vec::new(), Vec::new());
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
     assert_matches!(

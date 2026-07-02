@@ -1,27 +1,46 @@
 # Pony IPC
 
-This fork includes a local pony-to-pony messaging path inside the TUI.
+This fork now treats `/tell` as the user-facing command for pony letters.
+The live `/tmp` transport is an implementation detail that carries structured
+letters; the receiving pony writes each letter into its mailbox before acting
+on it.
 
 ## User-facing command
 
 Supported forms:
 
-- `/pony list`
-- `/pony <pony-name> <message>`
-- `/pony all <message>`
+- `/tell list`
+- `/tell <pony-name> <message>`
+- `/tell all <message>`
 
 Examples:
 
-- `/pony rd do a ls -la`
-- `/pony twilight please verify the branch before I continue`
-- `/pony all status check`
+- `/tell rd do a ls -la`
+- `/tell twilight please verify the branch before I continue`
+- `/tell all status check`
+- `/tell aj databases should use RDS.`
 
-The `/pony` command is a built-in slash command. On successful dispatch it clears
-the composer like other inline slash commands.
+The `/tell` command is a built-in slash command. On successful dispatch it
+clears the composer like other inline slash commands.
+
+## Letter envelope
+
+Each sent letter carries four core fields:
+
+- `DATE`
+- `FROM`
+- `SUBJECT`
+- `BODY`
+
+`SUBJECT` is derived from the body text up to the first `.`, `!`, `?`, newline,
+or 25 characters, whichever comes first. `BODY` is the remainder.
+
+The sender's cutie-mark symbol is included in the transport and mailbox render
+so intrasystem messages are visually distinct from ordinary user text.
 
 ## Identity and scope
 
-Pony IPC is only active when the TUI is launched with pony identity env vars.
+Pony letters are only active when the TUI is launched with pony identity env vars.
 
 Identity comes from:
 
@@ -29,8 +48,8 @@ Identity comes from:
 - `AGENIC_PROJECT_ROOT`
 - `AGENIC_PROJECT_BRANCH`
 
-If no pony identity is present, `/pony` remains unavailable at the App layer and
-the TUI reports that pony IPC is unavailable for the current session.
+If no pony identity is present, `/tell` remains unavailable at the App layer and
+the TUI reports that pony letters are unavailable for the current session.
 
 ## Transport
 
@@ -38,15 +57,15 @@ The current implementation is intentionally local-only and file-backed.
 
 - Live-session registry: `/tmp/codex-pony-registry.jsonl`
 - Registry cleanup lock: `/tmp/codex-pony-registry.cleanup.lock`
-- Chat log: `/tmp/codex-pony-chat.jsonl`
-- Chat cleanup lock: `/tmp/codex-pony-chat.cleanup.lock`
+- Letter log: `/tmp/codex-pony-chat.jsonl`
+- Letter cleanup lock: `/tmp/codex-pony-chat.cleanup.lock`
 
 Each pony session:
 
 - writes a heartbeat entry on startup
 - refreshes that heartbeat every 6 seconds
-- polls the shared chat log every 6 seconds
-- ignores its own outbound messages
+- polls the shared letter log every 6 seconds
+- ignores its own outbound letters
 - accepts direct pony targets or broadcast `*`
 
 Entries older than 1 hour are treated as stale, and the next live session may
@@ -54,36 +73,21 @@ reset the corresponding log.
 
 ## Delivery behavior
 
-Inbound pony messages are turned into synthetic user prompts inside the TUI.
+Inbound pony letters are written to the receiver's project-local mailbox under
+`pony/team.coordination/` and then delivered into the TUI as synthetic prompts
+when the composer is free.
 
 Current path:
 
-1. sender issues `/pony ...`
-2. Codex app appends a chat entry to the shared JSONL log
+1. sender issues `/tell ...`
+2. Codex app appends a structured letter entry to the shared JSONL log
 3. receiver polls and reads matching entries
-4. receiver mirrors the message into the project-local `pony/runtime` queue
-5. receiver injects the message into the chat widget as a synthetic submission when the composer is free
+4. receiver appends the letter to its mailbox markdown file
+5. receiver injects the message into the chat widget as a synthetic submission
+   when the composer is free
 
-Rendered prompt text currently looks like:
-
-```text
-[Applejack] says do a ls -la
-```
+Rendered prompt text includes the sender's cutie-mark symbol so the message is
+clearly an intrasystem letter rather than user input.
 
 Delivery waits until the receiving composer is empty and no modal or popup is
 active.
-
-## Current limitation
-
-This IPC lane now mirrors inbound messages into the project-local queue runtime
-before direct TUI delivery, so the parked shell host can retain durable state
-when immediate injection is blocked.
-
-Current limitation:
-
-- the direct TUI lane and the queue-backed lane are still coupled by best-effort
-  shelling to `pony/scripts/queue-runtime.sh`
-- immediate live delivery removes the queued item again, so the queue acts as a
-  persistence bridge rather than the sole execution engine
-- this remains fork-specific behavior in the Codex checkout, not upstream Codex
-  behavior
