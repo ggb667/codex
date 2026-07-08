@@ -312,7 +312,7 @@ fn read_new_messages_at(
     identity: &PonyIdentity,
 ) -> io::Result<Vec<PonyChatEntry>> {
     maybe_reset_stale_chat_log(chat_path, lock_path)?;
-    let mut messages = Vec::new();
+    let mut latest_by_sender: HashMap<String, PonyChatEntry> = HashMap::new();
     for entry in read_jsonl::<PonyChatEntry>(chat_path)? {
         if is_stale(entry.created_at) {
             continue;
@@ -323,8 +323,15 @@ fn read_new_messages_at(
         if !target_matches(&entry.to, &identity.pony_name) {
             continue;
         }
-        messages.push(entry);
+        let sender = canonicalize_pony_name(&entry.from_pony_name);
+        match latest_by_sender.get(&sender) {
+            Some(existing) if existing.created_at >= entry.created_at => {}
+            _ => {
+                latest_by_sender.insert(sender, entry);
+            }
+        }
     }
+    let mut messages = latest_by_sender.into_values().collect::<Vec<_>>();
     messages.sort_by(|left, right| left.created_at.cmp(&right.created_at));
     Ok(messages)
 }
@@ -627,23 +634,33 @@ mod tests {
     }
 
     #[test]
-    fn read_new_messages_filters_self_stale_and_duplicate_ids() {
+    fn read_new_messages_keeps_only_latest_message_per_sender() {
         let temp = tempdir().unwrap();
         let chat_path = temp.path().join("chat.jsonl");
         let lock_path = temp.path().join("chat.lock");
         let identity = sample_identity();
-        let fresh = PonyChatEntry {
+        let older_from_pinkie = PonyChatEntry {
             id: "msg-1".to_string(),
             from_instance_id: "uuid-2".to_string(),
             from_pony_name: "PINKIE_PIE".to_string(),
             from_symbol: "🎈".to_string(),
             to: "TWILIGHT_SPARKLE".to_string(),
-            subject: "check in".to_string(),
+            subject: "older waiting note".to_string(),
+            body: String::new(),
+            created_at: Utc::now() - ChronoDuration::seconds(5),
+        };
+        let fresh_from_pinkie = PonyChatEntry {
+            id: "msg-2".to_string(),
+            from_instance_id: "uuid-2".to_string(),
+            from_pony_name: "PINKIE_PIE".to_string(),
+            from_symbol: "🎈".to_string(),
+            to: "TWILIGHT_SPARKLE".to_string(),
+            subject: "latest waiting note".to_string(),
             body: String::new(),
             created_at: Utc::now(),
         };
         let stale = PonyChatEntry {
-            id: "msg-2".to_string(),
+            id: "msg-3".to_string(),
             from_instance_id: "uuid-3".to_string(),
             from_pony_name: "APPLEJACK".to_string(),
             from_symbol: "🍎".to_string(),
@@ -653,7 +670,7 @@ mod tests {
             created_at: Utc::now() - ChronoDuration::hours(2),
         };
         let own = PonyChatEntry {
-            id: "msg-3".to_string(),
+            id: "msg-4".to_string(),
             from_instance_id: identity.instance_id.clone(),
             from_pony_name: identity.pony_name.clone(),
             from_symbol: "✶".to_string(),
@@ -662,15 +679,27 @@ mod tests {
             body: String::new(),
             created_at: Utc::now(),
         };
-        append_json_line(&chat_path, &fresh).unwrap();
+        let fresh_from_dash = PonyChatEntry {
+            id: "msg-5".to_string(),
+            from_instance_id: "uuid-5".to_string(),
+            from_pony_name: "RAINBOW_DASH".to_string(),
+            from_symbol: "⚡".to_string(),
+            to: "TWILIGHT_SPARKLE".to_string(),
+            subject: "dash status".to_string(),
+            body: String::new(),
+            created_at: Utc::now() - ChronoDuration::seconds(1),
+        };
+        append_json_line(&chat_path, &older_from_pinkie).unwrap();
+        append_json_line(&chat_path, &fresh_from_pinkie).unwrap();
         append_json_line(&chat_path, &stale).unwrap();
         append_json_line(&chat_path, &own).unwrap();
+        append_json_line(&chat_path, &fresh_from_dash).unwrap();
 
         let first = read_new_messages_at(&chat_path, &lock_path, &identity).unwrap();
-        assert_eq!(first, vec![fresh.clone()]);
+        assert_eq!(first, vec![fresh_from_dash.clone(), fresh_from_pinkie.clone()]);
 
         let second = read_new_messages_at(&chat_path, &lock_path, &identity).unwrap();
-        assert_eq!(second, vec![fresh]);
+        assert_eq!(second, vec![fresh_from_dash, fresh_from_pinkie]);
     }
 
     #[test]
