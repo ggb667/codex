@@ -74,6 +74,7 @@ jobs:
     name: Build ${{ matrix.variant }} ${{ matrix.target }}
     needs: metadata
     # Metadata always runs; only relevant changes pay for the large matrix.
+    # Fork CI keeps Linux V8 canary coverage and omits unavailable macOS runners.
     if: ${{ needs.metadata.outputs.canary_required == 'true' }}
     runs-on: ${{ matrix.runner }}
     permissions:
@@ -112,34 +113,6 @@ jobs:
             platform: linux_arm64
             sandbox: true
             target: aarch64-unknown-linux-gnu
-            v8_cpu: arm64
-            variant: ptrcomp-sandbox
-          - runner: macos-15-xlarge
-            bazel_config: ci-macos
-            platform: macos_amd64
-            sandbox: false
-            target: x86_64-apple-darwin
-            v8_cpu: x64
-            variant: release
-          - runner: macos-15-xlarge
-            bazel_config: ci-macos
-            platform: macos_amd64
-            sandbox: true
-            target: x86_64-apple-darwin
-            v8_cpu: x64
-            variant: ptrcomp-sandbox
-          - runner: macos-15-xlarge
-            bazel_config: ci-macos
-            platform: macos_arm64
-            sandbox: false
-            target: aarch64-apple-darwin
-            v8_cpu: arm64
-            variant: release
-          - runner: macos-15-xlarge
-            bazel_config: ci-macos
-            platform: macos_arm64
-            sandbox: true
-            target: aarch64-apple-darwin
             v8_cpu: arm64
             variant: ptrcomp-sandbox
           - runner: ubuntu-24.04

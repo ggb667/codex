@@ -25,12 +25,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS
-          - os: macos-15-xlarge
-            target: aarch64-apple-darwin
-          - os: macos-15-xlarge
-            target: x86_64-apple-darwin
-
           # Linux
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
@@ -131,6 +125,7 @@ jobs:
         uses: ./.github/actions/check-clean-worktree
 
   test-windows-shard:
+    if: github.repository == 'openai/codex'
     # Split the Windows Bazel test leg across separate Windows hosts. Jobs with
     # BuildBuddy credentials use Linux RBE for build actions; test execution
     # remains on a Windows runner.
@@ -250,6 +245,10 @@ jobs:
       - name: Confirm Windows Bazel test shards passed
         shell: bash
         run: |
+          if [[ "${{ github.repository }}" != "openai/codex" && "${{ needs.test-windows-shard.result }}" == "skipped" ]]; then
+            echo "Skipping upstream Windows Bazel shards on fork CI."
+            exit 0
+          fi
           if [[ "${{ needs.test-windows-shard.result }}" != "success" ]]; then
             echo "Windows Bazel test shards finished with result: ${{ needs.test-windows-shard.result }}" >&2
             exit 1
@@ -341,19 +340,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Keep Linux lint coverage on x64 and add the arm64 macOS path that
-          # the Bazel test job already exercises. Add Windows gnullvm as well
-          # so PRs get Bazel-native lint signal on the same Windows toolchain
-          # that the Bazel test job uses.
+          # Keep fork PR lint coverage on the Linux x64 path. Upstream-only
+          # macOS and Windows runners are not available in this fork.
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-          - os: macos-15-xlarge
-            target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-gnullvm
-            runs_on:
-              group: ${{ github.event.repository.name }}-runners
-              labels: ${{ github.event.repository.name }}-windows-x64
     runs-on: ${{ matrix.runs_on || matrix.os }}
     name: Bazel clippy on ${{ matrix.os }} for ${{ matrix.target }}
     environment:
@@ -447,13 +437,6 @@ jobs:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-          - os: macos-15-xlarge
-            target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-gnullvm
-            runs_on:
-              group: ${{ github.event.repository.name }}-runners
-              labels: ${{ github.event.repository.name }}-windows-x64
     runs-on: ${{ matrix.runs_on || matrix.os }}
     name: Verify release build on ${{ matrix.os }} for ${{ matrix.target }}
     environment:
