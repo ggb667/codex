@@ -22,7 +22,10 @@
         {
           "properties": {
             "email": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "planType": {
               "$ref": "#/definitions/PlanType"
@@ -42,8 +45,39 @@
           ],
           "title": "ChatgptAccount",
           "type": "object"
+        },
+        {
+          "properties": {
+            "credentialSource": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/AmazonBedrockCredentialSource"
+                }
+              ],
+              "default": "awsManaged"
+            },
+            "type": {
+              "enum": [
+                "amazonBedrock"
+              ],
+              "title": "AmazonBedrockAccountType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "AmazonBedrockAccount",
+          "type": "object"
         }
       ]
+    },
+    "AmazonBedrockCredentialSource": {
+      "enum": [
+        "codexManaged",
+        "awsManaged"
+      ],
+      "type": "string"
     },
     "PlanType": {
       "enum": [
@@ -51,6 +85,7 @@
         "go",
         "plus",
         "pro",
+        "prolite",
         "team",
         "self_serve_business_usage_based",
         "business",

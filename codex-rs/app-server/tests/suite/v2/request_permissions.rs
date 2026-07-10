@@ -1,5 +1,5 @@
 use anyhow::Result;
-use app_test_support::McpProcess;
+use app_test_support::TestAppServer;
 use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::create_request_permissions_sse_response;
@@ -16,12 +16,19 @@ use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput as V2UserInput;
+use core_test_support::skip_if_wine_exec;
 use tokio::time::timeout;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn request_permissions_round_trip() -> Result<()> {
+    // TODO(anp): Remove after tool routing accepts a target-native cwd on a different host OS.
+    skip_if_wine_exec!(
+        Ok(()),
+        "request_permissions currently rejects the target-native Windows cwd on the Linux host"
+    );
+
     let codex_home = tempfile::TempDir::new()?;
     let responses = vec![
         create_request_permissions_sse_response("call1")?,
@@ -30,11 +37,14 @@ async fn request_permissions_round_trip() -> Result<()> {
     let server = create_mock_responses_server_sequence(responses).await;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let thread_start_id = mcp
-        .send_thread_start_request(ThreadStartParams {
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("mock-model".to_string()),
             ..Default::default()
         })
@@ -49,6 +59,7 @@ async fn request_permissions_round_trip() -> Result<()> {
     let turn_start_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![V2UserInput::Text {
                 text: "pick a directory".to_string(),
                 text_elements: Vec::new(),
@@ -76,13 +87,34 @@ async fn request_permissions_round_trip() -> Result<()> {
     assert_eq!(params.thread_id, thread.id);
     assert_eq!(params.turn_id, turn.id);
     assert_eq!(params.item_id, "call1");
+    assert!(params.cwd.as_path().is_absolute());
     assert_eq!(params.reason, Some("Select a workspace root".to_string()));
-    let requested_writes = params
+    let requested_file_system = params
         .permissions
         .file_system
-        .and_then(|file_system| file_system.write)
+        .expect("request should include file system permissions");
+    let requested_writes = requested_file_system
+        .write
+        .clone()
         .expect("request should include write permissions");
     assert_eq!(requested_writes.len(), 2);
+    assert_eq!(
+        requested_file_system.entries,
+        Some(vec![
+            codex_app_server_protocol::FileSystemSandboxEntry {
+                path: codex_app_server_protocol::FileSystemPath::Path {
+                    path: requested_writes[0].clone(),
+                },
+                access: codex_app_server_protocol::FileSystemAccessMode::Write,
+            },
+            codex_app_server_protocol::FileSystemSandboxEntry {
+                path: codex_app_server_protocol::FileSystemPath::Path {
+                    path: requested_writes[1].clone(),
+                },
+                access: codex_app_server_protocol::FileSystemAccessMode::Write,
+            },
+        ])
+    );
     let resolved_request_id = request_id.clone();
 
     mcp.send_response(
@@ -93,9 +125,12 @@ async fn request_permissions_round_trip() -> Result<()> {
                 file_system: Some(codex_app_server_protocol::AdditionalFileSystemPermissions {
                     read: None,
                     write: Some(vec![requested_writes[0].clone()]),
+                    glob_scan_max_depth: None,
+                    entries: None,
                 }),
             },
             scope: PermissionGrantScope::Turn,
+            strict_auto_review: None,
         })?,
     )
     .await?;

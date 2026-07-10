@@ -34,12 +34,15 @@ fn is_dangerous_powershell(command: &[String]) -> bool {
         return false;
     };
 
-    let tokens_lc: Vec<String> = parsed
-        .tokens
+    is_dangerous_powershell_words(&parsed.tokens)
+}
+
+pub(crate) fn is_dangerous_powershell_words(words: &[String]) -> bool {
+    let tokens_lc: Vec<String> = words
         .iter()
         .map(|t| t.trim_matches('\'').trim_matches('"').to_ascii_lowercase())
         .collect();
-    let has_url = args_have_url(&parsed.tokens);
+    let has_url = args_have_url(words);
 
     if has_url
         && tokens_lc.iter().any(|t| {
@@ -83,11 +86,7 @@ fn is_dangerous_powershell(command: &[String]) -> bool {
     }
 
     // Check for force delete operations (e.g., Remove-Item -Force)
-    if has_force_delete_cmdlet(&tokens_lc) {
-        return true;
-    }
-
-    false
+    has_force_delete_cmdlet(&tokens_lc)
 }
 
 fn is_dangerous_cmd(command: &[String]) -> bool {
@@ -316,9 +315,10 @@ fn looks_like_url(token: &str) -> bool {
         Lazy::new(|| Regex::new(r#"^[ "'\(\s]*([^\s"'\);]+)[\s;\)]*$"#).ok());
     // If the token embeds a URL alongside other text (e.g., Start-Process('https://...'))
     // as a single shlex token, grab the substring starting at the first URL prefix.
-    let urlish = token
+    let lowercase_token = token.to_ascii_lowercase();
+    let urlish = lowercase_token
         .find("https://")
-        .or_else(|| token.find("http://"))
+        .or_else(|| lowercase_token.find("http://"))
         .map(|idx| &token[idx..])
         .unwrap_or(token);
 
@@ -433,6 +433,19 @@ mod tests {
             "-Command",
             "Start-Process('https://example.com');"
         ])));
+    }
+
+    #[test]
+    fn powershell_start_process_mixed_case_urls_are_dangerous() {
+        for script in [
+            "Start-Process('HTTP://example.com');",
+            "Start-Process('hTtPs://example.com');",
+        ] {
+            assert!(
+                is_dangerous_command_windows(&vec_str(&["powershell", "-Command", script])),
+                "{script}"
+            );
+        }
     }
 
     #[test]

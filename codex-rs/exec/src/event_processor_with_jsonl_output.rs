@@ -122,6 +122,7 @@ impl EventProcessorWithJsonOutput {
             input_tokens: usage.total.input_tokens,
             cached_input_tokens: usage.total.cached_input_tokens,
             output_tokens: usage.total.output_tokens,
+            reasoning_output_tokens: usage.total.reasoning_output_tokens,
         }
     }
 
@@ -222,6 +223,7 @@ impl EventProcessorWithJsonOutput {
                     arguments,
                     result: result.map(|result| McpToolCallItemResult {
                         content: result.content,
+                        meta: result.meta,
                         structured_content: result.structured_content,
                     }),
                     error: error.map(|error| McpToolCallItemError {
@@ -291,16 +293,12 @@ impl EventProcessorWithJsonOutput {
                     },
                 }),
             }),
-            ThreadItem::WebSearch {
-                id: raw_id,
-                query,
-                action,
-            } => Some(ExecThreadItem {
+            ThreadItem::WebSearch(item) => Some(ExecThreadItem {
                 id: make_id(),
                 details: ThreadItemDetails::WebSearch(WebSearchItem {
-                    id: raw_id,
-                    query,
-                    action: match action {
+                    id: item.id,
+                    query: item.query,
+                    action: match item.action {
                         Some(action) => serde_json::from_value(
                             serde_json::to_value(action).unwrap_or_else(|_| json!("other")),
                         )
@@ -391,7 +389,7 @@ impl EventProcessorWithJsonOutput {
 
     pub fn thread_started_event(session_configured: &SessionConfiguredEvent) -> ThreadEvent {
         ThreadEvent::ThreadStarted(ThreadStartedEvent {
-            thread_id: session_configured.session_id.to_string(),
+            thread_id: session_configured.thread_id.to_string(),
         })
     }
 
@@ -427,6 +425,11 @@ impl EventProcessorWithJsonOutput {
                     },
                 }));
                 CodexStatus::Running
+            }
+            ServerNotification::Warning(notification) => {
+                let warning = self.collect_warning(notification.message);
+                events.extend(warning.events);
+                warning.status
             }
             ServerNotification::Error(notification) => {
                 let message = match notification.error.additional_details {
@@ -489,6 +492,7 @@ impl EventProcessorWithJsonOutput {
                 }));
                 CodexStatus::Running
             }
+            ServerNotification::ModelVerification(_) => CodexStatus::Running,
             ServerNotification::ThreadTokenUsageUpdated(notification) => {
                 self.last_total_token_usage = Some(notification.token_usage);
                 CodexStatus::Running

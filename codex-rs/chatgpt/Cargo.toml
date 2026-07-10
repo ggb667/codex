@@ -11,10 +11,11 @@ workspace = true
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 codex-connectors = { workspace = true }
-codex-config = { workspace = true }
 codex-core = { workspace = true }
 codex-git-utils = { workspace = true }
 codex-login = { workspace = true }
+codex-model-provider = { workspace = true }
+codex-plugin = { workspace = true }
 codex-utils-cli = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["full"] }
@@ -24,3 +25,6 @@ codex-utils-cargo-bin = { workspace = true }
 pretty_assertions = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+
+[lib]
+doctest = false

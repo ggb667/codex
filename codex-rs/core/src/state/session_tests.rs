@@ -1,7 +1,9 @@
 use super::*;
-use crate::codex::make_session_configuration_for_tests;
+use crate::session::tests::make_session_configuration_for_tests;
+use crate::state::AutoCompactWindowSnapshot;
 use codex_protocol::protocol::CreditsSnapshot;
 use codex_protocol::protocol::RateLimitWindow;
+use codex_protocol::protocol::SpendControlLimitSnapshot;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
@@ -48,7 +50,9 @@ async fn set_rate_limits_defaults_limit_id_to_codex_when_missing() {
         }),
         secondary: None,
         credits: None,
+        individual_limit: None,
         plan_type: None,
+        rate_limit_reached_type: None,
     });
 
     assert_eq!(
@@ -57,6 +61,22 @@ async fn set_rate_limits_defaults_limit_id_to_codex_when_missing() {
             .as_ref()
             .and_then(|v| v.limit_id.clone()),
         Some("codex".to_string())
+    );
+}
+
+#[tokio::test]
+async fn replace_history_clears_auto_compact_window_prefill() {
+    let session_configuration = make_session_configuration_for_tests().await;
+    let mut state = SessionState::new(session_configuration);
+
+    state.set_auto_compact_window_estimated_prefill(/*tokens*/ 100);
+    state.replace_history(Vec::new(), /*reference_context_item*/ None);
+
+    assert_eq!(
+        state.auto_compact_window_snapshot(),
+        AutoCompactWindowSnapshot {
+            prefill_input_tokens: None,
+        }
     );
 }
 
@@ -75,7 +95,9 @@ async fn set_rate_limits_defaults_to_codex_when_limit_id_missing_after_other_buc
         }),
         secondary: None,
         credits: None,
+        individual_limit: None,
         plan_type: None,
+        rate_limit_reached_type: None,
     });
     state.set_rate_limits(RateLimitSnapshot {
         limit_id: None,
@@ -87,7 +109,9 @@ async fn set_rate_limits_defaults_to_codex_when_limit_id_missing_after_other_buc
         }),
         secondary: None,
         credits: None,
+        individual_limit: None,
         plan_type: None,
+        rate_limit_reached_type: None,
     });
 
     assert_eq!(
@@ -100,7 +124,7 @@ async fn set_rate_limits_defaults_to_codex_when_limit_id_missing_after_other_buc
 }
 
 #[tokio::test]
-async fn set_rate_limits_carries_credits_and_plan_type_from_codex_to_codex_other() {
+async fn set_rate_limits_carries_account_metadata_from_codex_to_codex_other() {
     let session_configuration = make_session_configuration_for_tests().await;
     let mut state = SessionState::new(session_configuration);
 
@@ -118,7 +142,14 @@ async fn set_rate_limits_carries_credits_and_plan_type_from_codex_to_codex_other
             unlimited: false,
             balance: Some("50".to_string()),
         }),
+        individual_limit: Some(SpendControlLimitSnapshot {
+            limit: "25000".to_string(),
+            used: "8000".to_string(),
+            remaining_percent: 68,
+            resets_at: 300,
+        }),
         plan_type: Some(codex_protocol::account::PlanType::Plus),
+        rate_limit_reached_type: None,
     });
 
     state.set_rate_limits(RateLimitSnapshot {
@@ -131,7 +162,9 @@ async fn set_rate_limits_carries_credits_and_plan_type_from_codex_to_codex_other
         }),
         secondary: None,
         credits: None,
+        individual_limit: None,
         plan_type: None,
+        rate_limit_reached_type: None,
     });
 
     assert_eq!(
@@ -150,7 +183,14 @@ async fn set_rate_limits_carries_credits_and_plan_type_from_codex_to_codex_other
                 unlimited: false,
                 balance: Some("50".to_string()),
             }),
+            individual_limit: Some(SpendControlLimitSnapshot {
+                limit: "25000".to_string(),
+                used: "8000".to_string(),
+                remaining_percent: 68,
+                resets_at: 300,
+            }),
             plan_type: Some(codex_protocol::account::PlanType::Plus),
+            rate_limit_reached_type: None,
         })
     );
 }

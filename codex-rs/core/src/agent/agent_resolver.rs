@@ -1,6 +1,6 @@
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::function_tool::FunctionCallError;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use codex_protocol::ThreadId;
 use std::sync::Arc;
 
@@ -18,7 +18,7 @@ pub(crate) async fn resolve_agent_target(
     session
         .services
         .agent_control
-        .resolve_agent_reference(session.conversation_id, &turn.session_source, target)
+        .resolve_agent_reference(session.thread_id, &turn.session_source, target)
         .await
         .map_err(|err| match err {
             codex_protocol::error::CodexErr::UnsupportedOperation(message) => {
@@ -32,5 +32,5 @@ fn register_session_root(session: &Arc<Session>, turn: &Arc<TurnContext>) {
     session
         .services
         .agent_control
-        .register_session_root(session.conversation_id, &turn.session_source);
+        .register_session_root(session.thread_id, turn.parent_thread_id);
 }

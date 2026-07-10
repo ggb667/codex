@@ -1,5 +1,7 @@
 use regex_lite::Regex;
 use serde_json::Value;
+use similar::ChangeTag;
+use similar::TextDiff;
 use std::sync::OnceLock;
 
 use crate::responses::ResponsesRequest;
@@ -97,7 +99,7 @@ pub fn format_response_items_snapshot(items: &[Value], options: &ContextSnapshot
                                         }
                                         if options.strip_agents_md_user_context
                                             && role == "user"
-                                            && text.starts_with("# AGENTS.md instructions for ")
+                                            && text.starts_with("# AGENTS.md instructions")
                                         {
                                             return None;
                                         }
@@ -242,6 +244,104 @@ pub fn format_labeled_items_snapshot(
     format!("Scenario: {scenario}\n\n{sections}")
 }
 
+/// Render changed JSON lines between two captured `/responses` request bodies.
+///
+/// Request-parity tests use this to compare the entire JSON payload while showing only fields that
+/// changed, with the same redactions as the other context snapshots.
+pub fn format_request_body_diff_snapshot(
+    scenario: &str,
+    before_title: &str,
+    before_request: &ResponsesRequest,
+    after_title: &str,
+    after_request: &ResponsesRequest,
+    options: &ContextSnapshotOptions,
+) -> String {
+    let before = format_request_body_snapshot(before_request, options);
+    let after = format_request_body_snapshot(after_request, options);
+    let diff = format_changed_lines_diff(before_title, &before, after_title, &after);
+    format!("Scenario: {scenario}\n\n{diff}")
+}
+
+fn format_request_body_snapshot(
+    request: &ResponsesRequest,
+    options: &ContextSnapshotOptions,
+) -> String {
+    let mut body = crate::responses::strip_metadata_from_json(request.body_json());
+    canonicalize_json_snapshot_value(&mut body, options);
+    serde_json::to_string_pretty(&body).expect("request body should serialize")
+}
+
+fn canonicalize_json_snapshot_value(value: &mut Value, options: &ContextSnapshotOptions) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                canonicalize_json_snapshot_value(value, options);
+            }
+        }
+        Value::Object(map) => {
+            // Keep request-body snapshots stable when serde_json preserves insertion order.
+            let mut entries = std::mem::take(map).into_iter().collect::<Vec<_>>();
+            entries.sort_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+            for (key, mut value) in entries {
+                canonicalize_json_snapshot_value(&mut value, options);
+                map.insert(key, value);
+            }
+        }
+        Value::String(text) => {
+            *text = format_snapshot_json_string(text, options);
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn format_snapshot_json_string(text: &str, options: &ContextSnapshotOptions) -> String {
+    let normalized = match options.render_mode {
+        ContextSnapshotRenderMode::RedactedText
+        | ContextSnapshotRenderMode::KindWithTextPrefix { .. } => {
+            normalize_snapshot_dynamic_values(&normalize_snapshot_line_endings(
+                &canonicalize_snapshot_text(text),
+            ))
+        }
+        ContextSnapshotRenderMode::FullText => normalize_snapshot_line_endings(text),
+        ContextSnapshotRenderMode::KindOnly => unreachable!(),
+    };
+    match options.render_mode {
+        ContextSnapshotRenderMode::KindWithTextPrefix { max_chars }
+            if normalized.chars().count() > max_chars =>
+        {
+            let prefix = normalized.chars().take(max_chars).collect::<String>();
+            format!("{prefix}...")
+        }
+        ContextSnapshotRenderMode::RedactedText
+        | ContextSnapshotRenderMode::FullText
+        | ContextSnapshotRenderMode::KindWithTextPrefix { .. } => normalized,
+        ContextSnapshotRenderMode::KindOnly => unreachable!(),
+    }
+}
+
+fn format_changed_lines_diff(
+    before_title: &str,
+    before: &str,
+    after_title: &str,
+    after: &str,
+) -> String {
+    let mut diff = format!("--- {before_title}\n+++ {after_title}\n");
+    for change in TextDiff::from_lines(before, after).iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Equal => {}
+            ChangeTag::Delete => {
+                diff.push('-');
+                diff.push_str(change.value());
+            }
+            ChangeTag::Insert => {
+                diff.push('+');
+                diff.push_str(change.value());
+            }
+        }
+    }
+    diff
+}
+
 fn format_snapshot_text(text: &str, options: &ContextSnapshotOptions) -> String {
     match options.render_mode {
         ContextSnapshotRenderMode::RedactedText => {
@@ -281,7 +381,7 @@ fn canonicalize_snapshot_text(text: &str) -> String {
     if text.starts_with(PLUGINS_INSTRUCTIONS_OPEN_TAG) {
         return "<PLUGINS_INSTRUCTIONS>".to_string();
     }
-    if text.starts_with("# AGENTS.md instructions for ") {
+    if text.starts_with("# AGENTS.md instructions") {
         return "<AGENTS_MD>".to_string();
     }
     if text.starts_with("<environment_context>") {
@@ -342,11 +442,36 @@ fn normalize_dynamic_snapshot_paths(text: &str) -> String {
         .into_owned()
 }
 
+fn normalize_snapshot_dynamic_values(text: &str) -> String {
+    static UUID_RE: OnceLock<Regex> = OnceLock::new();
+    let uuid_re = UUID_RE.get_or_init(|| {
+        Regex::new(
+            r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
+        )
+        .expect("uuid regex should compile")
+    });
+    static TURN_STARTED_AT_UNIX_MS_RE: OnceLock<Regex> = OnceLock::new();
+    let turn_started_at_unix_ms_re = TURN_STARTED_AT_UNIX_MS_RE.get_or_init(|| {
+        Regex::new(r#""turn_started_at_unix_ms":\d+"#)
+            .expect("turn_started_at_unix_ms regex should compile")
+    });
+    static SANDBOX_RE: OnceLock<Regex> = OnceLock::new();
+    let sandbox_re = SANDBOX_RE
+        .get_or_init(|| Regex::new(r#""sandbox":"[^"]+""#).expect("sandbox regex should compile"));
+    let text = uuid_re.replace_all(text, "<UUID>");
+    let text =
+        turn_started_at_unix_ms_re.replace_all(&text, r#""turn_started_at_unix_ms":<UNIX_MS>"#);
+    sandbox_re
+        .replace_all(&text, r#""sandbox":"<SANDBOX>""#)
+        .into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::ContextSnapshotOptions;
     use super::ContextSnapshotRenderMode;
     use super::format_response_items_snapshot;
+    use super::format_snapshot_json_string;
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
@@ -597,6 +722,19 @@ mod tests {
         assert_eq!(
             rendered,
             "00:message/developer:## Skills\\n- openai-docs: helper (file: <SYSTEM_SKILLS_ROOT>/openai-docs/SKILL.md)"
+        );
+    }
+
+    #[test]
+    fn redacted_text_mode_normalizes_turn_metadata_dynamic_json_strings() {
+        let rendered = format_snapshot_json_string(
+            r#"{"turn_id":"019eaded-ba5c-7d40-8a81-a4dcebc4679e","sandbox":"seccomp","turn_started_at_unix_ms":1781035793002}"#,
+            &ContextSnapshotOptions::default(),
+        );
+
+        assert_eq!(
+            rendered,
+            r#"{"turn_id":"<UUID>","sandbox":"<SANDBOX>","turn_started_at_unix_ms":<UNIX_MS>}"#
         );
     }
 }

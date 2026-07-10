@@ -1,10 +1,9 @@
-#![allow(clippy::expect_used, clippy::unwrap_used, unused_imports)]
+#![allow(clippy::unwrap_used, unused_imports)]
 
 use anyhow::Context;
 use assert_cmd::prelude::*;
 use codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1;
 use core_test_support::responses::ev_apply_patch_custom_tool_call;
-use core_test_support::responses::ev_apply_patch_function_call;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
@@ -71,7 +70,7 @@ async fn test_apply_patch_tool() -> anyhow::Result<()> {
             ev_completed("request_0"),
         ]),
         sse(vec![
-            ev_apply_patch_function_call("request_1", update_patch),
+            ev_apply_patch_custom_tool_call("request_1", update_patch),
             ev_completed("request_1"),
         ]),
         sse(vec![ev_completed("request_2")]),
@@ -88,8 +87,7 @@ async fn test_apply_patch_tool() -> anyhow::Result<()> {
         .success();
 
     let final_path = tmp_path.join("test.md");
-    let contents = std::fs::read_to_string(&final_path)
-        .unwrap_or_else(|e| panic!("failed reading {}: {e}", final_path.display()));
+    let contents = std::fs::read_to_string(&final_path).expect("final file should be readable");
     assert_eq!(contents, "Final text\n");
     Ok(())
 }
@@ -140,8 +138,7 @@ async fn test_apply_patch_freeform_tool() -> anyhow::Result<()> {
 
     // Verify final file contents
     let final_path = test.cwd_path().join("app.py");
-    let contents = std::fs::read_to_string(&final_path)
-        .unwrap_or_else(|e| panic!("failed reading {}: {e}", final_path.display()));
+    let contents = std::fs::read_to_string(&final_path).expect("final file should be readable");
     assert_eq!(
         contents,
         include_str!("../fixtures/apply_patch_freeform_final.txt")

@@ -1,4 +1,4 @@
-use crate::auth::AuthProvider;
+use crate::auth::SharedAuthProvider;
 use crate::endpoint::session::EndpointSession;
 use crate::error::ApiError;
 use crate::provider::Provider;
@@ -11,12 +11,12 @@ use http::Method;
 use http::header::ETAG;
 use std::sync::Arc;
 
-pub struct ModelsClient<T: HttpTransport, A: AuthProvider> {
-    session: EndpointSession<T, A>,
+pub struct ModelsClient<T: HttpTransport> {
+    session: EndpointSession<T>,
 }
 
-impl<T: HttpTransport, A: AuthProvider> ModelsClient<T, A> {
-    pub fn new(transport: T, provider: Provider, auth: A) -> Self {
+impl<T: HttpTransport> ModelsClient<T> {
+    pub fn new(transport: T, provider: Provider, auth: SharedAuthProvider) -> Self {
         Self {
             session: EndpointSession::new(transport, provider, auth),
         }
@@ -37,9 +37,15 @@ impl<T: HttpTransport, A: AuthProvider> ModelsClient<T, A> {
         req.url = format!("{}{}client_version={client_version}", req.url, separator);
     }
 
+    pub fn request_url(provider: &Provider, client_version: &str) -> String {
+        let mut request = provider.build_request(Method::GET, Self::path());
+        Self::append_client_version_query(&mut request, client_version);
+        request.url
+    }
+
     pub async fn list_models(
         &self,
-        client_version: &str,
+        request_url: String,
         extra_headers: HeaderMap,
     ) -> Result<(Vec<ModelInfo>, Option<String>), ApiError> {
         let resp = self
@@ -49,8 +55,8 @@ impl<T: HttpTransport, A: AuthProvider> ModelsClient<T, A> {
                 Self::path(),
                 extra_headers,
                 /*body*/ None,
-                |req| {
-                    Self::append_client_version_query(req, client_version);
+                move |req| {
+                    req.url.clone_from(&request_url);
                 },
             )
             .await?;
@@ -76,8 +82,8 @@ impl<T: HttpTransport, A: AuthProvider> ModelsClient<T, A> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::AuthProvider;
     use crate::provider::RetryConfig;
-    use async_trait::async_trait;
     use codex_client::Request;
     use codex_client::Response;
     use codex_client::StreamResponse;
@@ -107,7 +113,6 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl HttpTransport for CapturingTransport {
         async fn execute(&self, req: Request) -> Result<Response, TransportError> {
             *self.last_request.lock().unwrap() = Some(req);
@@ -132,9 +137,7 @@ mod tests {
     struct DummyAuth;
 
     impl AuthProvider for DummyAuth {
-        fn bearer_token(&self) -> Option<String> {
-            None
-        }
+        fn add_auth_headers(&self, _headers: &mut HeaderMap) {}
     }
 
     fn provider(base_url: &str) -> Provider {
@@ -164,14 +167,12 @@ mod tests {
             etag: None,
         };
 
-        let client = ModelsClient::new(
-            transport.clone(),
-            provider("https://example.com/api/codex"),
-            DummyAuth,
-        );
+        let provider = provider("https://example.com/api/codex");
+        let request_url = ModelsClient::<CapturingTransport>::request_url(&provider, "0.99.0");
+        let client = ModelsClient::new(transport.clone(), provider, Arc::new(DummyAuth));
 
         let (models, _) = client
-            .list_models("0.99.0", HeaderMap::new())
+            .list_models(request_url, HeaderMap::new())
             .await
             .expect("request should succeed");
 
@@ -228,14 +229,12 @@ mod tests {
             etag: None,
         };
 
-        let client = ModelsClient::new(
-            transport,
-            provider("https://example.com/api/codex"),
-            DummyAuth,
-        );
+        let provider = provider("https://example.com/api/codex");
+        let request_url = ModelsClient::<CapturingTransport>::request_url(&provider, "0.99.0");
+        let client = ModelsClient::new(transport, provider, Arc::new(DummyAuth));
 
         let (models, _) = client
-            .list_models("0.99.0", HeaderMap::new())
+            .list_models(request_url, HeaderMap::new())
             .await
             .expect("request should succeed");
 
@@ -255,14 +254,12 @@ mod tests {
             etag: Some("\"abc\"".to_string()),
         };
 
-        let client = ModelsClient::new(
-            transport,
-            provider("https://example.com/api/codex"),
-            DummyAuth,
-        );
+        let provider = provider("https://example.com/api/codex");
+        let request_url = ModelsClient::<CapturingTransport>::request_url(&provider, "0.1.0");
+        let client = ModelsClient::new(transport, provider, Arc::new(DummyAuth));
 
         let (models, etag) = client
-            .list_models("0.1.0", HeaderMap::new())
+            .list_models(request_url, HeaderMap::new())
             .await
             .expect("request should succeed");
 

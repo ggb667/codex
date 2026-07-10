@@ -7,6 +7,7 @@ use crate::exec_output::ExecToolCallOutput;
 use crate::network_policy::NetworkPolicyDecisionPayload;
 use crate::protocol::CodexErrorInfo;
 use crate::protocol::ErrorEvent;
+use crate::protocol::RateLimitReachedType;
 use crate::protocol::RateLimitSnapshot;
 use crate::protocol::TruncationPolicy;
 use chrono::DateTime;
@@ -68,6 +69,9 @@ pub enum CodexErr {
     #[error("turn aborted. Something went wrong? Hit `/feedback` to report the issue.")]
     TurnAborted,
 
+    #[error("shared rollout token budget exhausted")]
+    SessionBudgetExceeded,
+
     /// Returned by ResponsesClient when the SSE stream disconnects or errors out **after** the HTTP
     /// handshake has succeeded but **before** it finished emitting `response.completed`.
     ///
@@ -82,13 +86,15 @@ pub enum CodexErr {
     ContextWindowExceeded,
     #[error("no thread with id: {0}")]
     ThreadNotFound(ThreadId),
-    #[error("agent thread limit reached (max {max_threads})")]
+    #[error("agent thread limit reached")]
     AgentLimitReached { max_threads: usize },
     #[error("session configured event was not the first event in the stream")]
     SessionConfiguredNotFirstEvent,
     /// Returned by run_command_stream when the spawned child process timed out (10s).
     #[error("timeout waiting for child process to exit")]
     Timeout,
+    #[error("request timed out")]
+    RequestTimeout,
     /// Returned by run_command_stream when the child could not be spawned (its stdout/stderr pipes
     /// could not be captured). Analogous to the previous `CodexError::Spawn` variant.
     #[error("spawn failed: child stdout/stderr not captured")]
@@ -110,6 +116,8 @@ pub enum CodexErr {
     UsageLimitReached(UsageLimitReachedError),
     #[error("Selected model is at capacity. Please try a different model.")]
     ServerOverloaded,
+    #[error("{message}")]
+    CyberPolicy { message: String },
     #[error("{0}")]
     ResponseStreamFailed(ResponseStreamFailed),
     #[error("{0}")]
@@ -168,6 +176,7 @@ impl CodexErr {
     pub fn is_retryable(&self) -> bool {
         match self {
             CodexErr::TurnAborted
+            | CodexErr::SessionBudgetExceeded
             | CodexErr::Interrupted
             | CodexErr::EnvVar(_)
             | CodexErr::Fatal(_)
@@ -186,9 +195,11 @@ impl CodexErr {
             | CodexErr::Spawn
             | CodexErr::SessionConfiguredNotFirstEvent
             | CodexErr::UsageLimitReached(_)
-            | CodexErr::ServerOverloaded => false,
+            | CodexErr::ServerOverloaded
+            | CodexErr::CyberPolicy { .. } => false,
             CodexErr::Stream(..)
             | CodexErr::Timeout
+            | CodexErr::RequestTimeout
             | CodexErr::UnexpectedStatus(_)
             | CodexErr::ResponseStreamFailed(_)
             | CodexErr::ConnectionFailed(_)
@@ -213,10 +224,12 @@ impl CodexErr {
     pub fn to_codex_protocol_error(&self) -> CodexErrorInfo {
         match self {
             CodexErr::ContextWindowExceeded => CodexErrorInfo::ContextWindowExceeded,
+            CodexErr::SessionBudgetExceeded => CodexErrorInfo::SessionBudgetExceeded,
             CodexErr::UsageLimitReached(_)
             | CodexErr::QuotaExceeded
             | CodexErr::UsageNotIncluded => CodexErrorInfo::UsageLimitExceeded,
             CodexErr::ServerOverloaded => CodexErrorInfo::ServerOverloaded,
+            CodexErr::CyberPolicy { .. } => CodexErrorInfo::CyberPolicy,
             CodexErr::RetryLimit(_) => CodexErrorInfo::ResponseTooManyFailedAttempts {
                 http_status_code: self.http_status_code_value(),
             },
@@ -297,6 +310,7 @@ impl std::fmt::Display for ResponseStreamFailed {
 pub struct UnexpectedResponseError {
     pub status: StatusCode,
     pub body: String,
+    pub user_message: Option<String>,
     pub url: Option<String>,
     pub cf_ray: Option<String>,
     pub request_id: Option<String>,
@@ -304,8 +318,6 @@ pub struct UnexpectedResponseError {
     pub identity_error_code: Option<String>,
 }
 
-const CLOUDFLARE_BLOCKED_MESSAGE: &str =
-    "Access blocked by Cloudflare. This usually happens when connecting from a restricted region";
 const UNEXPECTED_RESPONSE_BODY_MAX_BYTES: usize = 1000;
 
 impl UnexpectedResponseError {
@@ -335,18 +347,17 @@ impl UnexpectedResponseError {
             Some(message.to_string())
         }
     }
+}
 
-    fn friendly_message(&self) -> Option<String> {
-        if self.status != StatusCode::FORBIDDEN {
-            return None;
-        }
-
-        if !self.body.contains("Cloudflare") || !self.body.contains("blocked") {
-            return None;
-        }
-
-        let status = self.status;
-        let mut message = format!("{CLOUDFLARE_BLOCKED_MESSAGE} (status {status})");
+impl std::fmt::Display for UnexpectedResponseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut message = if let Some(user_message) = &self.user_message {
+            user_message.clone()
+        } else {
+            let status = self.status;
+            let body = self.display_body();
+            format!("unexpected status {status}: {body}")
+        };
         if let Some(url) = &self.url {
             message.push_str(&format!(", url: {url}"));
         }
@@ -362,36 +373,7 @@ impl UnexpectedResponseError {
         if let Some(error_code) = &self.identity_error_code {
             message.push_str(&format!(", auth error code: {error_code}"));
         }
-
-        Some(message)
-    }
-}
-
-impl std::fmt::Display for UnexpectedResponseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(friendly) = self.friendly_message() {
-            write!(f, "{friendly}")
-        } else {
-            let status = self.status;
-            let body = self.display_body();
-            let mut message = format!("unexpected status {status}: {body}");
-            if let Some(url) = &self.url {
-                message.push_str(&format!(", url: {url}"));
-            }
-            if let Some(cf_ray) = &self.cf_ray {
-                message.push_str(&format!(", cf-ray: {cf_ray}"));
-            }
-            if let Some(id) = &self.request_id {
-                message.push_str(&format!(", request id: {id}"));
-            }
-            if let Some(auth_error) = &self.identity_authorization_error {
-                message.push_str(&format!(", auth error: {auth_error}"));
-            }
-            if let Some(error_code) = &self.identity_error_code {
-                message.push_str(&format!(", auth error code: {error_code}"));
-            }
-            write!(f, "{message}")
-        }
+        write!(f, "{message}")
     }
 }
 
@@ -444,6 +426,7 @@ pub struct UsageLimitReachedError {
     pub resets_at: Option<DateTime<Utc>>,
     pub rate_limits: Option<Box<RateLimitSnapshot>>,
     pub promo_message: Option<String>,
+    pub rate_limit_reached_type: Option<RateLimitReachedType>,
 }
 
 impl std::fmt::Display for UsageLimitReachedError {
@@ -461,6 +444,38 @@ impl std::fmt::Display for UsageLimitReachedError {
                 "You've hit your usage limit for {limit_name}. Switch to another model now,{}",
                 retry_suffix_after_or(self.resets_at.as_ref())
             );
+        }
+
+        if let Some(rate_limit_reached_type) = self.rate_limit_reached_type {
+            match rate_limit_reached_type {
+                RateLimitReachedType::WorkspaceOwnerCreditsDepleted => {
+                    return write!(
+                        f,
+                        "Your workspace is out of credits. Add credits to continue."
+                    );
+                }
+                RateLimitReachedType::WorkspaceMemberCreditsDepleted => {
+                    return write!(
+                        f,
+                        "Your workspace is out of credits. Ask your workspace owner to refill in order to continue."
+                    );
+                }
+                RateLimitReachedType::WorkspaceOwnerUsageLimitReached => {
+                    return write!(
+                        f,
+                        "You hit your spend cap set in your workspace. Increase your spend cap to continue."
+                    );
+                }
+                RateLimitReachedType::WorkspaceMemberUsageLimitReached => {
+                    return write!(
+                        f,
+                        "You hit your spend cap set by the owner of your workspace. Ask an owner to increase your spend cap to continue."
+                    );
+                }
+                RateLimitReachedType::RateLimitReached => {
+                    // Generic limits intentionally use the existing promo or plan copy below.
+                }
+            }
         }
 
         if let Some(promo_message) = &self.promo_message {
@@ -493,7 +508,7 @@ impl std::fmt::Display for UsageLimitReachedError {
                     retry_suffix_after_or(self.resets_at.as_ref())
                 )
             }
-            Some(PlanType::Known(KnownPlan::Pro)) => format!(
+            Some(PlanType::Known(KnownPlan::Pro | KnownPlan::ProLite)) => format!(
                 "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits{}",
                 retry_suffix_after_or(self.resets_at.as_ref())
             ),

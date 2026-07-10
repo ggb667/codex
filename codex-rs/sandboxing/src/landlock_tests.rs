@@ -33,14 +33,16 @@ fn legacy_landlock_flag_is_included_when_requested() {
 }
 
 #[test]
-fn proxy_flag_is_included_when_requested() {
+fn proxy_flag_takes_precedence_over_legacy_landlock() {
     let command = vec!["/bin/true".to_string()];
     let command_cwd = Path::new("/tmp/link");
     let cwd = Path::new("/tmp");
+    let permission_profile = PermissionProfile::read_only();
 
-    let args = create_linux_sandbox_command_args(
+    let args = create_linux_sandbox_command_args_for_permission_profile(
         command,
         command_cwd,
+        &permission_profile,
         cwd,
         /*use_legacy_landlock*/ true,
         /*allow_network_for_proxy*/ true,
@@ -49,23 +51,20 @@ fn proxy_flag_is_included_when_requested() {
         args.contains(&"--allow-network-for-proxy".to_string()),
         true
     );
+    assert_eq!(args.contains(&"--use-legacy-landlock".to_string()), false);
 }
 
 #[test]
-fn split_policy_flags_are_included() {
+fn permission_profile_flag_is_included() {
     let command = vec!["/bin/true".to_string()];
     let command_cwd = Path::new("/tmp/link");
     let cwd = Path::new("/tmp");
-    let sandbox_policy = SandboxPolicy::new_read_only_policy();
-    let file_system_sandbox_policy = FileSystemSandboxPolicy::from(&sandbox_policy);
-    let network_sandbox_policy = NetworkSandboxPolicy::from(&sandbox_policy);
+    let permission_profile = PermissionProfile::read_only();
 
-    let args = create_linux_sandbox_command_args_for_policies(
+    let args = create_linux_sandbox_command_args_for_permission_profile(
         command,
         command_cwd,
-        &sandbox_policy,
-        &file_system_sandbox_policy,
-        network_sandbox_policy,
+        &permission_profile,
         cwd,
         /*use_legacy_landlock*/ true,
         /*allow_network_for_proxy*/ false,
@@ -73,12 +72,7 @@ fn split_policy_flags_are_included() {
 
     assert_eq!(
         args.windows(2)
-            .any(|window| { window[0] == "--file-system-sandbox-policy" && !window[1].is_empty() }),
-        true
-    );
-    assert_eq!(
-        args.windows(2)
-            .any(|window| window[0] == "--network-sandbox-policy" && window[1] == "\"restricted\""),
+            .any(|window| { window[0] == "--permission-profile" && !window[1].is_empty() }),
         true
     );
     assert_eq!(

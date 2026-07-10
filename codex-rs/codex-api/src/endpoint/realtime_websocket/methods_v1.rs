@@ -5,23 +5,33 @@ use crate::endpoint::realtime_websocket::protocol::ConversationItemContent;
 use crate::endpoint::realtime_websocket::protocol::ConversationItemPayload;
 use crate::endpoint::realtime_websocket::protocol::ConversationItemType;
 use crate::endpoint::realtime_websocket::protocol::ConversationMessageItem;
-use crate::endpoint::realtime_websocket::protocol::ConversationRole;
 use crate::endpoint::realtime_websocket::protocol::RealtimeOutboundMessage;
+use crate::endpoint::realtime_websocket::protocol::RealtimeVoice;
 use crate::endpoint::realtime_websocket::protocol::SessionAudio;
 use crate::endpoint::realtime_websocket::protocol::SessionAudioFormat;
 use crate::endpoint::realtime_websocket::protocol::SessionAudioInput;
 use crate::endpoint::realtime_websocket::protocol::SessionAudioOutput;
-use crate::endpoint::realtime_websocket::protocol::SessionAudioVoice;
 use crate::endpoint::realtime_websocket::protocol::SessionType;
 use crate::endpoint::realtime_websocket::protocol::SessionUpdateSession;
+use codex_protocol::protocol::ConversationTextRole;
 
-pub(super) fn conversation_item_create_message(text: String) -> RealtimeOutboundMessage {
+pub(super) fn conversation_item_create_message(
+    text: String,
+    role: ConversationTextRole,
+) -> RealtimeOutboundMessage {
+    let content_type = match role {
+        ConversationTextRole::Assistant => ConversationContentType::OutputText,
+        ConversationTextRole::User | ConversationTextRole::Developer => {
+            ConversationContentType::InputText
+        }
+    };
+
     RealtimeOutboundMessage::ConversationItemCreate {
         item: ConversationItemPayload::Message(ConversationMessageItem {
             r#type: ConversationItemType::Message,
-            role: ConversationRole::User,
+            role,
             content: vec![ConversationItemContent {
-                r#type: ConversationContentType::Text,
+                r#type: content_type,
                 text,
             }],
         }),
@@ -38,9 +48,14 @@ pub(super) fn conversation_handoff_append_message(
     }
 }
 
-pub(super) fn session_update_session(instructions: String) -> SessionUpdateSession {
+pub(super) fn session_update_session(
+    instructions: String,
+    voice: RealtimeVoice,
+) -> SessionUpdateSession {
     SessionUpdateSession {
+        id: None,
         r#type: SessionType::Quicksilver,
+        model: None,
         instructions: Some(instructions),
         output_modalities: None,
         audio: SessionAudio {
@@ -50,11 +65,12 @@ pub(super) fn session_update_session(instructions: String) -> SessionUpdateSessi
                     rate: REALTIME_AUDIO_SAMPLE_RATE,
                 },
                 noise_reduction: None,
+                transcription: None,
                 turn_detection: None,
             },
             output: Some(SessionAudioOutput {
                 format: None,
-                voice: SessionAudioVoice::Fathom,
+                voice,
             }),
         },
         tools: None,

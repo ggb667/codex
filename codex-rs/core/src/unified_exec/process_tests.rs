@@ -1,44 +1,31 @@
 use super::process::UnifiedExecProcess;
 use crate::unified_exec::UnifiedExecError;
-use async_trait::async_trait;
 use codex_exec_server::ExecProcess;
+use codex_exec_server::ExecProcessEventReceiver;
+use codex_exec_server::ExecProcessFuture;
 use codex_exec_server::ExecServerError;
 use codex_exec_server::ProcessId;
+use codex_exec_server::ProcessSignal;
 use codex_exec_server::ReadResponse;
 use codex_exec_server::StartedExecProcess;
 use codex_exec_server::WriteResponse;
 use codex_exec_server::WriteStatus;
-use codex_sandboxing::SandboxType;
 use pretty_assertions::assert_eq;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
-use tokio::time::Duration;
 
 struct MockExecProcess {
     process_id: ProcessId,
     write_response: WriteResponse,
     read_responses: Mutex<VecDeque<ReadResponse>>,
+    terminate_error: Option<String>,
     wake_tx: watch::Sender<u64>,
 }
 
-#[async_trait]
-impl ExecProcess for MockExecProcess {
-    fn process_id(&self) -> &ProcessId {
-        &self.process_id
-    }
-
-    fn subscribe_wake(&self) -> watch::Receiver<u64> {
-        self.wake_tx.subscribe()
-    }
-
-    async fn read(
-        &self,
-        _after_seq: Option<u64>,
-        _max_bytes: Option<usize>,
-        _wait_ms: Option<u64>,
-    ) -> Result<ReadResponse, ExecServerError> {
+impl MockExecProcess {
+    async fn read(&self) -> Result<ReadResponse, ExecServerError> {
         Ok(self
             .read_responses
             .lock()
@@ -51,19 +38,57 @@ impl ExecProcess for MockExecProcess {
                 exit_code: None,
                 closed: false,
                 failure: None,
+                sandbox_denied: false,
             }))
     }
 
-    async fn write(&self, _chunk: Vec<u8>) -> Result<WriteResponse, ExecServerError> {
-        Ok(self.write_response.clone())
-    }
-
     async fn terminate(&self) -> Result<(), ExecServerError> {
+        if let Some(message) = &self.terminate_error {
+            return Err(ExecServerError::Protocol(message.clone()));
+        }
         Ok(())
     }
 }
 
-async fn remote_process(write_status: WriteStatus) -> UnifiedExecProcess {
+impl ExecProcess for MockExecProcess {
+    fn process_id(&self) -> &ProcessId {
+        &self.process_id
+    }
+
+    fn subscribe_wake(&self) -> watch::Receiver<u64> {
+        self.wake_tx.subscribe()
+    }
+
+    fn subscribe_events(&self) -> ExecProcessEventReceiver {
+        ExecProcessEventReceiver::empty()
+    }
+
+    fn read(
+        &self,
+        _after_seq: Option<u64>,
+        _max_bytes: Option<usize>,
+        _wait_ms: Option<u64>,
+    ) -> ExecProcessFuture<'_, ReadResponse> {
+        Box::pin(MockExecProcess::read(self))
+    }
+
+    fn write(&self, _chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse> {
+        Box::pin(async { Ok(self.write_response.clone()) })
+    }
+
+    fn signal(&self, _signal: ProcessSignal) -> ExecProcessFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn terminate(&self) -> ExecProcessFuture<'_, ()> {
+        Box::pin(MockExecProcess::terminate(self))
+    }
+}
+
+async fn remote_process(
+    write_status: WriteStatus,
+    terminate_error: Option<String>,
+) -> UnifiedExecProcess {
     let (wake_tx, _wake_rx) = watch::channel(0);
     let started = StartedExecProcess {
         process: Arc::new(MockExecProcess {
@@ -72,18 +97,19 @@ async fn remote_process(write_status: WriteStatus) -> UnifiedExecProcess {
                 status: write_status,
             },
             read_responses: Mutex::new(VecDeque::new()),
+            terminate_error,
             wake_tx,
         }),
     };
 
-    UnifiedExecProcess::from_remote_started(started, SandboxType::None)
+    UnifiedExecProcess::from_exec_server_started(started)
         .await
         .expect("remote process should start")
 }
 
 #[tokio::test]
 async fn remote_write_unknown_process_marks_process_exited() {
-    let process = remote_process(WriteStatus::UnknownProcess).await;
+    let process = remote_process(WriteStatus::UnknownProcess, /*terminate_error*/ None).await;
 
     let err = process
         .write(b"hello")
@@ -96,7 +122,7 @@ async fn remote_write_unknown_process_marks_process_exited() {
 
 #[tokio::test]
 async fn remote_write_closed_stdin_marks_process_exited() {
-    let process = remote_process(WriteStatus::StdinClosed).await;
+    let process = remote_process(WriteStatus::StdinClosed, /*terminate_error*/ None).await;
 
     let err = process
         .write(b"hello")
@@ -108,35 +134,41 @@ async fn remote_write_closed_stdin_marks_process_exited() {
 }
 
 #[tokio::test]
-async fn remote_process_waits_for_early_exit_event() {
-    let (wake_tx, _wake_rx) = watch::channel(0);
-    let started = StartedExecProcess {
-        process: Arc::new(MockExecProcess {
-            process_id: "test-process".to_string().into(),
-            write_response: WriteResponse {
-                status: WriteStatus::Accepted,
-            },
-            read_responses: Mutex::new(VecDeque::from([ReadResponse {
-                chunks: Vec::new(),
-                next_seq: 2,
-                exited: true,
-                exit_code: Some(17),
-                closed: true,
-                failure: None,
-            }])),
-            wake_tx: wake_tx.clone(),
-        }),
-    };
+async fn fail_and_terminate_preserves_failure_message() {
+    let process = remote_process(WriteStatus::Accepted, /*terminate_error*/ None).await;
 
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        let _ = wake_tx.send(1);
-    });
-
-    let process = UnifiedExecProcess::from_remote_started(started, SandboxType::None)
-        .await
-        .expect("remote process should observe early exit");
+    process.fail_and_terminate("network denied".to_string());
+    process.fail_and_terminate("second failure".to_string());
 
     assert!(process.has_exited());
-    assert_eq!(process.exit_code(), Some(17));
+    assert_eq!(
+        process.failure_message(),
+        Some("network denied".to_string())
+    );
+}
+
+#[tokio::test]
+async fn remote_terminate_confirmed_updates_state_on_success_only() {
+    let process = remote_process(
+        WriteStatus::Accepted,
+        Some("terminate unavailable".to_string()),
+    )
+    .await;
+
+    let err = process
+        .terminate_confirmed()
+        .await
+        .expect_err("expected terminate failure");
+
+    assert!(matches!(err, UnifiedExecError::ProcessFailed { .. }));
+    assert!(!process.has_exited());
+
+    let process = remote_process(WriteStatus::Accepted, /*terminate_error*/ None).await;
+
+    process
+        .terminate_confirmed()
+        .await
+        .expect("terminate should succeed");
+
+    assert!(process.has_exited());
 }

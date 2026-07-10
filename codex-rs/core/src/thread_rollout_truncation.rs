@@ -5,11 +5,28 @@
 
 use crate::context_manager::is_user_turn_boundary;
 use crate::event_mapping;
+use codex_app_server_protocol::TurnStatus;
+use codex_app_server_protocol::build_turns_from_rollout_items;
+use codex_protocol::error::CodexErr;
+use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::RolloutItem;
+
+pub(crate) fn initial_history_has_prior_user_turns(conversation_history: &InitialHistory) -> bool {
+    conversation_history.scan_rollout_items(rollout_item_is_user_turn_boundary)
+}
+
+fn rollout_item_is_user_turn_boundary(item: &RolloutItem) -> bool {
+    match item {
+        RolloutItem::ResponseItem(item) => is_user_turn_boundary(item),
+        RolloutItem::InterAgentCommunication(_) => true,
+        _ => false,
+    }
+}
 
 /// Return the indices of user message boundaries in a rollout.
 ///
@@ -46,7 +63,8 @@ pub(crate) fn user_message_positions_in_rollout(items: &[RolloutItem]) -> Vec<us
 ///
 /// A fork-turn boundary is either:
 /// - a real user message boundary, or
-/// - an assistant inter-agent envelope whose parsed `trigger_turn` is `true`.
+/// - an inter-agent communication whose `trigger_turn` is `true`, or
+/// - a legacy assistant inter-agent envelope with the same flag.
 ///
 /// Like `user_message_positions_in_rollout`, this applies `ThreadRolledBack` markers so indexing
 /// reflects the effective post-rollback history. Rollback counts instruction turns, so a rollback
@@ -58,10 +76,29 @@ pub(crate) fn fork_turn_positions_in_rollout(items: &[RolloutItem]) -> Vec<usize
     for (idx, item) in items.iter().enumerate() {
         match item {
             RolloutItem::ResponseItem(item) => {
-                if is_user_turn_boundary(item) {
+                let has_delivery_metadata = matches!(item, ResponseItem::AgentMessage { .. })
+                    && idx.checked_sub(1).is_some_and(|previous_idx| {
+                        matches!(
+                            items.get(previous_idx),
+                            Some(RolloutItem::InterAgentCommunicationMetadata { .. })
+                        )
+                    });
+                if is_user_turn_boundary(item) && !has_delivery_metadata {
                     rollback_turn_positions.push(idx);
                 }
                 if is_real_user_message_boundary(item) || is_trigger_turn_boundary(item) {
+                    fork_turn_positions.push(idx);
+                }
+            }
+            RolloutItem::InterAgentCommunication(communication) => {
+                rollback_turn_positions.push(idx);
+                if communication.trigger_turn {
+                    fork_turn_positions.push(idx);
+                }
+            }
+            RolloutItem::InterAgentCommunicationMetadata { trigger_turn } => {
+                rollback_turn_positions.push(idx);
+                if *trigger_turn {
                     fork_turn_positions.push(idx);
                 }
             }
@@ -116,9 +153,62 @@ pub(crate) fn truncate_rollout_before_nth_user_message_from_start(
     items[..cut_idx].to_vec()
 }
 
+/// Return a rollout prefix ending after the requested persisted terminal turn.
+///
+/// The turn must still be present in the effective post-rollback history and
+/// must have an explicit persisted TurnStarted boundary. Synthetic IDs
+/// generated while projecting legacy rollouts are intentionally unsupported
+/// because they do not provide a stable raw rollout boundary for a fork.
+pub fn truncate_rollout_after_turn_id(
+    items: &[RolloutItem],
+    last_turn_id: &str,
+) -> CodexResult<Vec<RolloutItem>> {
+    let turns = build_turns_from_rollout_items(items);
+    let turn = turns
+        .iter()
+        .find(|turn| turn.id == last_turn_id)
+        .ok_or_else(|| {
+            CodexErr::InvalidRequest(format!(
+                "lastTurnId '{last_turn_id}' was not found in the source thread"
+            ))
+        })?;
+
+    let target_start_index = items
+        .iter()
+        .position(|item| {
+            matches!(
+                item,
+                RolloutItem::EventMsg(EventMsg::TurnStarted(event))
+                    if event.turn_id == last_turn_id
+            )
+        })
+        .ok_or_else(|| {
+            CodexErr::InvalidRequest(format!(
+                "lastTurnId '{last_turn_id}' is not a persisted canonical turn in the source thread"
+            ))
+        })?;
+
+    if matches!(turn.status, TurnStatus::InProgress) {
+        return Err(CodexErr::InvalidRequest(format!(
+            "lastTurnId '{last_turn_id}' identifies an in-progress turn"
+        )));
+    }
+
+    let cut_index = items
+        .iter()
+        .enumerate()
+        .skip(target_start_index.saturating_add(1))
+        .find_map(|(index, item)| {
+            matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_))).then_some(index)
+        })
+        .unwrap_or(items.len());
+    Ok(items[..cut_index].to_vec())
+}
+
 /// Return a suffix of `items` that keeps the last `n_from_end` fork turns.
 ///
-/// If fewer than or equal to `n_from_end` fork turns exist, this returns the full rollout.
+/// If fewer than or equal to `n_from_end` fork turns exist, this keeps from the first fork-turn
+/// boundary and still drops pre-turn startup context.
 pub(crate) fn truncate_rollout_to_last_n_fork_turns(
     items: &[RolloutItem],
     n_from_end: usize,
@@ -128,11 +218,14 @@ pub(crate) fn truncate_rollout_to_last_n_fork_turns(
     }
 
     let fork_turn_positions = fork_turn_positions_in_rollout(items);
-    if fork_turn_positions.len() <= n_from_end {
-        return items.to_vec();
-    }
-
-    let keep_idx = fork_turn_positions[fork_turn_positions.len() - n_from_end];
+    let Some(keep_idx) = fork_turn_positions
+        .len()
+        .checked_sub(n_from_end)
+        .map(|position| fork_turn_positions[position])
+        .or_else(|| fork_turn_positions.first().copied())
+    else {
+        return Vec::new();
+    };
     items[keep_idx..].to_vec()
 }
 

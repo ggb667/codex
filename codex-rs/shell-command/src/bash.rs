@@ -94,13 +94,19 @@ pub fn try_parse_word_only_commands_sequence(tree: &Tree, src: &str) -> Option<V
     Some(commands)
 }
 
+/// Parses a shell script consisting only of plain commands joined by safe operators.
+pub fn parse_shell_script_into_commands(script: &str) -> Option<Vec<Vec<String>>> {
+    let tree = try_parse_shell(script)?;
+    try_parse_word_only_commands_sequence(&tree, script)
+}
+
 pub fn extract_bash_command(command: &[String]) -> Option<(&str, &str)> {
     let [shell, flag, script] = command else {
         return None;
     };
     if !matches!(flag.as_str(), "-lc" | "-c")
         || !matches!(
-            detect_shell_type(&PathBuf::from(shell)),
+            detect_shell_type(PathBuf::from(shell)),
             Some(ShellType::Zsh) | Some(ShellType::Bash) | Some(ShellType::Sh)
         )
     {
@@ -114,9 +120,7 @@ pub fn extract_bash_command(command: &[String]) -> Option<(&str, &str)> {
 /// joined by safe operators.
 pub fn parse_shell_lc_plain_commands(command: &[String]) -> Option<Vec<Vec<String>>> {
     let (_, script) = extract_bash_command(command)?;
-
-    let tree = try_parse_shell(script)?;
-    try_parse_word_only_commands_sequence(&tree, script)
+    parse_shell_script_into_commands(script)
 }
 
 /// Returns the parsed argv for a single shell command in a here-doc style
@@ -129,6 +133,9 @@ pub fn parse_shell_lc_single_command_prefix(command: &[String]) -> Option<Vec<St
         return None;
     }
     if !has_named_descendant_kind(root, "heredoc_redirect") {
+        return None;
+    }
+    if has_named_descendant_kind(root, "file_redirect") {
         return None;
     }
 
@@ -218,9 +225,11 @@ fn parse_heredoc_command_words(cmd: Node<'_>, src: &str) -> Option<Vec<String>> 
                 }
                 words.push(child.utf8_text(src.as_bytes()).ok()?.to_owned());
             }
-            // Allow shell constructs that attach IO to a single command without
-            // changing argv matching semantics for the executable prefix.
-            "variable_assignment" | "comment" => {}
+            // Allow heredoc constructs that attach stdin to a single command
+            // without changing argv matching semantics for the executable
+            // prefix. Other file redirects may write outside the sandbox and
+            // must not be collapsed to the executable prefix for execpolicy.
+            "comment" => {}
             kind if is_allowed_heredoc_attachment_kind(kind) => {}
             _ => return None,
         }
@@ -244,7 +253,6 @@ fn is_allowed_heredoc_attachment_kind(kind: &str) -> bool {
             | "simple_heredoc_body"
             | "heredoc_redirect"
             | "herestring_redirect"
-            | "file_redirect"
             | "redirected_statement"
     )
 }
@@ -318,8 +326,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     fn parse_seq(src: &str) -> Option<Vec<Vec<String>>> {
-        let tree = try_parse_shell(src)?;
-        try_parse_word_only_commands_sequence(&tree, src)
+        parse_shell_script_into_commands(src)
     }
 
     #[test]
@@ -536,16 +543,23 @@ mod tests {
     }
 
     #[test]
-    fn parse_shell_lc_single_command_prefix_accepts_heredoc_with_extra_redirect() {
+    fn parse_shell_lc_single_command_prefix_rejects_heredoc_with_extra_file_redirect() {
         let command = vec![
             "bash".to_string(),
             "-lc".to_string(),
             "python3 <<'PY' > /tmp/out.txt\nprint('hello')\nPY".to_string(),
         ];
-        assert_eq!(
-            parse_shell_lc_single_command_prefix(&command),
-            Some(vec!["python3".to_string()])
-        );
+        assert_eq!(parse_shell_lc_single_command_prefix(&command), None);
+    }
+
+    #[test]
+    fn parse_shell_lc_single_command_prefix_rejects_heredoc_with_variable_assignment() {
+        let command = vec![
+            "bash".to_string(),
+            "-lc".to_string(),
+            "PATH=/tmp/evil:$PATH cat <<'EOF'\nhello\nEOF".to_string(),
+        ];
+        assert_eq!(parse_shell_lc_single_command_prefix(&command), None);
     }
 
     #[test]

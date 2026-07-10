@@ -298,6 +298,22 @@ fn scope_background_rgb(highlighter: &Highlighter<'_>, scope_name: &str) -> Opti
     Some((bg.r, bg.g, bg.b))
 }
 
+/// Query the active syntax theme for the first foreground style provided by the
+/// supplied TextMate scopes.
+pub(crate) fn foreground_style_for_scopes(scope_names: &[&str]) -> Option<Style> {
+    let theme = current_syntax_theme();
+    foreground_style_for_scopes_with_theme(&theme, scope_names)
+}
+
+fn foreground_style_for_scopes_with_theme(theme: &Theme, scope_names: &[&str]) -> Option<Style> {
+    let highlighter = Highlighter::new(theme);
+    scope_names.iter().find_map(|scope_name| {
+        let scope = Scope::new(scope_name).ok()?;
+        let fg = highlighter.style_mod_for_stack(&[scope]).foreground?;
+        convert_syntect_color(fg).map(|fg| Style::default().fg(fg))
+    })
+}
+
 /// Return the configured kebab-case theme name when it resolves; otherwise
 /// return the adaptive auto-detected default theme name.
 ///
@@ -510,8 +526,10 @@ fn find_syntax(lang: &str) -> Option<&'static SyntaxReference> {
     let ss = syntax_set();
 
     // Aliases that two-face does not resolve on its own.
-    let patched = match lang {
+    let normalized = lang.to_ascii_lowercase();
+    let patched = match normalized.as_str() {
         "csharp" | "c-sharp" => "c#",
+        "cppm" | "cxxm" | "ixx" => "cpp",
         "golang" => "go",
         "python3" => "python",
         "shell" => "bash",
@@ -776,6 +794,28 @@ mod tests {
                 ..StyleModifier::default()
             },
         }
+    }
+
+    fn theme_item_with_foreground(scope: &str, foreground: (u8, u8, u8)) -> ThemeItem {
+        ThemeItem {
+            scope: ScopeSelectors::from_str(scope).expect("scope selector should parse"),
+            style: StyleModifier {
+                foreground: Some(SyntectColor {
+                    r: foreground.0,
+                    g: foreground.1,
+                    b: foreground.2,
+                    a: 255,
+                }),
+                ..StyleModifier::default()
+            },
+        }
+    }
+
+    fn assert_rgb(color: Option<RtColor>, expected: (u8, u8, u8)) {
+        let Some(RtColor::Rgb(r, g, b)) = color else {
+            panic!("expected RGB color {expected:?}, got {color:?}");
+        };
+        assert_eq!((r, g, b), expected);
     }
 
     #[test]
@@ -1165,7 +1205,10 @@ mod tests {
             );
         }
         // Patched aliases that two-face cannot resolve on its own.
-        for alias in ["csharp", "c-sharp", "golang", "python3", "shell"] {
+        for alias in [
+            "csharp", "c-sharp", "cppm", "CPPM", "cxxm", "CxXm", "ixx", "IXX", "golang", "python3",
+            "shell",
+        ] {
             assert!(
                 find_syntax(alias).is_some(),
                 "find_syntax({alias:?}) returned None — patched alias broken"
@@ -1208,6 +1251,34 @@ mod tests {
                 deleted: None,
             }
         );
+    }
+
+    #[test]
+    fn foreground_style_for_scopes_reads_matching_theme_scope() {
+        let theme = Theme {
+            settings: ThemeSettings::default(),
+            scopes: vec![theme_item_with_foreground("keyword", (10, 20, 30))],
+            ..Theme::default()
+        };
+
+        let style = foreground_style_for_scopes_with_theme(&theme, &["keyword"])
+            .expect("expected keyword foreground style");
+
+        assert_rgb(style.fg, (10, 20, 30));
+    }
+
+    #[test]
+    fn foreground_style_for_scopes_uses_first_scope_with_foreground() {
+        let theme = Theme {
+            settings: ThemeSettings::default(),
+            scopes: vec![theme_item_with_foreground("string", (40, 50, 60))],
+            ..Theme::default()
+        };
+
+        let style = foreground_style_for_scopes_with_theme(&theme, &["keyword", "string"])
+            .expect("expected string foreground style");
+
+        assert_rgb(style.fg, (40, 50, 60));
     }
 
     #[test]

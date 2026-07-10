@@ -1,5 +1,3 @@
-#![allow(clippy::expect_used)]
-
 use super::compact::COMPACT_WARNING_MESSAGE;
 use anyhow::Result;
 use codex_core::CodexThread;
@@ -72,7 +70,7 @@ async fn window_id_advances_after_compact_persists_on_resume_and_resets_on_fork(
             /*snapshot*/ 0usize,
             resumed.config.clone(),
             rollout_path,
-            /*persist_extended_history*/ false,
+            /*thread_source*/ None,
             /*parent_trace*/ None,
         )
         .await?;
@@ -109,6 +107,9 @@ async fn submit_user_turn(codex: &Arc<CodexThread>, text: &str) -> Result<()> {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await?;
     wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
@@ -138,9 +139,9 @@ fn window_id_parts(request: &ResponsesRequest) -> (String, u64) {
         .expect("missing x-codex-window-id header");
     let (thread_id, generation) = window_id
         .rsplit_once(':')
-        .unwrap_or_else(|| panic!("invalid window id header: {window_id}"));
+        .expect("window id header should contain a generation");
     let generation = generation
         .parse::<u64>()
-        .unwrap_or_else(|err| panic!("invalid window generation in {window_id}: {err}"));
+        .expect("window generation should be a valid integer");
     (thread_id.to_string(), generation)
 }

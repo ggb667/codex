@@ -7,22 +7,23 @@ version.workspace = true
 [lib]
 name = "codex_cloud_tasks"
 path = "src/lib.rs"
+doctest = false
 
 [lints]
 workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-base64 = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true, features = ["derive"] }
-codex-client = { workspace = true }
+codex-http-client = { workspace = true }
 codex-cloud-tasks-client = { workspace = true }
 # TODO: codex-cloud-tasks-mock-client should be in dev-dependencies.
 codex-cloud-tasks-mock-client = { workspace = true }
 codex-core = { workspace = true }
 codex-git-utils = { workspace = true }
 codex-login = { path = "../login" }
+codex-model-provider = { workspace = true }
 codex-tui = { workspace = true }
 codex-utils-cli = { workspace = true }
 crossterm = { workspace = true, features = ["event-stream"] }
@@ -37,9 +38,6 @@ tokio-stream = { workspace = true }
 tracing = { workspace = true, features = ["log"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 unicode-width = { workspace = true }
-
-[dependencies.async-trait]
-workspace = true
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

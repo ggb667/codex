@@ -1,13 +1,14 @@
+#![allow(clippy::expect_used)]
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use async_trait::async_trait;
 use bytes::Bytes;
 use codex_api::AuthProvider;
+use codex_api::Compression;
 use codex_api::Provider;
 use codex_api::ResponseEvent;
 use codex_api::ResponsesClient;
-use codex_api::requests::responses::Compression;
 use codex_client::HttpTransport;
 use codex_client::Request;
 use codex_client::Response;
@@ -31,7 +32,6 @@ impl FixtureSseTransport {
     }
 }
 
-#[async_trait]
 impl HttpTransport for FixtureSseTransport {
     async fn execute(&self, _req: Request) -> Result<Response, TransportError> {
         Err(TransportError::Build("execute should not run".to_string()))
@@ -53,9 +53,7 @@ impl HttpTransport for FixtureSseTransport {
 struct NoAuth;
 
 impl AuthProvider for NoAuth {
-    fn bearer_token(&self) -> Option<String> {
-        None
-    }
+    fn add_auth_headers(&self, _headers: &mut HeaderMap) {}
 }
 
 fn provider(name: &str) -> Provider {
@@ -64,7 +62,7 @@ fn provider(name: &str) -> Provider {
         base_url: "https://example.com/v1".to_string(),
         query_params: None,
         headers: HeaderMap::new(),
-        retry: codex_api::provider::RetryConfig {
+        retry: codex_api::RetryConfig {
             max_attempts: 1,
             base_delay: Duration::from_millis(1),
             retry_429: false,
@@ -81,7 +79,7 @@ fn build_responses_body(events: Vec<Value>) -> String {
         let kind = e
             .get("type")
             .and_then(|v| v.as_str())
-            .unwrap_or_else(|| panic!("fixture event missing type in SSE fixture: {e}"));
+            .expect("SSE fixture event should have a type");
         if e.as_object().map(|o| o.len() == 1).unwrap_or(false) {
             body.push_str(&format!("event: {kind}\n\n"));
         } else {
@@ -118,7 +116,7 @@ async fn responses_stream_parses_items_and_completed_end_to_end() -> Result<()> 
 
     let body = build_responses_body(vec![item1, item2, completed]);
     let transport = FixtureSseTransport::new(body);
-    let client = ResponsesClient::new(transport, provider("openai"), NoAuth);
+    let client = ResponsesClient::new(transport, provider("openai"), Arc::new(NoAuth));
 
     let mut stream = client
         .stream(
@@ -159,9 +157,11 @@ async fn responses_stream_parses_items_and_completed_end_to_end() -> Result<()> 
         ResponseEvent::Completed {
             response_id,
             token_usage,
+            end_turn,
         } => {
             assert_eq!(response_id, "resp1");
             assert!(token_usage.is_none());
+            assert!(end_turn.is_none());
         }
         other => panic!("unexpected third event: {other:?}"),
     }

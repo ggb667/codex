@@ -1,122 +1,54 @@
 use std::path::PathBuf;
-use std::time::Duration;
-use std::time::Instant;
 
 use super::ChatWidget;
+use super::plugin_catalog::marketplace_display_name;
+use super::plugin_catalog::marketplace_is_user_configured;
+use super::plugin_catalog::marketplace_is_user_configured_git;
+use super::plugin_catalog::marketplace_tab_id;
+use super::plugin_catalog::marketplace_tab_id_from_path;
+use super::plugin_catalog::marketplace_tab_id_matching_saved_id;
+use super::plugin_catalog::merge_remote_marketplaces;
+use super::plugin_catalog::plugin_detail_hint_line;
 use crate::app_event::AppEvent;
+use crate::app_event::PluginLocation;
+use crate::app_event::PluginRemoteSectionError;
 use crate::bottom_pane::ColumnWidthMode;
 use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
+use crate::bottom_pane::custom_prompt_view::CustomPromptView;
 use crate::history_cell;
-use crate::onboarding::mark_url_hyperlink;
+use crate::key_hint;
 use crate::render::renderable::ColumnRenderable;
-use crate::render::renderable::Renderable;
-use crate::shimmer::shimmer_spans;
-use crate::tui::FrameRequester;
-use codex_app_server_protocol::PluginDetail;
-use codex_app_server_protocol::PluginInstallPolicy;
+use codex_app_server_protocol::MarketplaceAddResponse;
+use codex_app_server_protocol::MarketplaceRemoveResponse;
+use codex_app_server_protocol::MarketplaceUpgradeResponse;
 use codex_app_server_protocol::PluginInstallResponse;
 use codex_app_server_protocol::PluginListResponse;
 use codex_app_server_protocol::PluginMarketplaceEntry;
 use codex_app_server_protocol::PluginReadResponse;
-use codex_app_server_protocol::PluginSummary;
 use codex_app_server_protocol::PluginUninstallResponse;
 use codex_features::Feature;
-use codex_utils_absolute_path::AbsolutePathBuf;
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
-use ratatui::prelude::Widget;
+use crossterm::event::KeyCode;
+use crossterm::event::KeyEvent;
+use crossterm::event::KeyEventKind;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
-use ratatui::widgets::Paragraph;
-use ratatui::widgets::WidgetRef;
-use ratatui::widgets::Wrap;
 
-const PLUGINS_SELECTION_VIEW_ID: &str = "plugins-selection";
-const LOADING_ANIMATION_DELAY: Duration = Duration::from_secs(1);
-const LOADING_ANIMATION_INTERVAL: Duration = Duration::from_millis(100);
+pub(super) const PLUGINS_SELECTION_VIEW_ID: &str = "plugins-selection";
+pub(super) const ALL_PLUGINS_TAB_ID: &str = "all-plugins";
+pub(super) const ADD_MARKETPLACE_TAB_ID: &str = "add-marketplace";
 
-struct DelayedLoadingHeader {
-    started_at: Instant,
-    frame_requester: FrameRequester,
-    animations_enabled: bool,
-    loading_text: String,
-    note: Option<String>,
+#[derive(Debug, Clone, Default)]
+pub(super) struct PluginListFetchState {
+    pub(super) cache_cwd: Option<PathBuf>,
+    pub(super) in_flight_cwd: Option<PathBuf>,
+    pub(super) vertical_section_requested: bool,
 }
 
-impl DelayedLoadingHeader {
-    fn new(
-        frame_requester: FrameRequester,
-        animations_enabled: bool,
-        loading_text: String,
-        note: Option<String>,
-    ) -> Self {
-        Self {
-            started_at: Instant::now(),
-            frame_requester,
-            animations_enabled,
-            loading_text,
-            note,
-        }
-    }
-}
-
-impl Renderable for DelayedLoadingHeader {
-    fn render(&self, area: Rect, buf: &mut Buffer) {
-        if area.is_empty() {
-            return;
-        }
-
-        let mut lines = Vec::with_capacity(3);
-        lines.push(Line::from("Plugins".bold()));
-
-        let now = Instant::now();
-        let elapsed = now.saturating_duration_since(self.started_at);
-        if elapsed < LOADING_ANIMATION_DELAY {
-            self.frame_requester
-                .schedule_frame_in(LOADING_ANIMATION_DELAY - elapsed);
-            lines.push(Line::from(self.loading_text.as_str().dim()));
-        } else if self.animations_enabled {
-            self.frame_requester
-                .schedule_frame_in(LOADING_ANIMATION_INTERVAL);
-            lines.push(Line::from(shimmer_spans(self.loading_text.as_str())));
-        } else {
-            lines.push(Line::from(self.loading_text.as_str().dim()));
-        }
-
-        if let Some(note) = &self.note {
-            lines.push(Line::from(note.as_str().dim()));
-        }
-
-        Paragraph::new(lines).render_ref(area, buf);
-    }
-
-    fn desired_height(&self, _width: u16) -> u16 {
-        2 + u16::from(self.note.is_some())
-    }
-}
-
-const APPS_HELP_ARTICLE_URL: &str = "https://help.openai.com/en/articles/11487775-apps-in-chatgpt";
-
-struct PluginDisclosureLine {
-    line: Line<'static>,
-}
-
-impl Renderable for PluginDisclosureLine {
-    fn render(&self, area: Rect, buf: &mut Buffer) {
-        Paragraph::new(self.line.clone())
-            .wrap(Wrap { trim: false })
-            .render(area, buf);
-        mark_url_hyperlink(buf, area, APPS_HELP_ARTICLE_URL);
-    }
-
-    fn desired_height(&self, width: u16) -> u16 {
-        Paragraph::new(self.line.clone())
-            .wrap(Wrap { trim: false })
-            .line_count(width)
-            .try_into()
-            .unwrap_or(u16::MAX)
-    }
+#[derive(Debug, Clone)]
+pub(super) struct PluginInstallAuthFlowState {
+    plugin_display_name: String,
+    next_app_index: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -138,6 +70,7 @@ impl ChatWidget {
             return;
         }
 
+        self.plugins_active_tab_id = Some(ALL_PLUGINS_TAB_ID.to_string());
         self.prefetch_plugins();
 
         match self.plugins_cache_for_current_cwd() {
@@ -159,7 +92,9 @@ impl ChatWidget {
         cwd: PathBuf,
         result: Result<PluginListResponse, String>,
     ) {
-        if self.plugins_fetch_state.in_flight_cwd.as_deref() == Some(cwd.as_path()) {
+        let request_was_in_flight =
+            self.plugins_fetch_state.in_flight_cwd.as_deref() == Some(cwd.as_path());
+        if request_was_in_flight {
             self.plugins_fetch_state.in_flight_cwd = None;
         }
 
@@ -168,17 +103,53 @@ impl ChatWidget {
         }
 
         let auth_flow_active = self.plugin_install_auth_flow.is_some();
+        let should_refresh_plugins_popup = !auth_flow_active
+            && (self
+                .bottom_pane
+                .active_tab_id_for_active_view(PLUGINS_SELECTION_VIEW_ID)
+                .is_some()
+                || self
+                    .bottom_pane
+                    .selected_index_for_active_view(PLUGINS_SELECTION_VIEW_ID)
+                    .is_some()
+                || !matches!(
+                    self.plugins_cache_for_current_cwd(),
+                    PluginsCacheState::Ready(_)
+                ));
 
         match result {
             Ok(response) => {
                 self.plugins_fetch_state.cache_cwd = Some(cwd);
+                self.plugin_remote_sections_loading = request_was_in_flight;
+                if request_was_in_flight {
+                    self.plugin_remote_sections_loaded = false;
+                }
+                self.plugin_remote_section_errors.clear();
+                let active_tab_id = self
+                    .plugins_active_tab_id
+                    .as_deref()
+                    .and_then(|tab_id| {
+                        marketplace_tab_id_matching_saved_id(tab_id, &response.marketplaces)
+                    })
+                    .or_else(|| self.plugins_active_tab_id.clone());
+                self.newly_installed_marketplace_tab_id = self
+                    .newly_installed_marketplace_tab_id
+                    .as_deref()
+                    .and_then(|tab_id| {
+                        marketplace_tab_id_matching_saved_id(tab_id, &response.marketplaces)
+                    });
+                self.plugins_active_tab_id = active_tab_id;
                 self.plugins_cache = PluginsCacheState::Ready(response.clone());
-                if !auth_flow_active {
+                if should_refresh_plugins_popup {
                     self.refresh_plugins_popup_if_open(&response);
                 }
+                self.newly_installed_marketplace_tab_id = None;
             }
             Err(err) => {
-                if !auth_flow_active {
+                self.plugin_remote_sections_loading = false;
+                self.plugin_remote_sections_loaded = false;
+                self.plugins_fetch_state.vertical_section_requested = false;
+                if should_refresh_plugins_popup {
                     self.plugins_fetch_state.cache_cwd = None;
                     self.plugins_cache = PluginsCacheState::Failed(err.clone());
                     let _ = self.bottom_pane.replace_selection_view_if_active(
@@ -190,21 +161,68 @@ impl ChatWidget {
         }
     }
 
+    pub(crate) fn on_plugin_remote_sections_loaded(
+        &mut self,
+        cwd: PathBuf,
+        marketplaces: Vec<PluginMarketplaceEntry>,
+        section_errors: Vec<PluginRemoteSectionError>,
+    ) {
+        if self.config.cwd.as_path() != cwd.as_path() {
+            return;
+        }
+
+        let should_refresh_plugins_popup = self
+            .bottom_pane
+            .active_tab_id_for_active_view(PLUGINS_SELECTION_VIEW_ID)
+            .is_some();
+        self.plugin_remote_sections_loading = false;
+        self.plugin_remote_sections_loaded = true;
+        self.plugins_fetch_state.vertical_section_requested = false;
+        let refreshed_response = match &mut self.plugins_cache {
+            PluginsCacheState::Ready(response)
+                if self.plugins_fetch_state.cache_cwd.as_deref() == Some(cwd.as_path()) =>
+            {
+                merge_remote_marketplaces(response, marketplaces);
+                self.plugin_remote_section_errors = section_errors;
+                Some(response.clone())
+            }
+            _ => {
+                self.plugin_remote_section_errors = section_errors;
+                None
+            }
+        };
+
+        if let Some(response) = refreshed_response
+            && should_refresh_plugins_popup
+        {
+            self.refresh_plugins_popup_if_open(&response);
+        }
+    }
+
     fn prefetch_plugins(&mut self) {
         let cwd = self.config.cwd.to_path_buf();
         if self.plugins_fetch_state.in_flight_cwd.as_deref() == Some(cwd.as_path()) {
             return;
         }
 
-        self.plugins_fetch_state.in_flight_cwd = Some(cwd.clone());
-        if self.plugins_fetch_state.cache_cwd.as_deref() != Some(cwd.as_path()) {
-            self.plugins_cache = PluginsCacheState::Loading;
-        }
-
+        self.on_plugins_list_fetch_started(cwd.clone());
         self.app_event_tx.send(AppEvent::FetchPluginsList { cwd });
     }
 
-    fn plugins_cache_for_current_cwd(&self) -> PluginsCacheState {
+    pub(crate) fn on_plugins_list_fetch_started(&mut self, cwd: PathBuf) {
+        if self.config.cwd.as_path() != cwd.as_path() {
+            return;
+        }
+
+        self.plugins_fetch_state.in_flight_cwd = Some(cwd.clone());
+        self.plugins_fetch_state.vertical_section_requested =
+            !self.config.features.enabled(Feature::RemotePlugin);
+        if self.plugins_fetch_state.cache_cwd.as_deref() != Some(cwd.as_path()) {
+            self.plugins_cache = PluginsCacheState::Loading;
+        }
+    }
+
+    pub(super) fn plugins_cache_for_current_cwd(&self) -> PluginsCacheState {
         if self.plugins_fetch_state.cache_cwd.as_deref() == Some(self.config.cwd.as_path()) {
             self.plugins_cache.clone()
         } else {
@@ -223,11 +241,156 @@ impl ChatWidget {
     }
 
     fn open_plugins_popup(&mut self, response: &PluginListResponse) {
+        self.plugins_active_tab_id = Some(ALL_PLUGINS_TAB_ID.to_string());
         self.bottom_pane
-            .show_selection_view(self.plugins_popup_params(response));
+            .show_selection_view(self.plugins_popup_params(
+                response,
+                self.plugins_active_tab_id.clone(),
+                /*initial_selected_idx*/ None,
+            ));
+    }
+
+    pub(crate) fn open_plugins_list(&mut self, cwd: PathBuf, response: PluginListResponse) {
+        if self.config.cwd.as_path() != cwd.as_path() {
+            return;
+        }
+
+        let response = match self.plugins_cache_for_current_cwd() {
+            PluginsCacheState::Ready(current_response) => current_response,
+            PluginsCacheState::Uninitialized
+            | PluginsCacheState::Loading
+            | PluginsCacheState::Failed(_) => response,
+        };
+        self.plugins_fetch_state.cache_cwd = Some(cwd);
+        self.plugins_cache = PluginsCacheState::Ready(response.clone());
+        let active_tab_id = self
+            .bottom_pane
+            .active_tab_id_for_active_view(PLUGINS_SELECTION_VIEW_ID)
+            .map(str::to_string)
+            .or_else(|| self.plugins_active_tab_id.clone())
+            .or_else(|| Some(ALL_PLUGINS_TAB_ID.to_string()));
+        self.plugins_active_tab_id = active_tab_id.clone();
+        let params =
+            self.plugins_popup_params(&response, active_tab_id, /*initial_selected_idx*/ None);
+        if !self
+            .bottom_pane
+            .replace_selection_view_if_active(PLUGINS_SELECTION_VIEW_ID, params)
+        {
+            self.open_plugins_popup(&response);
+        }
+    }
+
+    pub(crate) fn open_marketplace_add_prompt(&mut self) {
+        self.plugins_active_tab_id = Some(ADD_MARKETPLACE_TAB_ID.to_string());
+        let tx = self.app_event_tx.clone();
+        let cwd = self.config.cwd.to_path_buf();
+        let view = CustomPromptView::new(
+            "Add marketplace".to_string(),
+            "owner/repo, git URL, or local marketplace path".to_string(),
+            String::new(),
+            Some("Examples: owner/repo, git URL, ./marketplace".to_string()),
+            Box::new(move |source: String| {
+                let source = source.trim().to_string();
+                if source.is_empty() {
+                    return;
+                }
+                tx.send(AppEvent::OpenMarketplaceAddLoading {
+                    source: source.clone(),
+                });
+                tx.send(AppEvent::FetchMarketplaceAdd {
+                    cwd: cwd.clone(),
+                    source,
+                });
+            }),
+        );
+        self.bottom_pane.show_view(Box::new(view));
+    }
+
+    pub(crate) fn open_marketplace_add_loading_popup(&mut self, _source: &str) {
+        self.plugins_active_tab_id = Some(ADD_MARKETPLACE_TAB_ID.to_string());
+        let params = self.marketplace_add_loading_popup_params();
+        if !self
+            .bottom_pane
+            .replace_selection_view_if_active(PLUGINS_SELECTION_VIEW_ID, params)
+        {
+            self.bottom_pane
+                .show_selection_view(self.marketplace_add_loading_popup_params());
+        }
+    }
+
+    pub(crate) fn open_marketplace_upgrade_loading_popup(
+        &mut self,
+        marketplace_name: Option<&str>,
+    ) {
+        self.plugins_active_tab_id = self
+            .bottom_pane
+            .active_tab_id_for_active_view(PLUGINS_SELECTION_VIEW_ID)
+            .map(str::to_string)
+            .or_else(|| self.plugins_active_tab_id.clone());
+        let params = self.marketplace_upgrade_loading_popup_params(marketplace_name);
+        if !self
+            .bottom_pane
+            .replace_selection_view_if_active(PLUGINS_SELECTION_VIEW_ID, params)
+        {
+            self.bottom_pane.show_selection_view(
+                self.marketplace_upgrade_loading_popup_params(marketplace_name),
+            );
+        }
+    }
+
+    pub(crate) fn open_marketplace_remove_confirmation(
+        &mut self,
+        marketplace_name: String,
+        marketplace_display_name: String,
+    ) {
+        self.plugins_active_tab_id = self
+            .bottom_pane
+            .active_tab_id_for_active_view(PLUGINS_SELECTION_VIEW_ID)
+            .map(str::to_string)
+            .or_else(|| self.plugins_active_tab_id.clone());
+
+        let PluginsCacheState::Ready(plugins_response) = self.plugins_cache_for_current_cwd()
+        else {
+            return;
+        };
+
+        let params = self.marketplace_remove_confirmation_popup_params(
+            &plugins_response,
+            marketplace_name.clone(),
+            marketplace_display_name.clone(),
+        );
+        if !self
+            .bottom_pane
+            .replace_selection_view_if_active(PLUGINS_SELECTION_VIEW_ID, params)
+        {
+            self.bottom_pane.show_selection_view(
+                self.marketplace_remove_confirmation_popup_params(
+                    &plugins_response,
+                    marketplace_name,
+                    marketplace_display_name,
+                ),
+            );
+        }
+    }
+
+    pub(crate) fn open_marketplace_remove_loading_popup(&mut self, marketplace_display_name: &str) {
+        let params = self.marketplace_remove_loading_popup_params(marketplace_display_name);
+        if !self
+            .bottom_pane
+            .replace_selection_view_if_active(PLUGINS_SELECTION_VIEW_ID, params)
+        {
+            self.bottom_pane.show_selection_view(
+                self.marketplace_remove_loading_popup_params(marketplace_display_name),
+            );
+        }
     }
 
     pub(crate) fn open_plugin_detail_loading_popup(&mut self, plugin_display_name: &str) {
+        self.plugins_active_tab_id = self
+            .bottom_pane
+            .active_tab_id_for_active_view(PLUGINS_SELECTION_VIEW_ID)
+            .map(str::to_string)
+            .or_else(|| self.plugins_active_tab_id.clone());
         let params = self.plugin_detail_loading_popup_params(plugin_display_name);
         let _ = self
             .bottom_pane
@@ -283,7 +446,7 @@ impl ChatWidget {
     pub(crate) fn on_plugin_install_loaded(
         &mut self,
         cwd: PathBuf,
-        _marketplace_path: AbsolutePathBuf,
+        _location: PluginLocation,
         _plugin_name: String,
         plugin_display_name: String,
         result: Result<PluginInstallResponse, String>,
@@ -316,7 +479,7 @@ impl ChatWidget {
                             self.plugin_install_apps_needing_auth.len()
                         )),
                     );
-                    self.plugin_install_auth_flow = Some(super::PluginInstallAuthFlowState {
+                    self.plugin_install_auth_flow = Some(PluginInstallAuthFlowState {
                         plugin_display_name,
                         next_app_index: 0,
                     });
@@ -337,6 +500,287 @@ impl ChatWidget {
                 );
                 true
             }
+        }
+    }
+
+    pub(crate) fn on_marketplace_add_loaded(
+        &mut self,
+        cwd: PathBuf,
+        _source: String,
+        result: Result<MarketplaceAddResponse, String>,
+    ) {
+        if self.config.cwd.as_path() != cwd.as_path() {
+            return;
+        }
+
+        match result {
+            Ok(response) => {
+                let marketplace_tab_id = marketplace_tab_id_from_path(&response.installed_root);
+                self.plugins_active_tab_id = Some(marketplace_tab_id.clone());
+                self.newly_installed_marketplace_tab_id =
+                    (!response.already_added).then_some(marketplace_tab_id);
+                let message = if response.already_added {
+                    format!(
+                        "Marketplace {} is already added.",
+                        response.marketplace_name
+                    )
+                } else {
+                    format!("Added marketplace {}.", response.marketplace_name)
+                };
+                self.add_info_message(
+                    message,
+                    Some(format!(
+                        "Marketplace root: {}",
+                        response.installed_root.as_path().display()
+                    )),
+                );
+            }
+            Err(_) => {
+                self.plugins_active_tab_id = Some(ADD_MARKETPLACE_TAB_ID.to_string());
+                let params = self.marketplace_add_error_popup_params();
+                if !self
+                    .bottom_pane
+                    .replace_selection_view_if_active(PLUGINS_SELECTION_VIEW_ID, params)
+                {
+                    self.bottom_pane
+                        .show_selection_view(self.marketplace_add_error_popup_params());
+                }
+            }
+        }
+    }
+
+    pub(crate) fn on_marketplace_remove_loaded(
+        &mut self,
+        cwd: PathBuf,
+        marketplace_name: String,
+        marketplace_display_name: String,
+        result: Result<MarketplaceRemoveResponse, String>,
+    ) {
+        if self.config.cwd.as_path() != cwd.as_path() {
+            return;
+        }
+
+        match result {
+            Ok(response) => {
+                self.plugins_active_tab_id = Some(ALL_PLUGINS_TAB_ID.to_string());
+                self.add_info_message(
+                    format!("Removed marketplace {marketplace_display_name}."),
+                    Some(match response.installed_root {
+                        Some(installed_root) => {
+                            format!("Marketplace root: {}", installed_root.as_path().display())
+                        }
+                        None => format!(
+                            "Removed marketplace config for {}.",
+                            response.marketplace_name
+                        ),
+                    }),
+                );
+            }
+            Err(_) => {
+                let params = self.marketplace_remove_error_popup_params(
+                    &marketplace_name,
+                    &marketplace_display_name,
+                );
+                if !self
+                    .bottom_pane
+                    .replace_selection_view_if_active(PLUGINS_SELECTION_VIEW_ID, params)
+                {
+                    self.bottom_pane.show_selection_view(
+                        self.marketplace_remove_error_popup_params(
+                            &marketplace_name,
+                            &marketplace_display_name,
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    pub(crate) fn on_marketplace_upgrade_loaded(
+        &mut self,
+        cwd: PathBuf,
+        result: Result<MarketplaceUpgradeResponse, String>,
+    ) {
+        if self.config.cwd.as_path() != cwd.as_path() {
+            return;
+        }
+
+        match result {
+            Ok(response) => {
+                if response.upgraded_roots.len() == 1 {
+                    self.plugins_active_tab_id =
+                        Some(marketplace_tab_id_from_path(&response.upgraded_roots[0]));
+                }
+
+                let selected_count = response.selected_marketplaces.len();
+                let upgraded_count = response.upgraded_roots.len();
+                let error_count = response.errors.len();
+                if selected_count == 0 {
+                    self.add_info_message(
+                        "No configured Git marketplaces to upgrade.".to_string(),
+                        Some("Only configured Git marketplaces can be upgraded.".to_string()),
+                    );
+                    return;
+                }
+
+                if upgraded_count == 0 && error_count == 0 {
+                    let message = if selected_count == 1 {
+                        format!(
+                            "Marketplace {} is already up to date.",
+                            response.selected_marketplaces[0]
+                        )
+                    } else {
+                        format!(
+                            "Checked {selected_count} marketplaces; all are already up to date."
+                        )
+                    };
+                    self.add_info_message(
+                        message,
+                        Some(format!(
+                            "Checked: {}",
+                            response.selected_marketplaces.join(", ")
+                        )),
+                    );
+                    return;
+                }
+
+                if upgraded_count > 0 {
+                    let noun = if upgraded_count == 1 {
+                        "marketplace"
+                    } else {
+                        "marketplaces"
+                    };
+                    self.add_info_message(
+                        format!("Upgraded {upgraded_count} {noun}."),
+                        Some(format!(
+                            "Updated roots: {}",
+                            response
+                                .upgraded_roots
+                                .iter()
+                                .map(|root| root.as_path().display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )),
+                    );
+                }
+
+                if error_count > 0 {
+                    let noun = if error_count == 1 {
+                        "marketplace"
+                    } else {
+                        "marketplaces"
+                    };
+                    self.add_error_message(format!(
+                        "Failed to upgrade {error_count} {noun}: {}",
+                        response
+                            .errors
+                            .iter()
+                            .map(|err| format!("{}: {}", err.marketplace_name, err.message))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ));
+                }
+            }
+            Err(err) => {
+                self.add_error_message(err);
+            }
+        }
+    }
+
+    pub(crate) fn handle_plugins_popup_key_event(&mut self, key_event: KeyEvent) -> bool {
+        let remove_marketplace = key_hint::ctrl(KeyCode::Char('r')).is_press(key_event);
+        let upgrade_marketplace = key_hint::ctrl(KeyCode::Char('u')).is_press(key_event);
+        if !remove_marketplace && !upgrade_marketplace {
+            return false;
+        }
+
+        let Some(active_tab_id) = self
+            .bottom_pane
+            .active_tab_id_for_active_view(PLUGINS_SELECTION_VIEW_ID)
+        else {
+            return false;
+        };
+        let PluginsCacheState::Ready(plugins_response) = self.plugins_cache_for_current_cwd()
+        else {
+            return false;
+        };
+        let Some(marketplace) = plugins_response.marketplaces.iter().find(|marketplace| {
+            marketplace_tab_id(marketplace) == active_tab_id
+                && marketplace_is_user_configured(&self.config, &marketplace.name)
+        }) else {
+            return false;
+        };
+
+        if remove_marketplace {
+            self.open_marketplace_remove_confirmation(
+                marketplace.name.clone(),
+                marketplace_display_name(marketplace),
+            );
+            return true;
+        }
+        if marketplace.path.is_none()
+            || !marketplace_is_user_configured_git(&self.config, &marketplace.name)
+        {
+            return false;
+        }
+        if key_event.kind != KeyEventKind::Press {
+            return true;
+        }
+
+        let cwd = self.config.cwd.to_path_buf();
+        let marketplace_name = Some(marketplace.name.clone());
+        self.open_marketplace_upgrade_loading_popup(marketplace_name.as_deref());
+        self.app_event_tx
+            .send(AppEvent::OpenMarketplaceUpgradeLoading {
+                marketplace_name: marketplace_name.clone(),
+            });
+        self.app_event_tx.send(AppEvent::FetchMarketplaceUpgrade {
+            cwd,
+            marketplace_name,
+        });
+        true
+    }
+
+    pub(crate) fn on_plugin_enabled_set(
+        &mut self,
+        cwd: PathBuf,
+        plugin_id: String,
+        enabled: bool,
+        result: Result<(), String>,
+    ) {
+        if self.config.cwd.as_path() != cwd.as_path() {
+            return;
+        }
+
+        if let Err(err) = result {
+            self.add_error_message(format!(
+                "Failed to update plugin config for {plugin_id}: {err}"
+            ));
+            if let PluginsCacheState::Ready(response) = self.plugins_cache_for_current_cwd() {
+                self.refresh_plugins_popup_if_open(&response);
+            }
+            return;
+        }
+
+        let refreshed_response = match &mut self.plugins_cache {
+            PluginsCacheState::Ready(response)
+                if self.plugins_fetch_state.cache_cwd.as_deref() == Some(cwd.as_path()) =>
+            {
+                for plugin in response
+                    .marketplaces
+                    .iter_mut()
+                    .flat_map(|marketplace| marketplace.plugins.iter_mut())
+                    .filter(|plugin| plugin.id == plugin_id)
+                {
+                    plugin.enabled = enabled;
+                }
+                Some(response.clone())
+            }
+            _ => None,
+        };
+
+        if let Some(response) = refreshed_response {
+            self.refresh_plugins_popup_if_open(&response);
         }
     }
 
@@ -501,7 +945,7 @@ impl ChatWidget {
         Some(SelectionViewParams {
             view_id: Some(PLUGINS_SELECTION_VIEW_ID),
             header: Box::new(header),
-            footer_hint: Some(plugins_popup_hint_line()),
+            footer_hint: Some(plugin_detail_hint_line()),
             items,
             col_width_mode: ColumnWidthMode::AutoAllRows,
             ..Default::default()
@@ -544,544 +988,31 @@ impl ChatWidget {
             _ => None,
         };
         if let Some(plugins_response) = plugins_response {
+            let tab_id = self.plugins_active_tab_id.clone();
             let _ = self.bottom_pane.replace_selection_view_if_active(
                 PLUGINS_SELECTION_VIEW_ID,
-                self.plugins_popup_params(&plugins_response),
+                self.plugins_popup_params(
+                    &plugins_response,
+                    tab_id,
+                    /*initial_selected_idx*/ None,
+                ),
             );
         }
     }
 
     fn refresh_plugins_popup_if_open(&mut self, response: &PluginListResponse) {
+        let active_tab_id = self
+            .bottom_pane
+            .active_tab_id_for_active_view(PLUGINS_SELECTION_VIEW_ID)
+            .map(str::to_string)
+            .or_else(|| self.plugins_active_tab_id.clone());
+        let selected_idx = self
+            .bottom_pane
+            .selected_index_for_active_view(PLUGINS_SELECTION_VIEW_ID);
+        self.plugins_active_tab_id = active_tab_id.clone();
         let _ = self.bottom_pane.replace_selection_view_if_active(
             PLUGINS_SELECTION_VIEW_ID,
-            self.plugins_popup_params(response),
+            self.plugins_popup_params(response, active_tab_id, selected_idx),
         );
-    }
-
-    fn plugins_loading_popup_params(&self) -> SelectionViewParams {
-        SelectionViewParams {
-            view_id: Some(PLUGINS_SELECTION_VIEW_ID),
-            header: Box::new(DelayedLoadingHeader::new(
-                self.frame_requester.clone(),
-                self.config.animations,
-                "Loading available plugins...".to_string(),
-                Some("This first pass shows the ChatGPT marketplace only.".to_string()),
-            )),
-            items: vec![SelectionItem {
-                name: "Loading plugins...".to_string(),
-                description: Some("This updates when the marketplace list is ready.".to_string()),
-                is_disabled: true,
-                ..Default::default()
-            }],
-            ..Default::default()
-        }
-    }
-
-    fn plugin_detail_loading_popup_params(&self, plugin_display_name: &str) -> SelectionViewParams {
-        SelectionViewParams {
-            view_id: Some(PLUGINS_SELECTION_VIEW_ID),
-            header: Box::new(DelayedLoadingHeader::new(
-                self.frame_requester.clone(),
-                self.config.animations,
-                format!("Loading details for {plugin_display_name}..."),
-                /*note*/ None,
-            )),
-            items: vec![SelectionItem {
-                name: "Loading plugin details...".to_string(),
-                description: Some("This updates when plugin details load.".to_string()),
-                is_disabled: true,
-                ..Default::default()
-            }],
-            ..Default::default()
-        }
-    }
-
-    fn plugin_install_loading_popup_params(
-        &self,
-        plugin_display_name: &str,
-    ) -> SelectionViewParams {
-        let mut header = ColumnRenderable::new();
-        header.push(Line::from("Plugins".bold()));
-        header.push(Line::from(
-            format!("Installing {plugin_display_name}...").dim(),
-        ));
-
-        SelectionViewParams {
-            view_id: Some(PLUGINS_SELECTION_VIEW_ID),
-            header: Box::new(header),
-            items: vec![SelectionItem {
-                name: "Installing plugin...".to_string(),
-                description: Some("This updates when plugin installation completes.".to_string()),
-                is_disabled: true,
-                ..Default::default()
-            }],
-            ..Default::default()
-        }
-    }
-
-    fn plugin_uninstall_loading_popup_params(
-        &self,
-        plugin_display_name: &str,
-    ) -> SelectionViewParams {
-        let mut header = ColumnRenderable::new();
-        header.push(Line::from("Plugins".bold()));
-        header.push(Line::from(
-            format!("Uninstalling {plugin_display_name}...").dim(),
-        ));
-
-        SelectionViewParams {
-            view_id: Some(PLUGINS_SELECTION_VIEW_ID),
-            header: Box::new(header),
-            items: vec![SelectionItem {
-                name: "Uninstalling plugin...".to_string(),
-                description: Some("This updates when the plugin removal completes.".to_string()),
-                is_disabled: true,
-                ..Default::default()
-            }],
-            ..Default::default()
-        }
-    }
-
-    fn plugins_error_popup_params(&self, err: &str) -> SelectionViewParams {
-        let mut header = ColumnRenderable::new();
-        header.push(Line::from("Plugins".bold()));
-        header.push(Line::from("Failed to load plugins.".dim()));
-
-        SelectionViewParams {
-            view_id: Some(PLUGINS_SELECTION_VIEW_ID),
-            header: Box::new(header),
-            items: vec![SelectionItem {
-                name: "Plugin marketplace unavailable".to_string(),
-                description: Some(err.to_string()),
-                is_disabled: true,
-                ..Default::default()
-            }],
-            ..Default::default()
-        }
-    }
-
-    fn plugin_detail_error_popup_params(
-        &self,
-        err: &str,
-        plugins_response: Option<&PluginListResponse>,
-    ) -> SelectionViewParams {
-        let mut header = ColumnRenderable::new();
-        header.push(Line::from("Plugins".bold()));
-        header.push(Line::from("Failed to load plugin details.".dim()));
-
-        let mut items = vec![SelectionItem {
-            name: "Plugin detail unavailable".to_string(),
-            description: Some(err.to_string()),
-            is_disabled: true,
-            ..Default::default()
-        }];
-        if let Some(plugins_response) = plugins_response.cloned() {
-            let cwd = self.config.cwd.to_path_buf();
-            items.push(SelectionItem {
-                name: "Back to plugins".to_string(),
-                description: Some("Return to the plugin list.".to_string()),
-                selected_description: Some("Return to the plugin list.".to_string()),
-                actions: vec![Box::new(move |tx| {
-                    tx.send(AppEvent::PluginsLoaded {
-                        cwd: cwd.clone(),
-                        result: Ok(plugins_response.clone()),
-                    });
-                })],
-                ..Default::default()
-            });
-        }
-
-        SelectionViewParams {
-            view_id: Some(PLUGINS_SELECTION_VIEW_ID),
-            header: Box::new(header),
-            footer_hint: Some(plugins_popup_hint_line()),
-            items,
-            ..Default::default()
-        }
-    }
-
-    fn plugins_popup_params(&self, response: &PluginListResponse) -> SelectionViewParams {
-        let marketplaces: Vec<&PluginMarketplaceEntry> = response.marketplaces.iter().collect();
-
-        let total: usize = marketplaces
-            .iter()
-            .map(|marketplace| marketplace.plugins.len())
-            .sum();
-        let installed = marketplaces
-            .iter()
-            .flat_map(|marketplace| marketplace.plugins.iter())
-            .filter(|plugin| plugin.installed)
-            .count();
-
-        let mut header = ColumnRenderable::new();
-        header.push(Line::from("Plugins".bold()));
-        header.push(Line::from(
-            "Browse plugins from available marketplaces.".dim(),
-        ));
-        header.push(Line::from(
-            format!("Installed {installed} of {total} available plugins.").dim(),
-        ));
-        if let Some(remote_sync_error) = response.remote_sync_error.as_deref() {
-            header.push(Line::from(
-                format!("Using cached marketplace data: {remote_sync_error}").dim(),
-            ));
-        }
-
-        let mut plugin_entries: Vec<(&PluginMarketplaceEntry, &PluginSummary, String)> =
-            marketplaces
-                .iter()
-                .flat_map(|marketplace| {
-                    marketplace
-                        .plugins
-                        .iter()
-                        .map(move |plugin| (*marketplace, plugin, plugin_display_name(plugin)))
-                })
-                .collect();
-        plugin_entries.sort_by(|left, right| {
-            right
-                .1
-                .installed
-                .cmp(&left.1.installed)
-                .then_with(|| {
-                    left.2
-                        .to_ascii_lowercase()
-                        .cmp(&right.2.to_ascii_lowercase())
-                })
-                .then_with(|| left.2.cmp(&right.2))
-                .then_with(|| left.1.name.cmp(&right.1.name))
-                .then_with(|| left.1.id.cmp(&right.1.id))
-        });
-        let status_label_width = plugin_entries
-            .iter()
-            .map(|(_, plugin, _)| plugin_status_label(plugin).chars().count())
-            .max()
-            .unwrap_or(0);
-
-        let mut items: Vec<SelectionItem> = Vec::new();
-        for (marketplace, plugin, display_name) in plugin_entries {
-            let marketplace_label = marketplace_display_name(marketplace);
-            let status_label = plugin_status_label(plugin);
-            let description =
-                plugin_brief_description(plugin, &marketplace_label, status_label_width);
-            let selected_status_label = format!("{status_label:<status_label_width$}");
-            let selected_description =
-                format!("{selected_status_label}   Press Enter to view plugin details.");
-            let search_value = format!(
-                "{display_name} {} {} {}",
-                plugin.id, plugin.name, marketplace_label
-            );
-            let cwd = self.config.cwd.to_path_buf();
-            let plugin_display_name = display_name.clone();
-            let marketplace_path = marketplace.path.clone();
-            let plugin_name = plugin.name.clone();
-
-            items.push(SelectionItem {
-                name: display_name,
-                description: Some(description),
-                selected_description: Some(selected_description),
-                search_value: Some(search_value),
-                actions: vec![Box::new(move |tx| {
-                    tx.send(AppEvent::OpenPluginDetailLoading {
-                        plugin_display_name: plugin_display_name.clone(),
-                    });
-                    tx.send(AppEvent::FetchPluginDetail {
-                        cwd: cwd.clone(),
-                        params: codex_app_server_protocol::PluginReadParams {
-                            marketplace_path: marketplace_path.clone(),
-                            plugin_name: plugin_name.clone(),
-                        },
-                    });
-                })],
-                ..Default::default()
-            });
-        }
-
-        if items.is_empty() {
-            items.push(SelectionItem {
-                name: "No marketplace plugins available".to_string(),
-                description: Some(
-                    "No plugins are available in the discovered marketplaces.".to_string(),
-                ),
-                is_disabled: true,
-                ..Default::default()
-            });
-        }
-
-        SelectionViewParams {
-            view_id: Some(PLUGINS_SELECTION_VIEW_ID),
-            header: Box::new(header),
-            footer_hint: Some(plugins_popup_hint_line()),
-            items,
-            is_searchable: true,
-            search_placeholder: Some("Type to search plugins".to_string()),
-            col_width_mode: ColumnWidthMode::AutoAllRows,
-            ..Default::default()
-        }
-    }
-
-    fn plugin_detail_popup_params(
-        &self,
-        plugins_response: &PluginListResponse,
-        plugin: &PluginDetail,
-    ) -> SelectionViewParams {
-        let marketplace_label = plugin.marketplace_name.clone();
-        let display_name = plugin_display_name(&plugin.summary);
-        let detail_status_label = if plugin.summary.installed {
-            if plugin.summary.enabled {
-                "Installed"
-            } else {
-                "Installed · Disabled"
-            }
-        } else {
-            match plugin.summary.install_policy {
-                PluginInstallPolicy::NotAvailable => "Not installable",
-                PluginInstallPolicy::Available => "Can be installed",
-                PluginInstallPolicy::InstalledByDefault => "Available by default",
-            }
-        };
-        let mut header = ColumnRenderable::new();
-        header.push(Line::from("Plugins".bold()));
-        header.push(Line::from(
-            format!("{display_name} · {detail_status_label} · {marketplace_label}").bold(),
-        ));
-        if !plugin.summary.installed {
-            header.push(PluginDisclosureLine {
-                line: Line::from(vec![
-                    "Data shared with this app is subject to the app's ".into(),
-                    "terms of service".bold(),
-                    " and ".into(),
-                    "privacy policy".bold(),
-                    ". ".into(),
-                    "Learn more".cyan().underlined(),
-                    ".".into(),
-                ]),
-            });
-        }
-        if let Some(description) = plugin_detail_description(plugin) {
-            header.push(Line::from(description.dim()));
-        }
-
-        let cwd = self.config.cwd.to_path_buf();
-        let plugins_response = plugins_response.clone();
-        let mut items = vec![SelectionItem {
-            name: "Back to plugins".to_string(),
-            description: Some("Return to the plugin list.".to_string()),
-            selected_description: Some("Return to the plugin list.".to_string()),
-            actions: vec![Box::new(move |tx| {
-                tx.send(AppEvent::PluginsLoaded {
-                    cwd: cwd.clone(),
-                    result: Ok(plugins_response.clone()),
-                });
-            })],
-            ..Default::default()
-        }];
-
-        if plugin.summary.installed {
-            let uninstall_cwd = self.config.cwd.to_path_buf();
-            let plugin_id = plugin.summary.id.clone();
-            let plugin_display_name = display_name;
-            items.push(SelectionItem {
-                name: "Uninstall plugin".to_string(),
-                description: Some("Remove this plugin now.".to_string()),
-                selected_description: Some("Remove this plugin now.".to_string()),
-                actions: vec![Box::new(move |tx| {
-                    tx.send(AppEvent::OpenPluginUninstallLoading {
-                        plugin_display_name: plugin_display_name.clone(),
-                    });
-                    tx.send(AppEvent::FetchPluginUninstall {
-                        cwd: uninstall_cwd.clone(),
-                        plugin_id: plugin_id.clone(),
-                        plugin_display_name: plugin_display_name.clone(),
-                    });
-                })],
-                ..Default::default()
-            });
-        } else if plugin.summary.install_policy == PluginInstallPolicy::NotAvailable {
-            items.push(SelectionItem {
-                name: "Install plugin".to_string(),
-                description: Some(
-                    "This plugin is not installable from this marketplace.".to_string(),
-                ),
-                is_disabled: true,
-                ..Default::default()
-            });
-        } else {
-            let install_cwd = self.config.cwd.to_path_buf();
-            let marketplace_path = plugin.marketplace_path.clone();
-            let plugin_name = plugin.summary.name.clone();
-            let plugin_display_name = display_name;
-            items.push(SelectionItem {
-                name: "Install plugin".to_string(),
-                description: Some("Install this plugin now.".to_string()),
-                selected_description: Some("Install this plugin now.".to_string()),
-                actions: vec![Box::new(move |tx| {
-                    tx.send(AppEvent::OpenPluginInstallLoading {
-                        plugin_display_name: plugin_display_name.clone(),
-                    });
-                    tx.send(AppEvent::FetchPluginInstall {
-                        cwd: install_cwd.clone(),
-                        marketplace_path: marketplace_path.clone(),
-                        plugin_name: plugin_name.clone(),
-                        plugin_display_name: plugin_display_name.clone(),
-                    });
-                })],
-                ..Default::default()
-            });
-        }
-
-        items.push(SelectionItem {
-            name: "Skills".to_string(),
-            description: Some(plugin_skill_summary(plugin)),
-            is_disabled: true,
-            ..Default::default()
-        });
-        items.push(SelectionItem {
-            name: "Apps".to_string(),
-            description: Some(plugin_app_summary(plugin)),
-            is_disabled: true,
-            ..Default::default()
-        });
-        items.push(SelectionItem {
-            name: "MCP Servers".to_string(),
-            description: Some(plugin_mcp_summary(plugin)),
-            is_disabled: true,
-            ..Default::default()
-        });
-
-        SelectionViewParams {
-            view_id: Some(PLUGINS_SELECTION_VIEW_ID),
-            header: Box::new(header),
-            footer_hint: Some(plugins_popup_hint_line()),
-            items,
-            col_width_mode: ColumnWidthMode::AutoAllRows,
-            ..Default::default()
-        }
-    }
-}
-
-fn plugins_popup_hint_line() -> Line<'static> {
-    Line::from("Press esc to close.")
-}
-
-fn marketplace_display_name(marketplace: &PluginMarketplaceEntry) -> String {
-    marketplace
-        .interface
-        .as_ref()
-        .and_then(|interface| interface.display_name.as_deref())
-        .map(str::trim)
-        .filter(|display_name| !display_name.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| marketplace.name.clone())
-}
-
-fn plugin_display_name(plugin: &PluginSummary) -> String {
-    plugin
-        .interface
-        .as_ref()
-        .and_then(|interface| interface.display_name.as_deref())
-        .map(str::trim)
-        .filter(|display_name| !display_name.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| plugin.name.clone())
-}
-
-fn plugin_brief_description(
-    plugin: &PluginSummary,
-    marketplace_label: &str,
-    status_label_width: usize,
-) -> String {
-    let status_label = plugin_status_label(plugin);
-    let status_label = format!("{status_label:<status_label_width$}");
-    match plugin_description(plugin) {
-        Some(description) => format!("{status_label} · {marketplace_label} · {description}"),
-        None => format!("{status_label} · {marketplace_label}"),
-    }
-}
-
-fn plugin_status_label(plugin: &PluginSummary) -> &'static str {
-    if plugin.installed {
-        if plugin.enabled {
-            "Installed"
-        } else {
-            "Installed · Disabled"
-        }
-    } else {
-        match plugin.install_policy {
-            PluginInstallPolicy::NotAvailable => "Not installable",
-            PluginInstallPolicy::Available => "Available",
-            PluginInstallPolicy::InstalledByDefault => "Available by default",
-        }
-    }
-}
-
-fn plugin_description(plugin: &PluginSummary) -> Option<String> {
-    plugin
-        .interface
-        .as_ref()
-        .and_then(|interface| {
-            interface
-                .short_description
-                .as_deref()
-                .or(interface.long_description.as_deref())
-        })
-        .map(str::trim)
-        .filter(|description| !description.is_empty())
-        .map(str::to_string)
-}
-
-fn plugin_detail_description(plugin: &PluginDetail) -> Option<String> {
-    plugin
-        .description
-        .as_deref()
-        .or_else(|| {
-            plugin
-                .summary
-                .interface
-                .as_ref()
-                .and_then(|interface| interface.long_description.as_deref())
-        })
-        .or_else(|| {
-            plugin
-                .summary
-                .interface
-                .as_ref()
-                .and_then(|interface| interface.short_description.as_deref())
-        })
-        .map(str::trim)
-        .filter(|description| !description.is_empty())
-        .map(str::to_string)
-}
-
-fn plugin_skill_summary(plugin: &PluginDetail) -> String {
-    if plugin.skills.is_empty() {
-        "No plugin skills.".to_string()
-    } else {
-        plugin
-            .skills
-            .iter()
-            .map(|skill| skill.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-}
-
-fn plugin_app_summary(plugin: &PluginDetail) -> String {
-    if plugin.apps.is_empty() {
-        "No plugin apps.".to_string()
-    } else {
-        plugin
-            .apps
-            .iter()
-            .map(|app| app.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-}
-
-fn plugin_mcp_summary(plugin: &PluginDetail) -> String {
-    if plugin.mcp_servers.is_empty() {
-        "No plugin MCP servers.".to_string()
-    } else {
-        plugin.mcp_servers.join(", ")
     }
 }

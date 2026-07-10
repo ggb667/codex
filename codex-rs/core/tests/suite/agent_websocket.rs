@@ -1,6 +1,10 @@
 use anyhow::Result;
 use codex_features::Feature;
 use codex_protocol::config_types::ServiceTier;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ThreadSettingsOverrides;
+use codex_protocol::user_input::UserInput;
 use core_test_support::responses::WebSocketConnectionConfig;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -10,11 +14,88 @@ use core_test_support::responses::start_websocket_server;
 use core_test_support::responses::start_websocket_server_with_headers;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
+use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use std::time::Duration;
 
 const WS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_model_switch_to_responses_lite_omits_top_level_tools() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_websocket_server(vec![vec![
+        vec![ev_response_created("warm-1"), ev_completed("warm-1")],
+        vec![ev_response_created("resp-1"), ev_completed("resp-1")],
+        vec![ev_response_created("resp-2"), ev_completed("resp-2")],
+    ]])
+    .await;
+
+    let mut builder = test_codex()
+        .with_model_info_override("gpt-5.4", |model_info| {
+            model_info.use_responses_lite = true;
+        })
+        .with_model("gpt-5.2");
+    let test = builder.build_with_websocket_server(&server).await?;
+
+    test.submit_turn("non-lite turn").await?;
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "lite turn".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: ThreadSettingsOverrides {
+                model: Some("gpt-5.4".to_string()),
+                ..Default::default()
+            },
+        })
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    assert_eq!(server.handshakes().len(), 1);
+    let connection = server.single_connection();
+    assert_eq!(connection.len(), 3);
+    let non_lite_turn = connection
+        .get(1)
+        .expect("missing non-lite turn request")
+        .body_json();
+    let lite_turn = connection
+        .get(2)
+        .expect("missing lite turn request")
+        .body_json();
+
+    assert_eq!(non_lite_turn["model"].as_str(), Some("gpt-5.2"));
+    assert_eq!(lite_turn["model"].as_str(), Some("gpt-5.4"));
+    assert!(
+        non_lite_turn
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty())
+    );
+    assert_eq!(lite_turn.get("previous_response_id"), None);
+    assert_eq!(lite_turn.get("tools"), None);
+    assert_eq!(lite_turn.get("instructions"), None);
+    let additional_tools = lite_turn
+        .get("input")
+        .and_then(Value::as_array)
+        .and_then(|input| input.first())
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("additional_tools"))
+        .and_then(|item| item.get("tools"))
+        .and_then(Value::as_array)
+        .expect("lite turn should start with an additional_tools item");
+    assert!(!additional_tools.is_empty());
+
+    server.shutdown().await;
+    Ok(())
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_test_codex_shell_chain() -> Result<()> {
@@ -38,11 +119,8 @@ async fn websocket_test_codex_shell_chain() -> Result<()> {
     let mut builder = test_codex().with_windows_cmd_shell();
 
     let test = builder.build_with_websocket_server(&server).await?;
-    test.submit_turn_with_policy(
-        "run the echo command",
-        test.config.permissions.sandbox_policy.get().clone(),
-    )
-    .await?;
+    test.submit_turn_with_policy("run the echo command", test.config.legacy_sandbox_policy())
+        .await?;
 
     let connection = server.single_connection();
     assert_eq!(connection.len(), 2);
@@ -85,11 +163,8 @@ async fn websocket_first_turn_uses_startup_prewarm_and_create() -> Result<()> {
 
     let mut builder = test_codex();
     let test = builder.build_with_websocket_server(&server).await?;
-    test.submit_turn_with_policy(
-        "hello",
-        test.config.permissions.sandbox_policy.get().clone(),
-    )
-    .await?;
+    test.submit_turn_with_policy("hello", test.config.legacy_sandbox_policy())
+        .await?;
 
     assert_eq!(server.handshakes().len(), 1);
     let connection = server.single_connection();
@@ -101,6 +176,16 @@ async fn websocket_first_turn_uses_startup_prewarm_and_create() -> Result<()> {
     let turn = connection.get(1).expect("missing turn request").body_json();
     assert_eq!(warmup["type"].as_str(), Some("response.create"));
     assert_eq!(warmup["generate"].as_bool(), Some(false));
+    let warmup_metadata: Value = serde_json::from_str(
+        warmup["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .expect("warmup turn metadata"),
+    )?;
+    assert_eq!(warmup_metadata["request_kind"].as_str(), Some("prewarm"));
+    assert_eq!(
+        warmup_metadata["window_id"].as_str(),
+        warmup["client_metadata"]["x-codex-window-id"].as_str()
+    );
     assert!(
         turn["tools"]
             .as_array()
@@ -108,6 +193,12 @@ async fn websocket_first_turn_uses_startup_prewarm_and_create() -> Result<()> {
         "expected request tools to be populated"
     );
     assert_eq!(turn["type"].as_str(), Some("response.create"));
+    let turn_metadata: Value = serde_json::from_str(
+        turn["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .expect("turn metadata"),
+    )?;
+    assert_eq!(turn_metadata["request_kind"].as_str(), Some("turn"));
 
     server.shutdown().await;
     Ok(())
@@ -135,11 +226,8 @@ async fn websocket_first_turn_handles_handshake_delay_with_startup_prewarm() -> 
 
     let mut builder = test_codex();
     let test = builder.build_with_websocket_server(&server).await?;
-    test.submit_turn_with_policy(
-        "hello",
-        test.config.permissions.sandbox_policy.get().clone(),
-    )
-    .await?;
+    test.submit_turn_with_policy("hello", test.config.legacy_sandbox_policy())
+        .await?;
 
     assert_eq!(server.handshakes().len(), 1);
     let connection = server.single_connection();
@@ -168,11 +256,14 @@ async fn websocket_v2_test_codex_shell_chain() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let call_id = "shell-command-call";
+    let mut shell_command_call = ev_shell_command_call(call_id, "echo websocket");
+    shell_command_call["item"]["internal_chat_message_metadata_passthrough"] =
+        serde_json::json!({"turn_id": "turn-123"});
     let server = start_websocket_server(vec![vec![
         vec![ev_response_created("warm-1"), ev_completed("warm-1")],
         vec![
             ev_response_created("resp-1"),
-            ev_shell_command_call(call_id, "echo websocket"),
+            shell_command_call,
             ev_completed("resp-1"),
         ],
         vec![
@@ -191,11 +282,8 @@ async fn websocket_v2_test_codex_shell_chain() -> Result<()> {
     });
 
     let test = builder.build_with_websocket_server(&server).await?;
-    test.submit_turn_with_policy(
-        "run the echo command",
-        test.config.permissions.sandbox_policy.get().clone(),
-    )
-    .await?;
+    test.submit_turn_with_policy("run the echo command", test.config.legacy_sandbox_policy())
+        .await?;
 
     let connection = server.single_connection();
     assert_eq!(connection.len(), 3);
@@ -281,7 +369,7 @@ async fn websocket_v2_first_turn_uses_updated_fast_tier_after_startup_prewarm() 
     assert_eq!(warmup["generate"].as_bool(), Some(false));
     assert_eq!(warmup.get("service_tier"), None);
 
-    test.submit_turn_with_service_tier("hello", Some(ServiceTier::Fast))
+    test.submit_turn_with_service_tier("hello", Some(ServiceTier::Fast.request_value()))
         .await?;
 
     assert_eq!(server.handshakes().len(), 1);
@@ -325,7 +413,7 @@ async fn websocket_v2_first_turn_drops_fast_tier_after_startup_prewarm() -> Resu
             .features
             .enable(Feature::ResponsesWebsocketsV2)
             .expect("test config should allow feature update");
-        config.service_tier = Some(ServiceTier::Fast);
+        config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
     });
     let test = builder.build_with_websocket_server(&server).await?;
 
@@ -397,7 +485,7 @@ async fn websocket_v2_next_turn_uses_updated_service_tier() -> Result<()> {
     assert_eq!(warmup["generate"].as_bool(), Some(false));
     assert_eq!(warmup.get("service_tier"), None);
 
-    test.submit_turn_with_service_tier("first", Some(ServiceTier::Fast))
+    test.submit_turn_with_service_tier("first", Some(ServiceTier::Fast.request_value()))
         .await?;
     test.submit_turn_with_service_tier("second", /*service_tier*/ None)
         .await?;

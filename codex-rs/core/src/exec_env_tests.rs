@@ -1,5 +1,5 @@
 use super::*;
-use codex_config::types::ShellEnvironmentPolicyInherit;
+use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
 use maplit::hashmap;
 use pretty_assertions::assert_eq;
 
@@ -8,6 +8,59 @@ fn make_vars(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect()
+}
+
+#[test]
+fn inject_permission_profile_env_overrides_policy_value() {
+    let mut env = HashMap::from([(
+        CODEX_PERMISSION_PROFILE_ENV_VAR.to_string(),
+        "stale-profile".to_string(),
+    )]);
+
+    inject_permission_profile_env(
+        &mut env,
+        Some(&ActivePermissionProfile::new("current-profile")),
+    );
+
+    assert_eq!(
+        env.get(CODEX_PERMISSION_PROFILE_ENV_VAR)
+            .map(String::as_str),
+        Some("current-profile")
+    );
+}
+
+#[test]
+fn inject_permission_profile_env_removes_stale_value_without_active_profile() {
+    let mut env = HashMap::from([(
+        CODEX_PERMISSION_PROFILE_ENV_VAR.to_string(),
+        "stale-profile".to_string(),
+    )]);
+
+    inject_permission_profile_env(&mut env, /*active_permission_profile*/ None);
+
+    assert_eq!(env.get(CODEX_PERMISSION_PROFILE_ENV_VAR), None);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn inject_permission_profile_env_replaces_differently_cased_windows_key() {
+    let mut env = HashMap::from([(
+        "codex_permission_profile".to_string(),
+        "stale-profile".to_string(),
+    )]);
+
+    inject_permission_profile_env(
+        &mut env,
+        Some(&ActivePermissionProfile::new("current-profile")),
+    );
+
+    assert_eq!(
+        env,
+        HashMap::from([(
+            CODEX_PERMISSION_PROFILE_ENV_VAR.to_string(),
+            "current-profile".to_string(),
+        )])
+    );
 }
 
 #[test]

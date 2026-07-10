@@ -1,48 +1,70 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use codex_exec_server::EnvironmentManager;
-use codex_features::Feature;
+use codex_exec_server::ExecServerRuntimePaths;
+use codex_extension_api::UserInstructionsProvider;
 use codex_login::AuthManager;
-use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
+use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
-use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::user_input::UserInput;
 use tokio_util::sync::CancellationToken;
 
-use crate::codex::Session;
-use crate::codex::build_prompt;
-use crate::codex::built_tools;
 use crate::config::Config;
+use crate::resolve_installation_id;
+use crate::session::session::Session;
+use crate::session::turn::build_prompt;
+use crate::session::turn::built_tools;
+use crate::state_db_bridge::StateDbHandle;
 use crate::thread_manager::ThreadManager;
+use crate::thread_manager::thread_store_from_config;
+use codex_extension_api::empty_extension_registry;
 
 /// Build the model-visible `input` list for a single debug turn.
 #[doc(hidden)]
 pub async fn build_prompt_input(
     mut config: Config,
     input: Vec<UserInput>,
+    state_db: Option<StateDbHandle>,
+    user_instructions_provider: Arc<dyn UserInstructionsProvider>,
 ) -> CodexResult<Vec<ResponseItem>> {
     config.ephemeral = true;
 
     let auth_manager =
-        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false);
+        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
 
+    let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
+        config.codex_self_exe.clone(),
+        config.codex_linux_sandbox_exe.clone(),
+    )?;
+
+    let thread_store = thread_store_from_config(&config, state_db.clone());
+    let installation_id = resolve_installation_id(&config.codex_home).await?;
     let thread_manager = ThreadManager::new(
         &config,
         Arc::clone(&auth_manager),
         SessionSource::Exec,
-        CollaborationModesConfig {
-            default_mode_request_user_input: config
-                .features
-                .enabled(Feature::DefaultModeRequestUserInput),
-        },
-        Arc::new(EnvironmentManager::from_env()),
+        Arc::new(
+            EnvironmentManager::from_codex_home(
+                config.codex_home.clone(),
+                Some(local_runtime_paths),
+            )
+            .await
+            .map_err(|err| CodexErr::Fatal(err.to_string()))?,
+        ),
+        empty_extension_registry(),
+        user_instructions_provider,
+        /*analytics_events_client*/ None,
+        thread_store,
+        crate::local_agent_graph_store_from_state_db(state_db.as_ref()),
+        installation_id,
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
     );
     let thread = thread_manager.start_thread(config).await?;
 
-    let output = build_prompt_input_from_session(thread.thread.codex.session.as_ref(), input).await;
+    let output = build_prompt_input_from_session(&thread.thread.codex.session, input).await;
     let shutdown = thread.thread.shutdown_and_wait().await;
     let _removed = thread_manager.remove_thread(&thread.thread_id).await;
 
@@ -51,16 +73,17 @@ pub async fn build_prompt_input(
 }
 
 pub(crate) async fn build_prompt_input_from_session(
-    sess: &Session,
+    sess: &Arc<Session>,
     input: Vec<UserInput>,
 ) -> CodexResult<Vec<ResponseItem>> {
     let turn_context = sess.new_default_turn().await;
-    sess.record_context_updates_and_set_reference_context_item(turn_context.as_ref())
+    // Prompt debugging builds a standalone request without entering run_turn.
+    let step_context = sess.capture_step_context(Arc::clone(&turn_context)).await;
+    sess.record_context_updates_and_set_reference_context_item(step_context.as_ref())
         .await;
 
     if !input.is_empty() {
-        let input_item = ResponseInputItem::from(input);
-        let response_item = ResponseItem::from(input_item);
+        let response_item = sess.response_item_from_user_input(input);
         sess.record_conversation_items(turn_context.as_ref(), std::slice::from_ref(&response_item))
             .await;
     }
@@ -69,15 +92,7 @@ pub(crate) async fn build_prompt_input_from_session(
         .clone_history()
         .await
         .for_prompt(&turn_context.model_info.input_modalities);
-    let router = built_tools(
-        sess,
-        turn_context.as_ref(),
-        &prompt_input,
-        &HashSet::new(),
-        Some(turn_context.turn_skills.outcome.as_ref()),
-        &CancellationToken::new(),
-    )
-    .await?;
+    let router = built_tools(sess, step_context.as_ref(), &CancellationToken::new()).await?;
     let base_instructions = sess.get_base_instructions().await;
     let prompt = build_prompt(
         prompt_input,
@@ -86,63 +101,5 @@ pub(crate) async fn build_prompt_input_from_session(
         base_instructions,
     );
 
-    Ok(prompt.get_formatted_input())
-}
-
-#[cfg(test)]
-mod tests {
-    use codex_protocol::models::ContentItem;
-    use codex_protocol::models::ResponseItem;
-    use codex_protocol::user_input::UserInput;
-    use codex_utils_absolute_path::AbsolutePathBuf;
-    use pretty_assertions::assert_eq;
-
-    use crate::config::test_config;
-
-    use super::build_prompt_input;
-
-    #[tokio::test]
-    async fn build_prompt_input_includes_context_and_user_message() {
-        let codex_home = tempfile::tempdir().expect("create codex home");
-        let cwd = tempfile::tempdir().expect("create cwd");
-        let mut config = test_config();
-        config.codex_home = codex_home.path().to_path_buf();
-        config.cwd = AbsolutePathBuf::try_from(cwd.path().to_path_buf()).expect("absolute cwd");
-        config.user_instructions = Some("Project-specific test instructions".to_string());
-
-        let input = build_prompt_input(
-            config,
-            vec![UserInput::Text {
-                text: "hello from debug prompt".to_string(),
-                text_elements: Vec::new(),
-            }],
-        )
-        .await
-        .expect("build prompt input");
-
-        let expected_user_message = ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "hello from debug prompt".to_string(),
-            }],
-            end_turn: None,
-            phase: None,
-        };
-        assert_eq!(input.last(), Some(&expected_user_message));
-        assert!(input.iter().any(|item| {
-            let ResponseItem::Message { content, .. } = item else {
-                return false;
-            };
-
-            content.iter().any(|content_item| {
-                let (ContentItem::InputText { text } | ContentItem::OutputText { text }) =
-                    content_item
-                else {
-                    return false;
-                };
-                text.contains("Project-specific test instructions")
-            })
-        }));
-    }
+    Ok(prompt.input)
 }

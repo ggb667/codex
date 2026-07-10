@@ -1,6 +1,5 @@
 exports_files([
     "clippy.toml",
-    "node-version.txt",
 ])
 
 filegroup(
@@ -14,5 +13,14 @@ filegroup(
             "BUILD.bazel",
         ],
     ),
+    visibility = ["//visibility:public"],
+)
+
+test_suite(
+    name = "e2e-benchmarks",
+    tags = ["manual"],
+    tests = [
+        "//codex-rs/cli:codex-help-bench",
+    ],
     visibility = ["//visibility:public"],
 )

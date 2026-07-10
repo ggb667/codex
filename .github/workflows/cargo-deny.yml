@@ -1,36 +1,32 @@
 name: cargo-deny
 
 on:
-  pull_request:
-  push:
-    branches:
-      - main
+  workflow_call:
 
 jobs:
   cargo-deny:
-    if: github.repository == 'openai/codex'
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: ./codex-rs
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-ci
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
 
       - name: Run cargo-deny
         uses: EmbarkStudios/cargo-deny-action@82eb9f621fbc699dd0918f3ea06864c14cc84246 # v2
         with:
-          rust-version: stable
+          rust-version: 1.95.0
           manifest-path: ./codex-rs/Cargo.toml
 
-  cargo-deny-fork-note:
-    if: github.repository != 'openai/codex'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Skip upstream security gate on forks
-        run: |
-          echo 'Skipping upstream cargo-deny gate on forked repositories.'
-          echo 'The current failures are upstream dependency advisories, not fork regressions.'
+      - name: Check for a clean worktree
+        if: always() && !cancelled()
+        uses: ./.github/actions/check-clean-worktree

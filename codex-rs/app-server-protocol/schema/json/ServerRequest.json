@@ -7,9 +7,27 @@
     },
     "AdditionalFileSystemPermissions": {
       "properties": {
-        "read": {
+        "entries": {
           "items": {
-            "$ref": "#/definitions/AbsolutePathBuf"
+            "$ref": "#/definitions/FileSystemSandboxEntry"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "globScanMaxDepth": {
+          "format": "uint",
+          "minimum": 1.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "read": {
+          "description": "This will be removed in favor of `entries`.",
+          "items": {
+            "$ref": "#/definitions/LegacyAppPathString"
           },
           "type": [
             "array",
@@ -17,8 +35,9 @@
           ]
         },
         "write": {
+          "description": "This will be removed in favor of `entries`.",
           "items": {
-            "$ref": "#/definitions/AbsolutePathBuf"
+            "$ref": "#/definitions/LegacyAppPathString"
           },
           "type": [
             "array",
@@ -59,7 +78,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Partial overlay used for per-command permission requests."
         }
       },
       "type": "object"
@@ -99,6 +119,9 @@
         "conversationId",
         "fileChanges"
       ],
+      "type": "object"
+    },
+    "AttestationGenerateParams": {
       "type": "object"
     },
     "ChatgptAuthTokensRefreshParams": {
@@ -141,7 +164,7 @@
               "type": "string"
             },
             "path": {
-              "type": "string"
+              "$ref": "#/definitions/AbsolutePathBuf"
             },
             "type": {
               "enum": [
@@ -346,7 +369,19 @@
           ]
         },
         "cwd": {
-          "description": "The command's working directory.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LegacyAppPathString"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The command's working directory."
+        },
+        "environmentId": {
+          "default": null,
+          "description": "Environment in which the command will run.",
           "type": [
             "string",
             "null"
@@ -393,6 +428,11 @@
             "null"
           ]
         },
+        "startedAtMs": {
+          "description": "Unix timestamp (in milliseconds) when this approval request started.",
+          "format": "int64",
+          "type": "integer"
+        },
         "threadId": {
           "type": "string"
         },
@@ -402,6 +442,7 @@
       },
       "required": [
         "itemId",
+        "startedAtMs",
         "threadId",
         "turnId"
       ],
@@ -412,6 +453,12 @@
         "arguments": true,
         "callId": {
           "type": "string"
+        },
+        "namespace": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "threadId": {
           "type": "string"
@@ -568,6 +615,11 @@
             "null"
           ]
         },
+        "startedAtMs": {
+          "description": "Unix timestamp (in milliseconds) when this approval request started.",
+          "format": "int64",
+          "type": "integer"
+        },
         "threadId": {
           "type": "string"
         },
@@ -577,10 +629,210 @@
       },
       "required": [
         "itemId",
+        "startedAtMs",
         "threadId",
         "turnId"
       ],
       "type": "object"
+    },
+    "FileSystemAccessMode": {
+      "enum": [
+        "read",
+        "write",
+        "deny"
+      ],
+      "type": "string"
+    },
+    "FileSystemPath": {
+      "oneOf": [
+        {
+          "properties": {
+            "path": {
+              "$ref": "#/definitions/LegacyAppPathString"
+            },
+            "type": {
+              "enum": [
+                "path"
+              ],
+              "title": "PathFileSystemPathType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "type"
+          ],
+          "title": "PathFileSystemPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "pattern": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "glob_pattern"
+              ],
+              "title": "GlobPatternFileSystemPathType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "pattern",
+            "type"
+          ],
+          "title": "GlobPatternFileSystemPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "special"
+              ],
+              "title": "SpecialFileSystemPathType",
+              "type": "string"
+            },
+            "value": {
+              "$ref": "#/definitions/FileSystemSpecialPath"
+            }
+          },
+          "required": [
+            "type",
+            "value"
+          ],
+          "title": "SpecialFileSystemPath",
+          "type": "object"
+        }
+      ]
+    },
+    "FileSystemSandboxEntry": {
+      "properties": {
+        "access": {
+          "$ref": "#/definitions/FileSystemAccessMode"
+        },
+        "path": {
+          "$ref": "#/definitions/FileSystemPath"
+        }
+      },
+      "required": [
+        "access",
+        "path"
+      ],
+      "type": "object"
+    },
+    "FileSystemSpecialPath": {
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "root"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "title": "RootFileSystemSpecialPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "minimal"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "title": "MinimalFileSystemSpecialPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "project_roots"
+              ],
+              "type": "string"
+            },
+            "subpath": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "title": "KindFileSystemSpecialPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "tmpdir"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "title": "TmpdirFileSystemSpecialPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "slash_tmp"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "title": "SlashTmpFileSystemSpecialPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "unknown"
+              ],
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "subpath": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "path"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "LegacyAppPathString": {
+      "type": "string"
     },
     "McpElicitationArrayType": {
       "enum": [
@@ -1141,6 +1393,27 @@
         {
           "properties": {
             "_meta": true,
+            "message": {
+              "type": "string"
+            },
+            "mode": {
+              "enum": [
+                "openai/form"
+              ],
+              "type": "string"
+            },
+            "requestedSchema": true
+          },
+          "required": [
+            "message",
+            "mode",
+            "requestedSchema"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "_meta": true,
             "elicitationId": {
               "type": "string"
             },
@@ -1346,6 +1619,16 @@
     },
     "PermissionsRequestApprovalParams": {
       "properties": {
+        "cwd": {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        },
+        "environmentId": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "itemId": {
           "type": "string"
         },
@@ -1358,6 +1641,11 @@
             "null"
           ]
         },
+        "startedAtMs": {
+          "description": "Unix timestamp (in milliseconds) when this approval request started.",
+          "format": "int64",
+          "type": "integer"
+        },
         "threadId": {
           "type": "string"
         },
@@ -1366,8 +1654,10 @@
         }
       },
       "required": [
+        "cwd",
         "itemId",
         "permissions",
+        "startedAtMs",
         "threadId",
         "turnId"
       ],
@@ -1432,6 +1722,15 @@
     "ToolRequestUserInputParams": {
       "description": "EXPERIMENTAL. Params sent with a request_user_input event.",
       "properties": {
+        "autoResolutionMs": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "itemId": {
           "type": "string"
         },
@@ -1668,6 +1967,31 @@
         "params"
       ],
       "title": "Account/chatgptAuthTokens/refreshRequest",
+      "type": "object"
+    },
+    {
+      "description": "Generate a fresh upstream attestation result on demand.",
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "attestation/generate"
+          ],
+          "title": "Attestation/generateRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/AttestationGenerateParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Attestation/generateRequest",
       "type": "object"
     },
     {

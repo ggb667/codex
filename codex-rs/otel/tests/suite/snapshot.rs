@@ -1,10 +1,10 @@
 use crate::harness::attributes_to_map;
 use crate::harness::find_metric;
+use codex_otel::MetricsClient;
+use codex_otel::MetricsConfig;
+use codex_otel::Result;
 use codex_otel::SessionTelemetry;
 use codex_otel::TelemetryAuthMode;
-use codex_otel::metrics::MetricsClient;
-use codex_otel::metrics::MetricsConfig;
-use codex_otel::metrics::Result;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
 use opentelemetry_sdk::metrics::InMemoryMetricExporter;
@@ -59,6 +59,38 @@ fn snapshot_collects_metrics_without_shutdown() -> Result<()> {
         .expect("finished metrics should be readable");
     assert!(finished.is_empty(), "expected no periodic exports yet");
 
+    Ok(())
+}
+
+#[test]
+fn observable_gauge_is_collected_on_every_delta_snapshot() -> Result<()> {
+    let exporter = InMemoryMetricExporter::default();
+    let config = MetricsConfig::in_memory("test", "codex-cli", env!("CARGO_PKG_VERSION"), exporter)
+        .with_runtime_reader();
+    let metrics = MetricsClient::new(config)?;
+    metrics.register_observable_gauge_with_description(
+        "codex.active",
+        "Number of active operations.",
+        || 1,
+        &[("component", "test")],
+    )?;
+
+    for snapshot in [metrics.snapshot()?, metrics.snapshot()?] {
+        let gauge = find_metric(&snapshot, "codex.active").expect("gauge metric missing");
+        let point = match gauge.data() {
+            AggregatedMetrics::I64(MetricData::Gauge(gauge)) => {
+                gauge.data_points().next().expect("gauge point")
+            }
+            _ => panic!("unexpected gauge metric data type"),
+        };
+        assert_eq!(point.value(), 1);
+        assert_eq!(
+            attributes_to_map(point.attributes()),
+            BTreeMap::from([("component".to_string(), "test".to_string())])
+        );
+    }
+
+    metrics.shutdown()?;
     Ok(())
 }
 

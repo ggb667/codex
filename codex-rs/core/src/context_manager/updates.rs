@@ -1,77 +1,103 @@
-use crate::codex::PreviousTurnSettings;
-use crate::codex::TurnContext;
-use crate::environment_context::EnvironmentContext;
-use crate::shell::Shell;
+use crate::context::ApprovalPromptContext;
+use crate::context::CollaborationModeInstructions;
+use crate::context::ContextualUserFragment;
+use crate::context::ModelSwitchInstructions;
+use crate::context::MultiAgentModeInstructions;
+use crate::context::PermissionsInstructions;
+use crate::context::PersonalitySpecInstructions;
+use crate::context::RealtimeEndInstructions;
+use crate::context::RealtimeStartInstructions;
+use crate::context::RealtimeStartWithInstructions;
+use crate::session::PreviousTurnSettings;
+use crate::session::turn_context::TurnContext;
 use codex_execpolicy::Policy;
 use codex_features::Feature;
+use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::config_types::Personality;
 use codex_protocol::models::ContentItem;
-use codex_protocol::models::DeveloperInstructions;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::TurnContextItem;
-
-fn build_environment_update_item(
-    previous: Option<&TurnContextItem>,
-    next: &TurnContext,
-    shell: &Shell,
-) -> Option<ResponseItem> {
-    if !next.config.include_environment_context {
-        return None;
-    }
-
-    let prev = previous?;
-    let prev_context = EnvironmentContext::from_turn_context_item(prev, shell);
-    let next_context = EnvironmentContext::from_turn_context(next, shell);
-    if prev_context.equals_except_shell(&next_context) {
-        return None;
-    }
-
-    Some(ResponseItem::from(
-        EnvironmentContext::diff_from_turn_context_item(prev, next, shell),
-    ))
-}
 
 fn build_permissions_update_item(
     previous: Option<&TurnContextItem>,
     next: &TurnContext,
     exec_policy: &Policy,
-) -> Option<DeveloperInstructions> {
+) -> Option<String> {
     if !next.config.include_permissions_instructions {
         return None;
     }
 
     let prev = previous?;
-    if prev.sandbox_policy == *next.sandbox_policy.get()
+    if prev.permission_profile() == next.permission_profile()
         && prev.approval_policy == next.approval_policy.value()
+        && prev.model == next.model_info.slug
     {
         return None;
     }
 
-    Some(DeveloperInstructions::from_policy(
-        next.sandbox_policy.get(),
-        next.approval_policy.value(),
-        next.config.approvals_reviewer,
-        exec_policy,
-        &next.cwd,
-        next.features.enabled(Feature::ExecPermissionApprovals),
-        next.features.enabled(Feature::RequestPermissionsTool),
-    ))
+    Some(
+        PermissionsInstructions::from_permission_profile(
+            &next.permission_profile,
+            next.approval_policy.value(),
+            ApprovalPromptContext::new(
+                next.config.approvals_reviewer,
+                next.model_info
+                    .model_messages
+                    .as_ref()
+                    .and_then(|messages| messages.approvals.as_ref()),
+            ),
+            exec_policy,
+            #[allow(deprecated)]
+            &next.cwd,
+            next.config
+                .features
+                .enabled(Feature::ExecPermissionApprovals),
+            next.config
+                .features
+                .enabled(Feature::RequestPermissionsTool),
+        )
+        .render(),
+    )
 }
 
 fn build_collaboration_mode_update_item(
     previous: Option<&TurnContextItem>,
     next: &TurnContext,
-) -> Option<DeveloperInstructions> {
+) -> Option<String> {
+    if !next.config.include_collaboration_mode_instructions {
+        return None;
+    }
+
     let prev = previous?;
     if prev.collaboration_mode.as_ref() != Some(&next.collaboration_mode) {
         // If the next mode has empty developer instructions, this returns None and we emit no
         // update, so prior collaboration instructions remain in the prompt history.
-        Some(DeveloperInstructions::from_collaboration_mode(
-            &next.collaboration_mode,
-        )?)
+        Some(
+            CollaborationModeInstructions::from_collaboration_mode(&next.collaboration_mode)?
+                .render(),
+        )
     } else {
         None
+    }
+}
+
+fn build_multi_agent_mode_update_item(
+    previous: Option<&TurnContextItem>,
+    next: &TurnContext,
+) -> Option<String> {
+    let effective_multi_agent_mode = crate::session::multi_agents::effective_multi_agent_mode(next);
+    let previous = previous?;
+    if previous.multi_agent_mode == effective_multi_agent_mode {
+        return None;
+    }
+
+    match effective_multi_agent_mode {
+        Some(multi_agent_mode) => Some(MultiAgentModeInstructions::new(multi_agent_mode).render()),
+        None if previous.multi_agent_mode == Some(MultiAgentMode::Proactive) => {
+            Some(MultiAgentModeInstructions::new(MultiAgentMode::ExplicitRequestOnly).render())
+        }
+        None => None,
     }
 }
 
@@ -79,28 +105,28 @@ pub(crate) fn build_realtime_update_item(
     previous: Option<&TurnContextItem>,
     previous_turn_settings: Option<&PreviousTurnSettings>,
     next: &TurnContext,
-) -> Option<DeveloperInstructions> {
+) -> Option<String> {
     match (
         previous.and_then(|item| item.realtime_active),
         next.realtime_active,
     ) {
-        (Some(true), false) => Some(DeveloperInstructions::realtime_end_message("inactive")),
+        (Some(true), false) => Some(RealtimeEndInstructions::new("inactive").render()),
         (Some(false), true) | (None, true) => Some(
             if let Some(instructions) = next
                 .config
                 .experimental_realtime_start_instructions
                 .as_deref()
             {
-                DeveloperInstructions::realtime_start_message_with_instructions(instructions)
+                RealtimeStartWithInstructions::new(instructions).render()
             } else {
-                DeveloperInstructions::realtime_start_message()
+                RealtimeStartInstructions.render()
             },
         ),
         (Some(true), true) | (Some(false), false) => None,
         (None, false) => previous_turn_settings
             .and_then(|settings| settings.realtime_active)
             .filter(|realtime_active| *realtime_active)
-            .map(|_| DeveloperInstructions::realtime_end_message("inactive")),
+            .map(|_| RealtimeEndInstructions::new("inactive").render()),
     }
 }
 
@@ -108,7 +134,7 @@ pub(crate) fn build_initial_realtime_item(
     previous: Option<&TurnContextItem>,
     previous_turn_settings: Option<&PreviousTurnSettings>,
     next: &TurnContext,
-) -> Option<DeveloperInstructions> {
+) -> Option<String> {
     build_realtime_update_item(previous, previous_turn_settings, next)
 }
 
@@ -116,7 +142,7 @@ fn build_personality_update_item(
     previous: Option<&TurnContextItem>,
     next: &TurnContext,
     personality_feature_enabled: bool,
-) -> Option<DeveloperInstructions> {
+) -> Option<String> {
     if !personality_feature_enabled {
         return None;
     }
@@ -130,7 +156,7 @@ fn build_personality_update_item(
     {
         let model_info = &next.model_info;
         let personality_message = personality_message_for(model_info, personality);
-        personality_message.map(DeveloperInstructions::personality_spec_message)
+        personality_message.map(|message| PersonalitySpecInstructions::new(message).render())
     } else {
         None
     }
@@ -150,7 +176,7 @@ pub(crate) fn personality_message_for(
 pub(crate) fn build_model_instructions_update_item(
     previous_turn_settings: Option<&PreviousTurnSettings>,
     next: &TurnContext,
-) -> Option<DeveloperInstructions> {
+) -> Option<String> {
     let previous_turn_settings = previous_turn_settings?;
     if previous_turn_settings.model == next.model_info.slug {
         return None;
@@ -161,9 +187,7 @@ pub(crate) fn build_model_instructions_update_item(
         return None;
     }
 
-    Some(DeveloperInstructions::model_switch_message(
-        model_instructions,
-    ))
+    Some(ModelSwitchInstructions::new(model_instructions).render())
 }
 
 pub(crate) fn build_developer_update_item(text_sections: Vec<String>) -> Option<ResponseItem> {
@@ -172,6 +196,26 @@ pub(crate) fn build_developer_update_item(text_sections: Vec<String>) -> Option<
 
 pub(crate) fn build_contextual_user_message(text_sections: Vec<String>) -> Option<ResponseItem> {
     build_text_message("user", text_sections)
+}
+
+pub(crate) fn merge_contextual_fragments(
+    fragments: Vec<Box<dyn ContextualUserFragment>>,
+) -> Vec<ResponseItem> {
+    let mut messages: Vec<(&str, Vec<String>)> = Vec::with_capacity(fragments.len());
+    for fragment in fragments {
+        let role = fragment.role();
+        let text = fragment.render();
+        match messages.last_mut() {
+            Some((previous_role, text_sections)) if *previous_role == role => {
+                text_sections.push(text);
+            }
+            _ => messages.push((role, vec![text])),
+        }
+    }
+    messages
+        .into_iter()
+        .filter_map(|(role, text_sections)| build_text_message(role, text_sections))
+        .collect()
 }
 
 fn build_text_message(role: &str, text_sections: Vec<String>) -> Option<ResponseItem> {
@@ -188,8 +232,8 @@ fn build_text_message(role: &str, text_sections: Vec<String>) -> Option<Response
         id: None,
         role: role.to_string(),
         content,
-        end_turn: None,
         phase: None,
+        internal_chat_message_metadata_passthrough: None,
     })
 }
 
@@ -197,7 +241,6 @@ pub(crate) fn build_settings_update_items(
     previous: Option<&TurnContextItem>,
     previous_turn_settings: Option<&PreviousTurnSettings>,
     next: &TurnContext,
-    shell: &Shell,
     exec_policy: &Policy,
     personality_feature_enabled: bool,
 ) -> Vec<ResponseItem> {
@@ -205,27 +248,21 @@ pub(crate) fn build_settings_update_items(
     // model-visible item emitted by build_initial_context. Persist the remaining
     // inputs or add explicit replay events so fork/resume can diff everything
     // deterministically.
-    let contextual_user_message = build_environment_update_item(previous, next, shell);
     let developer_update_sections = [
         // Keep model-switch instructions first so model-specific guidance is read before
         // any other context diffs on this turn.
         build_model_instructions_update_item(previous_turn_settings, next),
         build_permissions_update_item(previous, next, exec_policy),
         build_collaboration_mode_update_item(previous, next),
+        build_multi_agent_mode_update_item(previous, next),
         build_realtime_update_item(previous, previous_turn_settings, next),
         build_personality_update_item(previous, next, personality_feature_enabled),
     ]
     .into_iter()
     .flatten()
-    .map(DeveloperInstructions::into_text)
     .collect();
 
-    let mut items = Vec::with_capacity(2);
-    if let Some(developer_message) = build_developer_update_item(developer_update_sections) {
-        items.push(developer_message);
-    }
-    if let Some(contextual_user_message) = contextual_user_message {
-        items.push(contextual_user_message);
-    }
-    items
+    build_developer_update_item(developer_update_sections)
+        .into_iter()
+        .collect()
 }

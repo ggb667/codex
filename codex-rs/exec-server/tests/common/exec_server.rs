@@ -1,31 +1,39 @@
 #![allow(dead_code)]
 
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::anyhow;
-use codex_app_server_protocol::JSONRPCMessage;
-use codex_app_server_protocol::JSONRPCNotification;
-use codex_app_server_protocol::JSONRPCRequest;
-use codex_app_server_protocol::RequestId;
-use codex_utils_cargo_bin::cargo_bin;
+use codex_exec_server_protocol::JSONRPCMessage;
+use codex_exec_server_protocol::JSONRPCNotification;
+use codex_exec_server_protocol::JSONRPCRequest;
+use codex_exec_server_protocol::RequestId;
 use futures::SinkExt;
 use futures::StreamExt;
+use tempfile::TempDir;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
+use tokio::io::copy_bidirectional;
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
 use tokio::process::Child;
 use tokio::process::Command;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio::time::sleep;
 use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct ExecServerHarness {
+    _codex_home: TempDir,
+    _helper_paths: TestCodexHelperPaths,
     child: Child,
     websocket_url: String,
     websocket: tokio_tungstenite::WebSocketStream<
@@ -40,18 +48,60 @@ impl Drop for ExecServerHarness {
     }
 }
 
+pub(crate) struct TestCodexHelperPaths {
+    pub(crate) codex_exe: PathBuf,
+    pub(crate) codex_linux_sandbox_exe: Option<PathBuf>,
+}
+
+pub(crate) struct DisconnectableWebSocketProxy {
+    websocket_url: String,
+    pause_tx: Option<oneshot::Sender<()>>,
+    blocked_connection_rx: Option<oneshot::Receiver<()>>,
+    resume_tx: Option<oneshot::Sender<()>>,
+    task: JoinHandle<()>,
+}
+
+impl Drop for DisconnectableWebSocketProxy {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+pub(crate) fn test_codex_helper_paths() -> anyhow::Result<TestCodexHelperPaths> {
+    let (helper_binary, codex_linux_sandbox_exe) = super::current_test_binary_helper_paths()?;
+    Ok(TestCodexHelperPaths {
+        codex_exe: helper_binary,
+        codex_linux_sandbox_exe,
+    })
+}
+
 pub(crate) async fn exec_server() -> anyhow::Result<ExecServerHarness> {
-    let binary = cargo_bin("codex-exec-server")?;
-    let mut child = Command::new(binary);
-    child.args(["--listen", "ws://127.0.0.1:0"]);
+    exec_server_with_env(std::iter::empty::<(&str, &str)>()).await
+}
+
+pub(crate) async fn exec_server_with_env<I, K, V>(env: I) -> anyhow::Result<ExecServerHarness>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<std::ffi::OsStr>,
+    V: AsRef<std::ffi::OsStr>,
+{
+    let helper_paths = test_codex_helper_paths()?;
+    let codex_home = TempDir::new()?;
+    let mut child = Command::new(&helper_paths.codex_exe);
+    child.args(["exec-server", "--listen", "ws://127.0.0.1:0"]);
     child.stdin(Stdio::null());
     child.stdout(Stdio::piped());
     child.stderr(Stdio::inherit());
+    child.kill_on_drop(true);
+    child.env("CODEX_HOME", codex_home.path());
+    child.envs(env);
     let mut child = child.spawn()?;
 
     let websocket_url = read_listen_url_from_stdout(&mut child).await?;
     let (websocket, _) = connect_websocket_when_ready(&websocket_url).await?;
     Ok(ExecServerHarness {
+        _codex_home: codex_home,
+        _helper_paths: helper_paths,
         child,
         websocket_url,
         websocket,
@@ -62,6 +112,46 @@ pub(crate) async fn exec_server() -> anyhow::Result<ExecServerHarness> {
 impl ExecServerHarness {
     pub(crate) fn websocket_url(&self) -> &str {
         &self.websocket_url
+    }
+
+    pub(crate) async fn disconnect_websocket(&mut self) -> anyhow::Result<()> {
+        self.websocket.close(None).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn reconnect_websocket(&mut self) -> anyhow::Result<()> {
+        let (websocket, _) = connect_websocket_when_ready(&self.websocket_url).await?;
+        self.websocket = websocket;
+        Ok(())
+    }
+
+    pub(crate) async fn disconnectable_websocket_proxy(
+        &self,
+    ) -> anyhow::Result<DisconnectableWebSocketProxy> {
+        let upstream = self
+            .websocket_url
+            .strip_prefix("ws://")
+            .ok_or_else(|| anyhow!("exec-server websocket URL must use ws://"))?
+            .to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let websocket_url = format!("ws://{}", listener.local_addr()?);
+        let (pause_tx, pause_rx) = oneshot::channel();
+        let (blocked_connection_tx, blocked_connection_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel();
+        let task = tokio::spawn(run_disconnectable_proxy(
+            listener,
+            upstream,
+            pause_rx,
+            blocked_connection_tx,
+            resume_rx,
+        ));
+        Ok(DisconnectableWebSocketProxy {
+            websocket_url,
+            pause_tx: Some(pause_tx),
+            blocked_connection_rx: Some(blocked_connection_rx),
+            resume_tx: Some(resume_tx),
+            task,
+        })
     }
 
     pub(crate) async fn send_request(
@@ -100,6 +190,11 @@ impl ExecServerHarness {
         Ok(())
     }
 
+    pub(crate) async fn send_raw_binary(&mut self, bytes: Vec<u8>) -> anyhow::Result<()> {
+        self.websocket.send(Message::Binary(bytes.into())).await?;
+        Ok(())
+    }
+
     pub(crate) async fn next_event(&mut self) -> anyhow::Result<JSONRPCMessage> {
         self.next_event_with_timeout(EVENT_TIMEOUT).await
     }
@@ -129,6 +224,9 @@ impl ExecServerHarness {
 
     pub(crate) async fn shutdown(&mut self) -> anyhow::Result<()> {
         self.child.start_kill()?;
+        timeout(CONNECT_TIMEOUT, self.child.wait())
+            .await
+            .map_err(|_| anyhow!("timed out waiting for exec-server shutdown"))??;
         Ok(())
     }
 
@@ -160,6 +258,85 @@ impl ExecServerHarness {
                 _ => {}
             }
         }
+    }
+}
+
+impl DisconnectableWebSocketProxy {
+    pub(crate) fn websocket_url(&self) -> &str {
+        &self.websocket_url
+    }
+
+    pub(crate) async fn pause_and_disconnect(&mut self) -> anyhow::Result<()> {
+        self.pause_tx
+            .take()
+            .ok_or_else(|| anyhow!("disconnectable websocket proxy is already paused"))?
+            .send(())
+            .map_err(|_| anyhow!("disconnectable websocket proxy stopped"))?;
+        let blocked_connection_rx = self
+            .blocked_connection_rx
+            .take()
+            .ok_or_else(|| anyhow!("disconnectable websocket proxy is already paused"))?;
+        timeout(CONNECT_TIMEOUT, blocked_connection_rx)
+            .await
+            .map_err(|_| anyhow!("timed out waiting for client reconnect attempt"))?
+            .map_err(|_| anyhow!("disconnectable websocket proxy stopped"))?;
+        Ok(())
+    }
+
+    pub(crate) fn resume(&mut self) -> anyhow::Result<()> {
+        self.resume_tx
+            .take()
+            .ok_or_else(|| anyhow!("disconnectable websocket proxy is already resumed"))?
+            .send(())
+            .map_err(|_| anyhow!("disconnectable websocket proxy stopped"))?;
+        Ok(())
+    }
+}
+
+async fn run_disconnectable_proxy(
+    listener: TcpListener,
+    upstream: String,
+    pause_rx: oneshot::Receiver<()>,
+    blocked_connection_tx: oneshot::Sender<()>,
+    mut resume_rx: oneshot::Receiver<()>,
+) {
+    let Ok((mut downstream, _)) = listener.accept().await else {
+        return;
+    };
+    let Ok(mut upstream_stream) = TcpStream::connect(&upstream).await else {
+        return;
+    };
+    tokio::select! {
+        _ = copy_bidirectional(&mut downstream, &mut upstream_stream) => return,
+        _ = pause_rx => {}
+    }
+    drop(downstream);
+    drop(upstream_stream);
+
+    let mut blocked_connection_tx = Some(blocked_connection_tx);
+    loop {
+        tokio::select! {
+            _ = &mut resume_rx => break,
+            accepted = listener.accept() => {
+                let Ok((blocked, _)) = accepted else {
+                    break;
+                };
+                drop(blocked);
+                if let Some(blocked_connection_tx) = blocked_connection_tx.take() {
+                    let _ = blocked_connection_tx.send(());
+                }
+            }
+        }
+    }
+
+    loop {
+        let Ok((mut downstream, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok(mut upstream_stream) = TcpStream::connect(&upstream).await else {
+            continue;
+        };
+        let _ = copy_bidirectional(&mut downstream, &mut upstream_stream).await;
     }
 }
 

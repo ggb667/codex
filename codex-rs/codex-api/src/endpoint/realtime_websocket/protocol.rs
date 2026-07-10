@@ -1,10 +1,11 @@
 use crate::endpoint::realtime_websocket::protocol_v1::parse_realtime_event_v1;
 use crate::endpoint::realtime_websocket::protocol_v2::parse_realtime_event_v2;
+use codex_protocol::protocol::ConversationTextRole;
 pub use codex_protocol::protocol::RealtimeAudioFrame;
 pub use codex_protocol::protocol::RealtimeEvent;
-pub use codex_protocol::protocol::RealtimeHandoffRequested;
-pub use codex_protocol::protocol::RealtimeTranscriptDelta;
+pub use codex_protocol::protocol::RealtimeOutputModality;
 pub use codex_protocol::protocol::RealtimeTranscriptEntry;
+pub use codex_protocol::protocol::RealtimeVoice;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -27,6 +28,8 @@ pub struct RealtimeSessionConfig {
     pub session_id: Option<String>,
     pub event_parser: RealtimeEventParser,
     pub session_mode: RealtimeSessionMode,
+    pub output_modality: RealtimeOutputModality,
+    pub voice: RealtimeVoice,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -49,8 +52,12 @@ pub(super) enum RealtimeOutboundMessage {
 
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct SessionUpdateSession {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) id: Option<String>,
     #[serde(rename = "type")]
     pub(super) r#type: SessionType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -83,7 +90,14 @@ pub(super) struct SessionAudioInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) noise_reduction: Option<SessionNoiseReduction>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) transcription: Option<SessionInputAudioTranscription>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) turn_detection: Option<SessionTurnDetection>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct SessionInputAudioTranscription {
+    pub(super) model: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -103,15 +117,7 @@ pub(super) enum AudioFormatType {
 pub(super) struct SessionAudioOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) format: Option<SessionAudioOutputFormat>,
-    pub(super) voice: SessionAudioVoice,
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
-pub(super) enum SessionAudioVoice {
-    #[serde(rename = "fathom")]
-    Fathom,
-    #[serde(rename = "marin")]
-    Marin,
+    pub(super) voice: RealtimeVoice,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -132,6 +138,7 @@ pub(super) struct SessionTurnDetection {
     pub(super) r#type: TurnDetectionType,
     pub(super) interrupt_response: bool,
     pub(super) create_response: bool,
+    pub(super) silence_duration_ms: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -151,7 +158,7 @@ pub(super) struct SessionAudioOutputFormat {
 pub(super) struct ConversationMessageItem {
     #[serde(rename = "type")]
     pub(super) r#type: ConversationItemType,
-    pub(super) role: ConversationRole,
+    pub(super) role: ConversationTextRole,
     pub(super) content: Vec<ConversationItemContent>,
 }
 
@@ -160,12 +167,6 @@ pub(super) struct ConversationMessageItem {
 pub(super) enum ConversationItemType {
     Message,
     FunctionCallOutput,
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum ConversationRole {
-    User,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -193,8 +194,8 @@ pub(super) struct ConversationItemContent {
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ConversationContentType {
-    Text,
     InputText,
+    OutputText,
 }
 
 #[derive(Debug, Clone, Serialize)]

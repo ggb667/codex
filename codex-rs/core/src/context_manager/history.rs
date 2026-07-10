@@ -1,8 +1,11 @@
-use crate::codex::TurnContext;
+use crate::context::ContextualUserFragment;
+use crate::context::world_state::WorldState;
+use crate::context::world_state::WorldStateSnapshot;
 use crate::context_manager::normalize;
 use crate::event_mapping::has_non_contextual_dev_message_content;
 use crate::event_mapping::is_contextual_dev_message_content;
 use crate::event_mapping::is_contextual_user_message_content;
+use crate::session::turn_context::TurnContext;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_protocol::models::BaseInstructions;
@@ -17,6 +20,7 @@ use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnContextItem;
+use codex_protocol::protocol::WorldStateItem;
 use codex_utils_cache::BlockingLruCache;
 use codex_utils_cache::sha1_digest;
 use codex_utils_output_truncation::TruncationPolicy;
@@ -34,6 +38,8 @@ use std::sync::LazyLock;
 pub(crate) struct ContextManager {
     /// The oldest items are at the beginning of the vector.
     items: Vec<ResponseItem>,
+    /// Bumped whenever history is rewritten, such as compaction or rollback.
+    history_version: u64,
     token_info: Option<TokenUsageInfo>,
     /// Reference context snapshot used for diffing and producing model-visible
     /// settings update items.
@@ -46,24 +52,20 @@ pub(crate) struct ContextManager {
     /// also clear this when it trims a mixed initial-context developer bundle
     /// whose non-diff fragments no longer exist in the surviving history.
     reference_context_item: Option<TurnContextItem>,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct TotalTokenUsageBreakdown {
-    pub last_api_response_total_tokens: i64,
-    pub all_history_items_model_visible_bytes: i64,
-    pub estimated_tokens_of_items_added_since_last_successful_api_response: i64,
-    pub estimated_bytes_of_items_added_since_last_successful_api_response: i64,
+    /// World state most recently appended to model-visible history.
+    world_state_baseline: Option<WorldStateSnapshot>,
 }
 
 impl ContextManager {
     pub(crate) fn new() -> Self {
         Self {
             items: Vec::new(),
+            history_version: 0,
             token_info: TokenUsageInfo::new_or_append(
                 &None, &None, /*model_context_window*/ None,
             ),
             reference_context_item: None,
+            world_state_baseline: None,
         }
     }
 
@@ -83,6 +85,29 @@ impl ContextManager {
         self.reference_context_item.clone()
     }
 
+    pub(crate) fn update_world_state(
+        &mut self,
+        world_state: &WorldState,
+    ) -> (Vec<Box<dyn ContextualUserFragment>>, Option<WorldStateItem>) {
+        let snapshot = world_state.snapshot();
+        let fragments =
+            world_state.render_history_diff(self.world_state_baseline.as_ref(), &self.items);
+        let rollout_item = self.world_state_baseline.as_ref().map_or_else(
+            || Some(WorldStateItem::full(snapshot.clone().into_value())),
+            |previous| {
+                snapshot
+                    .merge_patch_from(previous)
+                    .map(WorldStateItem::patch)
+            },
+        );
+        self.world_state_baseline = Some(snapshot);
+        (fragments, rollout_item)
+    }
+
+    pub(crate) fn set_world_state_baseline(&mut self, snapshot: WorldStateSnapshot) {
+        self.world_state_baseline = Some(snapshot);
+    }
+
     pub(crate) fn set_token_usage_full(&mut self, context_window: i64) {
         match &mut self.token_info {
             Some(info) => info.fill_to_context_window(context_window),
@@ -100,8 +125,7 @@ impl ContextManager {
     {
         for item in items {
             let item_ref = item.deref();
-            let is_ghost_snapshot = matches!(item_ref, ResponseItem::GhostSnapshot { .. });
-            if !is_api_message(item_ref) && !is_ghost_snapshot {
+            if !is_api_message(item_ref) {
                 continue;
             }
 
@@ -117,13 +141,20 @@ impl ContextManager {
     pub(crate) fn for_prompt(mut self, input_modalities: &[InputModality]) -> Vec<ResponseItem> {
         self.normalize_history(input_modalities);
         self.items
-            .retain(|item| !matches!(item, ResponseItem::GhostSnapshot { .. }));
-        self.items
     }
 
     /// Returns raw items in the history.
     pub(crate) fn raw_items(&self) -> &[ResponseItem] {
         &self.items
+    }
+
+    /// Returns raw items in the history and consumes the snapshot.
+    pub(crate) fn into_raw_items(self) -> Vec<ResponseItem> {
+        self.items
+    }
+
+    pub(crate) fn history_version(&self) -> u64 {
+        self.history_version
     }
 
     // Estimate token usage using byte-based heuristics from the truncation helpers.
@@ -162,20 +193,14 @@ impl ContextManager {
             // its corresponding counterpart to keep the invariants intact without
             // running a full normalization pass.
             normalize::remove_corresponding_for(&mut self.items, &removed);
-        }
-    }
-
-    pub(crate) fn remove_last_item(&mut self) -> bool {
-        if let Some(removed) = self.items.pop() {
-            normalize::remove_corresponding_for(&mut self.items, &removed);
-            true
-        } else {
-            false
+            self.world_state_baseline = None;
         }
     }
 
     pub(crate) fn replace(&mut self, items: Vec<ResponseItem>) {
         self.items = items;
+        self.history_version = self.history_version.saturating_add(1);
+        self.world_state_baseline = None;
     }
 
     /// Replace image content in the last turn if it originated from a tool output.
@@ -201,6 +226,9 @@ impl ContextManager {
                         };
                         replaced = true;
                     }
+                }
+                if replaced {
+                    self.history_version = self.history_version.saturating_add(1);
                 }
                 replaced
             }
@@ -317,32 +345,11 @@ impl ContextManager {
         }
     }
 
-    pub(crate) fn get_total_token_usage_breakdown(&self) -> TotalTokenUsageBreakdown {
-        let last_usage = self
-            .token_info
-            .as_ref()
-            .map(|info| info.last_token_usage.clone())
-            .unwrap_or_default();
-        let items_after_last_model_generated = self.items_after_last_model_generated_item();
-
-        TotalTokenUsageBreakdown {
-            last_api_response_total_tokens: last_usage.total_tokens,
-            all_history_items_model_visible_bytes: self
-                .items
-                .iter()
-                .map(estimate_response_item_model_visible_bytes)
-                .fold(0i64, i64::saturating_add),
-            estimated_tokens_of_items_added_since_last_successful_api_response:
-                items_after_last_model_generated
-                    .iter()
-                    .map(estimate_item_token_count)
-                    .fold(0i64, i64::saturating_add),
-            estimated_bytes_of_items_added_since_last_successful_api_response:
-                items_after_last_model_generated
-                    .iter()
-                    .map(estimate_response_item_model_visible_bytes)
-                    .fold(0i64, i64::saturating_add),
-        }
+    pub(crate) fn estimated_tokens_after_last_model_generated_item(&self) -> i64 {
+        self.items_after_last_model_generated_item()
+            .iter()
+            .map(estimate_item_token_count)
+            .fold(0i64, i64::saturating_add)
     }
 
     /// This function enforces a couple of invariants on the in-memory history:
@@ -363,25 +370,33 @@ impl ContextManager {
     fn process_item(&self, item: &ResponseItem, policy: TruncationPolicy) -> ResponseItem {
         let policy_with_serialization_budget = policy * 1.2;
         match item {
-            ResponseItem::FunctionCallOutput { call_id, output } => {
-                ResponseItem::FunctionCallOutput {
-                    call_id: call_id.clone(),
-                    output: truncate_function_output_payload(
-                        output,
-                        policy_with_serialization_budget,
-                    ),
-                }
-            }
+            ResponseItem::FunctionCallOutput {
+                id,
+                call_id,
+                output,
+                internal_chat_message_metadata_passthrough: metadata,
+            } => ResponseItem::FunctionCallOutput {
+                id: id.clone(),
+                call_id: call_id.clone(),
+                output: truncate_function_output_payload(output, policy_with_serialization_budget),
+                internal_chat_message_metadata_passthrough: metadata.clone(),
+            },
             ResponseItem::CustomToolCallOutput {
+                id,
                 call_id,
                 name,
                 output,
+                internal_chat_message_metadata_passthrough: metadata,
             } => ResponseItem::CustomToolCallOutput {
+                id: id.clone(),
                 call_id: call_id.clone(),
                 name: name.clone(),
                 output: truncate_function_output_payload(output, policy_with_serialization_budget),
+                internal_chat_message_metadata_passthrough: metadata.clone(),
             },
-            ResponseItem::Message { .. }
+            ResponseItem::AdditionalTools { .. }
+            | ResponseItem::Message { .. }
+            | ResponseItem::AgentMessage { .. }
             | ResponseItem::Reasoning { .. }
             | ResponseItem::LocalShellCall { .. }
             | ResponseItem::FunctionCall { .. }
@@ -391,7 +406,8 @@ impl ContextManager {
             | ResponseItem::ImageGenerationCall { .. }
             | ResponseItem::CustomToolCall { .. }
             | ResponseItem::Compaction { .. }
-            | ResponseItem::GhostSnapshot { .. }
+            | ResponseItem::CompactionTrigger { .. }
+            | ResponseItem::ContextCompaction { .. }
             | ResponseItem::Other => item.clone(),
         }
     }
@@ -444,7 +460,7 @@ impl ContextManager {
     }
 }
 
-fn truncate_function_output_payload(
+pub(crate) fn truncate_function_output_payload(
     output: &FunctionCallOutputPayload,
     policy: TruncationPolicy,
 ) -> FunctionCallOutputPayload {
@@ -469,7 +485,9 @@ fn truncate_function_output_payload(
 fn is_api_message(message: &ResponseItem) -> bool {
     match message {
         ResponseItem::Message { role, .. } => role.as_str() != "system",
-        ResponseItem::FunctionCallOutput { .. }
+        ResponseItem::AdditionalTools { .. }
+        | ResponseItem::AgentMessage { .. }
+        | ResponseItem::FunctionCallOutput { .. }
         | ResponseItem::FunctionCall { .. }
         | ResponseItem::ToolSearchCall { .. }
         | ResponseItem::ToolSearchOutput { .. }
@@ -479,8 +497,9 @@ fn is_api_message(message: &ResponseItem) -> bool {
         | ResponseItem::Reasoning { .. }
         | ResponseItem::WebSearchCall { .. }
         | ResponseItem::ImageGenerationCall { .. }
-        | ResponseItem::Compaction { .. } => true,
-        ResponseItem::GhostSnapshot { .. } => false,
+        | ResponseItem::Compaction { .. }
+        | ResponseItem::ContextCompaction { .. } => true,
+        ResponseItem::CompactionTrigger { .. } => false,
         ResponseItem::Other => false,
     }
 }
@@ -491,6 +510,10 @@ fn estimate_reasoning_length(encoded_len: usize) -> usize {
         .checked_div(4)
         .unwrap_or(0)
         .saturating_sub(650)
+}
+
+fn estimate_encrypted_function_output_length(encoded_len: usize) -> usize {
+    encoded_len.saturating_mul(9).div_ceil(16)
 }
 
 fn estimate_item_token_count(item: &ResponseItem) -> i64 {
@@ -507,6 +530,10 @@ const RESIZED_IMAGE_BYTES_ESTIMATE: i64 = 7373;
 // Use a direct 32px patch count only for `detail: "original"`;
 // all other image inputs continue to use `RESIZED_IMAGE_BYTES_ESTIMATE`.
 const ORIGINAL_IMAGE_PATCH_SIZE: u32 = 32;
+// See https://platform.openai.com/docs/guides/images-vision#model-sizing-behavior.
+// Keep this hard-coded for now; move it into model capabilities if the patch
+// budget starts changing often across model releases.
+const ORIGINAL_IMAGE_MAX_PATCHES: usize = 10_000;
 const ORIGINAL_IMAGE_ESTIMATE_CACHE_SIZE: usize = 32;
 
 static ORIGINAL_IMAGE_ESTIMATE_CACHE: LazyLock<BlockingLruCache<[u8; 20], Option<i64>>> =
@@ -516,30 +543,36 @@ static ORIGINAL_IMAGE_ESTIMATE_CACHE: LazyLock<BlockingLruCache<[u8; 20], Option
         )
     });
 
-pub(crate) fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
+fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
     match item {
-        ResponseItem::GhostSnapshot { .. } => 0,
         ResponseItem::Reasoning {
             encrypted_content: Some(content),
             ..
         }
         | ResponseItem::Compaction {
             encrypted_content: content,
+            ..
+        }
+        | ResponseItem::ContextCompaction {
+            encrypted_content: Some(content),
+            ..
         } => i64::try_from(estimate_reasoning_length(content.len())).unwrap_or(i64::MAX),
         item => {
             let raw = serde_json::to_string(item)
                 .map(|serialized| i64::try_from(serialized.len()).unwrap_or(i64::MAX))
                 .unwrap_or_default();
-            let (payload_bytes, replacement_bytes) = image_data_url_estimate_adjustment(item);
-            if payload_bytes == 0 || replacement_bytes == 0 {
-                raw
-            } else {
-                // Replace raw base64 payload bytes with a per-image estimate.
-                // We intentionally preserve the data URL prefix and JSON
-                // wrapper bytes already included in `raw`.
-                raw.saturating_sub(payload_bytes)
-                    .saturating_add(replacement_bytes)
-            }
+            let (image_payload_bytes, image_replacement_bytes) =
+                image_data_url_estimate_adjustment(item);
+            let (encrypted_payload_bytes, encrypted_replacement_bytes) =
+                encrypted_function_output_estimate_adjustment(item);
+            // Replace raw base64 payload bytes with a per-image estimate.
+            // We intentionally preserve the data URL prefix and JSON
+            // wrapper bytes already included in `raw`.
+            let raw = raw
+                .saturating_sub(image_payload_bytes)
+                .saturating_add(image_replacement_bytes);
+            raw.saturating_sub(encrypted_payload_bytes)
+                .saturating_add(encrypted_replacement_bytes)
         }
     }
 }
@@ -609,6 +642,7 @@ fn estimate_original_image_bytes(image_url: &str) -> Option<i64> {
         let patches_high = height.saturating_add(patch_size.saturating_sub(1)) / patch_size;
         let patch_count = patches_wide.saturating_mul(patches_high);
         let patch_count = usize::try_from(patch_count).unwrap_or(usize::MAX);
+        let patch_count = patch_count.min(ORIGINAL_IMAGE_MAX_PATCHES);
         Some(i64::try_from(approx_bytes_for_tokens(patch_count)).unwrap_or(i64::MAX))
     })
 }
@@ -637,8 +671,8 @@ fn image_data_url_estimate_adjustment(item: &ResponseItem) -> (i64, i64) {
     match item {
         ResponseItem::Message { content, .. } => {
             for content_item in content {
-                if let ContentItem::InputImage { image_url } = content_item {
-                    accumulate(image_url, None);
+                if let ContentItem::InputImage { image_url, detail } = content_item {
+                    accumulate(image_url, *detail);
                 }
             }
         }
@@ -660,6 +694,31 @@ fn image_data_url_estimate_adjustment(item: &ResponseItem) -> (i64, i64) {
     (payload_bytes, replacement_bytes)
 }
 
+fn encrypted_function_output_estimate_adjustment(item: &ResponseItem) -> (i64, i64) {
+    let ResponseItem::FunctionCallOutput { output, .. } = item else {
+        return (0, 0);
+    };
+    let FunctionCallOutputBody::ContentItems(items) = &output.body else {
+        return (0, 0);
+    };
+
+    items.iter().fold((0i64, 0i64), |acc, item| {
+        let FunctionCallOutputContentItem::EncryptedContent { encrypted_content } = item else {
+            return acc;
+        };
+        let payload_bytes = acc
+            .0
+            .saturating_add(i64::try_from(encrypted_content.len()).unwrap_or(i64::MAX));
+        let replacement_bytes = acc.1.saturating_add(
+            i64::try_from(estimate_encrypted_function_output_length(
+                encrypted_content.len(),
+            ))
+            .unwrap_or(i64::MAX),
+        );
+        (payload_bytes, replacement_bytes)
+    })
+}
+
 fn is_model_generated_item(item: &ResponseItem) -> bool {
     match item {
         ResponseItem::Message { role, .. } => role == "assistant",
@@ -670,25 +729,22 @@ fn is_model_generated_item(item: &ResponseItem) -> bool {
         | ResponseItem::ImageGenerationCall { .. }
         | ResponseItem::CustomToolCall { .. }
         | ResponseItem::LocalShellCall { .. }
-        | ResponseItem::Compaction { .. } => true,
-        ResponseItem::FunctionCallOutput { .. }
+        | ResponseItem::Compaction { .. }
+        | ResponseItem::ContextCompaction { .. } => true,
+        ResponseItem::CompactionTrigger { .. } => false,
+        ResponseItem::AdditionalTools { .. }
+        | ResponseItem::FunctionCallOutput { .. }
         | ResponseItem::ToolSearchOutput { .. }
         | ResponseItem::CustomToolCallOutput { .. }
-        | ResponseItem::GhostSnapshot { .. }
+        | ResponseItem::AgentMessage { .. }
         | ResponseItem::Other => false,
     }
 }
 
-pub(crate) fn is_codex_generated_item(item: &ResponseItem) -> bool {
-    matches!(
-        item,
-        ResponseItem::FunctionCallOutput { .. }
-            | ResponseItem::ToolSearchOutput { .. }
-            | ResponseItem::CustomToolCallOutput { .. }
-    ) || matches!(item, ResponseItem::Message { role, .. } if role == "developer")
-}
-
 pub(crate) fn is_user_turn_boundary(item: &ResponseItem) -> bool {
+    if matches!(item, ResponseItem::AgentMessage { .. }) {
+        return true;
+    }
     let ResponseItem::Message { role, content, .. } = item else {
         return false;
     };

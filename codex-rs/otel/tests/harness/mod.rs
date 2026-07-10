@@ -1,6 +1,6 @@
-use codex_otel::metrics::MetricsClient;
-use codex_otel::metrics::MetricsConfig;
-use codex_otel::metrics::Result;
+use codex_otel::MetricsClient;
+use codex_otel::MetricsConfig;
+use codex_otel::Result;
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::metrics::InMemoryMetricExporter;
 use opentelemetry_sdk::metrics::data::AggregatedMetrics;
@@ -27,13 +27,12 @@ pub(crate) fn build_metrics_with_defaults(
 }
 
 pub(crate) fn latest_metrics(exporter: &InMemoryMetricExporter) -> ResourceMetrics {
-    let Ok(metrics) = exporter.get_finished_metrics() else {
-        panic!("finished metrics error");
-    };
-    let Some(metrics) = metrics.into_iter().last() else {
-        panic!("metrics export missing");
-    };
-    metrics
+    exporter
+        .get_finished_metrics()
+        .expect("finished metrics should be available")
+        .into_iter()
+        .last()
+        .expect("metrics export should exist")
 }
 
 pub(crate) fn find_metric<'a>(
@@ -62,8 +61,7 @@ pub(crate) fn histogram_data(
     resource_metrics: &ResourceMetrics,
     name: &str,
 ) -> (Vec<f64>, Vec<u64>, f64, u64) {
-    let metric =
-        find_metric(resource_metrics, name).unwrap_or_else(|| panic!("metric {name} missing"));
+    let metric = find_metric(resource_metrics, name).expect("metric should exist");
     match metric.data() {
         AggregatedMetrics::F64(data) => match data {
             MetricData::Histogram(histogram) => {

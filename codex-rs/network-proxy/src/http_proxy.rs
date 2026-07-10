@@ -1,4 +1,6 @@
+use crate::attribution::BindConnectionAttribution;
 use crate::config::NetworkMode;
+use crate::connect_policy::TargetCheckedTcpConnector;
 use crate::mitm;
 use crate::network_policy::BlockDecisionAuditEventArgs;
 use crate::network_policy::NetworkDecision;
@@ -22,6 +24,7 @@ use crate::responses::blocked_header_value;
 use crate::responses::blocked_message_with_policy;
 use crate::responses::blocked_text_response_with_policy;
 use crate::responses::json_response;
+use crate::runtime::HostMitmRequirement;
 use crate::runtime::unix_socket_permissions_supported;
 use crate::state::BlockedRequest;
 use crate::state::BlockedRequestArgs;
@@ -33,13 +36,12 @@ use anyhow::Result;
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 use rama_core::Layer;
 use rama_core::Service;
-use rama_core::error::BoxError;
 use rama_core::error::ErrorExt as _;
 use rama_core::error::OpaqueError;
 use rama_core::extensions::ExtensionsMut;
 use rama_core::extensions::ExtensionsRef;
-use rama_core::layer::AddInputExtensionLayer;
 use rama_core::service::service_fn;
+use rama_core::stream::Stream;
 use rama_http::Body;
 use rama_http::HeaderMap;
 use rama_http::HeaderName;
@@ -57,7 +59,6 @@ use rama_http_backend::server::HttpServer;
 use rama_http_backend::server::layer::upgrade::UpgradeLayer;
 use rama_http_backend::server::layer::upgrade::Upgraded;
 use rama_net::Protocol;
-use rama_net::address::ProxyAddress;
 use rama_net::client::ConnectorService;
 use rama_net::client::EstablishedClientConnection;
 use rama_net::http::RequestContext;
@@ -66,7 +67,6 @@ use rama_net::proxy::ProxyTarget;
 use rama_net::proxy::StreamForwardService;
 use rama_net::stream::SocketInfo;
 use rama_tcp::client::Request as TcpRequest;
-use rama_tcp::client::service::TcpConnector;
 use rama_tcp::server::TcpListener;
 use rama_tls_rustls::client::TlsConnectorDataBuilder;
 use rama_tls_rustls::client::TlsConnectorLayer;
@@ -75,14 +75,23 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::net::TcpListener as StdTcpListener;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectMitmMode {
+    Disabled,
+    Enabled,
+    DetectTls,
+}
 
 pub async fn run_http_proxy(
     state: Arc<NetworkProxyState>,
     addr: SocketAddr,
     policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
+    environment_id: Option<String>,
 ) -> Result<()> {
     let listener = TcpListener::build()
         .bind(addr)
@@ -95,23 +104,25 @@ pub async fn run_http_proxy(
         .map_err(anyhow::Error::from)
         .with_context(|| format!("bind HTTP proxy: {addr}"))?;
 
-    run_http_proxy_with_listener(state, listener, policy_decider).await
+    run_http_proxy_with_listener(state, listener, policy_decider, environment_id).await
 }
 
 pub async fn run_http_proxy_with_std_listener(
     state: Arc<NetworkProxyState>,
     listener: StdTcpListener,
     policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
+    environment_id: Option<String>,
 ) -> Result<()> {
     let listener =
         TcpListener::try_from(listener).context("convert std listener to HTTP proxy listener")?;
-    run_http_proxy_with_listener(state, listener, policy_decider).await
+    run_http_proxy_with_listener(state, listener, policy_decider, environment_id).await
 }
 
 async fn run_http_proxy_with_listener(
     state: Arc<NetworkProxyState>,
     listener: TcpListener,
     policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
+    environment_id: Option<String>,
 ) -> Result<()> {
     ensure_rustls_crypto_provider();
 
@@ -129,7 +140,10 @@ async fn run_http_proxy_with_listener(
                 MethodMatcher::CONNECT,
                 service_fn({
                     let policy_decider = policy_decider.clone();
-                    move |req| http_connect_accept(policy_decider.clone(), req)
+                    let environment_id = environment_id.clone();
+                    move |req| {
+                        http_connect_accept(policy_decider.clone(), environment_id.clone(), req)
+                    }
                 }),
                 service_fn(http_connect_proxy),
             ),
@@ -137,20 +151,26 @@ async fn run_http_proxy_with_listener(
         )
             .into_layer(service_fn({
                 let policy_decider = policy_decider.clone();
-                move |req| http_plain_proxy(policy_decider.clone(), req)
+                let environment_id = environment_id.clone();
+                move |req| http_plain_proxy(policy_decider.clone(), environment_id.clone(), req)
             })),
     );
 
     info!("HTTP proxy listening on {addr}");
 
     listener
-        .serve(AddInputExtensionLayer::new(state).into_layer(http_service))
+        .serve(BindConnectionAttribution::new(
+            http_service,
+            state,
+            environment_id,
+        ))
         .await;
     Ok(())
 }
 
 async fn http_connect_accept(
     policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
+    environment_id: Option<String>,
     mut req: Request,
 ) -> Result<(Response, Request), Response> {
     let app_state = req
@@ -196,6 +216,7 @@ async fn http_connect_accept(
         protocol: NetworkProtocol::HttpsConnect,
         host: host.clone(),
         port: authority.port,
+        environment_id,
         client_addr: client.clone(),
         method: Some("CONNECT".to_string()),
         command: None,
@@ -255,10 +276,26 @@ async fn http_connect_accept(
             return Err(text_response(StatusCode::INTERNAL_SERVER_ERROR, "error"));
         }
     };
+    let host_mitm_requirement = match app_state.host_mitm_requirement(&host).await {
+        Ok(requirement) => requirement,
+        Err(err) => {
+            error!("failed to inspect MITM requirements for {host}: {err}");
+            return Err(text_response(StatusCode::INTERNAL_SERVER_ERROR, "error"));
+        }
+    };
+    let connect_mitm_mode = if mode == NetworkMode::Limited {
+        ConnectMitmMode::Enabled
+    } else {
+        match host_mitm_requirement {
+            HostMitmRequirement::None => ConnectMitmMode::Disabled,
+            HostMitmRequirement::Tls => ConnectMitmMode::DetectTls,
+            HostMitmRequirement::Always => ConnectMitmMode::Enabled,
+        }
+    };
 
-    if mode == NetworkMode::Limited && mitm_state.is_none() {
-        // Limited mode is designed to be read-only. Without MITM, a CONNECT tunnel would hide the
-        // inner HTTP method/headers from the proxy, effectively bypassing method policy.
+    if connect_mitm_mode == ConnectMitmMode::Enabled && mitm_state.is_none() {
+        // Limited-mode enforcement and host-specific hooks require interception. Credential-only
+        // interception is deferred until the upgraded stream presents a TLS ClientHello.
         emit_http_block_decision_audit_event(
             &app_state,
             BlockDecisionAuditEventArgs {
@@ -285,7 +322,7 @@ async fn http_connect_accept(
                 reason: REASON_MITM_REQUIRED.to_string(),
                 client: client.clone(),
                 method: Some("CONNECT".to_string()),
-                mode: Some(NetworkMode::Limited),
+                mode: Some(mode),
                 protocol: "http-connect".to_string(),
                 decision: Some(details.decision.as_str().to_string()),
                 source: Some(details.source.as_str().to_string()),
@@ -294,14 +331,17 @@ async fn http_connect_accept(
             .await;
         let client = client.as_deref().unwrap_or_default();
         warn!(
-            "CONNECT blocked; MITM required for read-only HTTPS in limited mode (client={client}, host={host}, mode=limited, allowed_methods=GET, HEAD, OPTIONS)"
+            "CONNECT blocked; MITM required to enforce HTTPS policy (client={client}, host={host}, mode={mode:?}, host_mitm_requirement={host_mitm_requirement:?})"
         );
         return Err(blocked_text_with_details(REASON_MITM_REQUIRED, &details));
     }
 
     req.extensions_mut().insert(ProxyTarget(authority));
+    req.extensions_mut().insert(connect_mitm_mode);
     req.extensions_mut().insert(mode);
-    if let Some(mitm_state) = mitm_state {
+    if connect_mitm_mode != ConnectMitmMode::Disabled
+        && let Some(mitm_state) = mitm_state
+    {
         req.extensions_mut().insert(mitm_state);
     }
 
@@ -315,75 +355,90 @@ async fn http_connect_accept(
 }
 
 async fn http_connect_proxy(upgraded: Upgraded) -> Result<(), Infallible> {
-    let mode = upgraded
+    let connect_mitm_mode = upgraded
+        .extensions()
+        .get::<ConnectMitmMode>()
+        .copied()
+        .unwrap_or(ConnectMitmMode::Disabled);
+    let result: Result<(), OpaqueError> = match connect_mitm_mode {
+        ConnectMitmMode::Disabled => forward_connect_tunnel(upgraded).await,
+        ConnectMitmMode::Enabled => mitm_connect_tunnel(upgraded).await,
+        ConnectMitmMode::DetectTls => match mitm::peek_tls_prefix(upgraded).await {
+            Ok((true, stream)) => mitm_connect_tunnel(stream).await,
+            Ok((false, stream)) => forward_connect_tunnel(stream).await,
+            Err(err) => Err(OpaqueError::from_display(format!("detect TLS: {err:#}"))),
+        },
+    };
+    if let Err(err) = result {
+        warn!("CONNECT tunnel error: {err}");
+    }
+    Ok(())
+}
+
+async fn mitm_connect_tunnel<S>(stream: S) -> Result<(), OpaqueError>
+where
+    S: Stream + Unpin + ExtensionsMut,
+{
+    let target = stream
+        .extensions()
+        .get::<ProxyTarget>()
+        .map(|target| target.0.clone())
+        .ok_or_else(|| OpaqueError::from_display("missing MITM authority"))?;
+    let host = normalize_host(&target.host.to_string());
+    let port = target.port;
+    let mode = stream
         .extensions()
         .get::<NetworkMode>()
         .copied()
         .unwrap_or(NetworkMode::Full);
-
-    let Some(target) = upgraded
-        .extensions()
-        .get::<ProxyTarget>()
-        .map(|t| t.0.clone())
-    else {
-        warn!("CONNECT missing proxy target");
-        return Ok(());
-    };
-
-    if mode == NetworkMode::Limited
-        && upgraded
-            .extensions()
-            .get::<Arc<mitm::MitmState>>()
-            .is_some()
-    {
-        let host = normalize_host(&target.host.to_string());
-        let port = target.port;
-        info!("CONNECT MITM enabled (host={host}, port={port}, mode={mode:?})");
-        if let Err(err) = mitm::mitm_tunnel(upgraded).await {
-            warn!("MITM tunnel error: {err}");
-        }
-        return Ok(());
+    if stream.extensions().get::<Arc<mitm::MitmState>>().is_none() {
+        return Err(OpaqueError::from_display(format!(
+            "cannot enable MITM without state (host={host}, port={port})"
+        )));
     }
 
-    let allow_upstream_proxy = match upgraded
+    info!("CONNECT MITM enabled (host={host}, port={port}, mode={mode:?})");
+    mitm::mitm_stream(stream)
+        .await
+        .map_err(|err| OpaqueError::from_display(format!("MITM tunnel error: {err}")))
+}
+
+async fn forward_connect_tunnel<S>(upgraded: S) -> Result<(), OpaqueError>
+where
+    S: Stream + Unpin + ExtensionsMut,
+{
+    let authority = upgraded
+        .extensions()
+        .get::<ProxyTarget>()
+        .map(|target| target.0.clone())
+        .ok_or_else(|| OpaqueError::from_display("missing forward authority"))?;
+    let app_state = upgraded
         .extensions()
         .get::<Arc<NetworkProxyState>>()
         .cloned()
-    {
-        Some(state) => match state.allow_upstream_proxy().await {
-            Ok(allowed) => allowed,
-            Err(err) => {
-                error!("failed to read upstream proxy setting: {err}");
-                false
-            }
-        },
-        None => {
-            error!("missing app state");
+        .ok_or_else(|| OpaqueError::from_display("missing app state"))?;
+    let allow_upstream_proxy = match app_state.allow_upstream_proxy().await {
+        Ok(allowed) => allowed,
+        Err(err) => {
+            error!("failed to read upstream proxy setting: {err}");
             false
         }
     };
-
     let proxy = if allow_upstream_proxy {
         proxy_for_connect()
     } else {
         None
     };
-
-    if let Err(err) = forward_connect_tunnel(upgraded, proxy).await {
-        warn!("tunnel error: {err}");
+    match proxy.as_ref() {
+        Some(proxy) => info!(
+            "CONNECT route selected (host={}, port={}, route=upstream_proxy, proxy={})",
+            authority.host, authority.port, proxy.address
+        ),
+        None => info!(
+            "CONNECT route selected (host={}, port={}, route=direct)",
+            authority.host, authority.port
+        ),
     }
-    Ok(())
-}
-
-async fn forward_connect_tunnel(
-    upgraded: Upgraded,
-    proxy: Option<ProxyAddress>,
-) -> Result<(), BoxError> {
-    let authority = upgraded
-        .extensions()
-        .get::<ProxyTarget>()
-        .map(|target| target.0.clone())
-        .ok_or_else(|| OpaqueError::from_display("missing forward authority").into_boxed())?;
 
     let mut extensions = upgraded.extensions().clone();
     if let Some(proxy) = proxy {
@@ -392,36 +447,61 @@ async fn forward_connect_tunnel(
 
     let req = TcpRequest::new_with_extensions(authority.clone(), extensions)
         .with_protocol(Protocol::HTTPS);
-    let proxy_connector = HttpProxyConnector::optional(TcpConnector::new());
+    let proxy_connector = HttpProxyConnector::optional(TargetCheckedTcpConnector::new(app_state));
     let tls_config = TlsConnectorDataBuilder::new()
         .with_alpn_protocols_http_auto()
         .build();
     let connector = TlsConnectorLayer::tunnel(None)
         .with_connector_data(tls_config)
         .into_layer(proxy_connector);
-    let EstablishedClientConnection { conn: target, .. } =
-        connector.connect(req).await.map_err(|err| {
-            OpaqueError::from_boxed(err)
-                .with_context(|| format!("establish CONNECT tunnel to {authority}"))
-                .into_boxed()
-        })?;
+    info!("CONNECT upstream dial started (target={authority})");
+    let connect_started_at = Instant::now();
+    let EstablishedClientConnection { conn: target, .. } = match connector.connect(req).await {
+        Ok(connection) => {
+            info!(
+                "CONNECT upstream dial established (target={authority}, elapsed_ms={})",
+                connect_started_at.elapsed().as_millis()
+            );
+            connection
+        }
+        Err(err) => {
+            warn!(
+                "CONNECT upstream dial failed (target={authority}, elapsed_ms={})",
+                connect_started_at.elapsed().as_millis()
+            );
+            return Err(OpaqueError::from_boxed(err)
+                .with_context(|| format!("establish CONNECT tunnel to {authority}")));
+        }
+    };
 
     let proxy_req = ProxyRequest {
         source: upgraded,
         target,
     };
+    info!("CONNECT tunnel forwarding started (target={authority})");
+    let forward_started_at = Instant::now();
     StreamForwardService::default()
         .serve(proxy_req)
         .await
+        .map(|_| {
+            info!(
+                "CONNECT tunnel forwarding completed (target={authority}, elapsed_ms={})",
+                forward_started_at.elapsed().as_millis()
+            );
+        })
         .map_err(|err| {
+            warn!(
+                "CONNECT tunnel forwarding failed (target={authority}, elapsed_ms={})",
+                forward_started_at.elapsed().as_millis()
+            );
             OpaqueError::from_boxed(err.into())
                 .with_context(|| format!("forward CONNECT tunnel to {authority}"))
-                .into_boxed()
         })
 }
 
 async fn http_plain_proxy(
     policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
+    environment_id: Option<String>,
     mut req: Request,
 ) -> Result<Response, Infallible> {
     let app_state = match req.extensions().get::<Arc<NetworkProxyState>>().cloned() {
@@ -627,6 +707,7 @@ async fn http_plain_proxy(
         protocol: NetworkProtocol::Http,
         host: host.clone(),
         port,
+        environment_id,
         client_addr: client.clone(),
         method: Some(req.method().as_str().to_string()),
         command: None,
@@ -717,6 +798,15 @@ async fn http_plain_proxy(
         ));
     }
 
+    if let Err(err) =
+        inject_plaintext_credentials_if_enabled(app_state.as_ref(), &host, req.headers_mut()).await
+    {
+        return Ok(internal_error(
+            "failed to read plaintext credential injection config",
+            err,
+        ));
+    }
+
     let client = client.as_deref().unwrap_or_default();
     let method = req.method();
     info!("request allowed (client={client}, host={host}, method={method})");
@@ -730,9 +820,9 @@ async fn http_plain_proxy(
         Err(resp) => return Ok(resp),
     };
     let client = if allow_upstream_proxy {
-        UpstreamClient::from_env_proxy()
+        UpstreamClient::from_env_proxy(app_state.clone())
     } else {
-        UpstreamClient::direct()
+        UpstreamClient::direct(app_state.clone())
     };
 
     // Strip hop-by-hop headers only after extracting metadata used for policy correlation.
@@ -744,6 +834,17 @@ async fn http_plain_proxy(
             Ok(text_response(StatusCode::BAD_GATEWAY, "upstream failure"))
         }
     }
+}
+
+async fn inject_plaintext_credentials_if_enabled(
+    app_state: &NetworkProxyState,
+    host: &str,
+    headers: &mut HeaderMap,
+) -> Result<()> {
+    if app_state.plaintext_credential_injection_enabled().await? {
+        app_state.inject_request_credentials(host, headers);
+    }
+    Ok(())
 }
 
 async fn proxy_via_unix_socket(req: Request, socket_path: &str) -> Result<Response> {
@@ -986,14 +1087,16 @@ mod tests {
     use super::*;
 
     use crate::config::NetworkMode;
-    use crate::config::NetworkProxySettings;
+    use crate::config::NetworkProxyConfig;
     use crate::runtime::network_proxy_state_for_policy;
     use pretty_assertions::assert_eq;
     use rama_http::Method;
     use rama_http::Request;
+    use std::collections::HashMap;
     use std::net::Ipv4Addr;
     use std::net::TcpListener as StdTcpListener;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener as TokioTcpListener;
@@ -1003,7 +1106,7 @@ mod tests {
     #[tokio::test]
     async fn http_connect_accept_blocks_in_limited_mode() {
         let policy = {
-            let mut policy = NetworkProxySettings::default();
+            let mut policy = NetworkProxyConfig::default();
             policy.set_allowed_domains(vec!["example.com".to_string()]);
             policy
         };
@@ -1018,9 +1121,11 @@ mod tests {
             .unwrap();
         req.extensions_mut().insert(state);
 
-        let response = http_connect_accept(/*policy_decider*/ None, req)
-            .await
-            .unwrap_err();
+        let response = http_connect_accept(
+            /*policy_decider*/ None, /*environment_id*/ None, req,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(
             response.headers().get("x-proxy-error").unwrap(),
@@ -1031,7 +1136,10 @@ mod tests {
     #[tokio::test]
     async fn http_connect_accept_allows_allowlisted_host_in_full_mode() {
         let policy = {
-            let mut policy = NetworkProxySettings::default();
+            let mut policy = NetworkProxyConfig {
+                allow_local_binding: true,
+                ..NetworkProxyConfig::default()
+            };
             policy.set_allowed_domains(vec!["example.com".to_string()]);
             policy
         };
@@ -1045,14 +1153,185 @@ mod tests {
             .unwrap();
         req.extensions_mut().insert(state);
 
-        let (response, _request) = http_connect_accept(/*policy_decider*/ None, req)
-            .await
-            .unwrap();
+        let (response, _request) = http_connect_accept(
+            /*policy_decider*/ None, /*environment_id*/ None, req,
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
-    async fn http_proxy_listener_accepts_plain_http1_connect_requests() {
+    async fn http_connect_accept_passes_environment_id_to_decider() {
+        let state = Arc::new(network_proxy_state_for_policy(NetworkProxyConfig::default()));
+        let seen_environment_id = Arc::new(Mutex::new(None));
+        let decider: Arc<dyn NetworkPolicyDecider> = Arc::new({
+            let seen_environment_id = seen_environment_id.clone();
+            move |request: NetworkPolicyRequest| {
+                *seen_environment_id
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = request.environment_id;
+                async { NetworkDecision::Allow }
+            }
+        });
+
+        let mut req = Request::builder()
+            .method(Method::CONNECT)
+            .uri("https://example.com:443")
+            .header("host", "example.com:443")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(state);
+
+        let (response, _request) =
+            http_connect_accept(Some(decider), Some("remote".to_string()), req)
+                .await
+                .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            seen_environment_id
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_deref(),
+            Some("remote")
+        );
+    }
+
+    #[tokio::test]
+    async fn http_connect_accept_defers_brokered_host_mitm_until_protocol_detection() {
+        let mut policy = NetworkProxyConfig {
+            credential_broker: true,
+            mitm: true,
+            ..NetworkProxyConfig::default()
+        };
+        policy.set_allowed_domains(vec!["github.com".to_string()]);
+        let state = Arc::new(network_proxy_state_for_policy(policy));
+        let mut env = HashMap::from([("GH_TOKEN".to_string(), "ghp-real".to_string())]);
+        state.virtualize_child_credentials(&mut env);
+
+        let mut req = Request::builder()
+            .method(Method::CONNECT)
+            .uri("https://github.com:22")
+            .header("host", "github.com:22")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(state);
+
+        let (response, request) = http_connect_accept(
+            /*policy_decider*/ None, /*environment_id*/ None, req,
+        )
+        .await
+        .expect("brokered credentials should defer MITM until protocol detection");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            request.extensions().get::<ConnectMitmMode>().copied(),
+            Some(ConnectMitmMode::DetectTls)
+        );
+    }
+
+    #[tokio::test]
+    async fn plaintext_credential_injection_requires_explicit_opt_in() {
+        let real_token = "ghp-real";
+        let mut disabled_network = NetworkProxyConfig {
+            credential_broker: true,
+            mitm: true,
+            ..NetworkProxyConfig::default()
+        };
+        disabled_network.set_allowed_domains(vec!["api.github.com".to_string()]);
+        let disabled_state = Arc::new(network_proxy_state_for_policy(disabled_network));
+        let mut disabled_env = HashMap::from([("GH_TOKEN".to_string(), real_token.to_string())]);
+        disabled_state.virtualize_child_credentials(&mut disabled_env);
+        let dummy_token = disabled_env.get("GH_TOKEN").expect("dummy GitHub token");
+        let mut disabled_headers = HeaderMap::from_iter([(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {dummy_token}"))
+                .expect("valid authorization header"),
+        )]);
+
+        inject_plaintext_credentials_if_enabled(
+            disabled_state.as_ref(),
+            "api.github.com",
+            &mut disabled_headers,
+        )
+        .await
+        .expect("disabled plaintext injection check should succeed");
+        assert_eq!(
+            disabled_headers.get(header::AUTHORIZATION),
+            Some(&HeaderValue::from_str(&format!("Bearer {dummy_token}")).unwrap())
+        );
+
+        let mut enabled_network = NetworkProxyConfig {
+            credential_broker: true,
+            dangerously_allow_plaintext_credential_injection: true,
+            mitm: true,
+            ..NetworkProxyConfig::default()
+        };
+        enabled_network.set_allowed_domains(vec!["api.github.com".to_string()]);
+        let enabled_state = Arc::new(network_proxy_state_for_policy(enabled_network));
+        let mut enabled_env = HashMap::from([("GH_TOKEN".to_string(), real_token.to_string())]);
+        enabled_state.virtualize_child_credentials(&mut enabled_env);
+        let enabled_dummy = enabled_env.get("GH_TOKEN").expect("dummy GitHub token");
+        let mut enabled_headers = HeaderMap::from_iter([(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {enabled_dummy}"))
+                .expect("valid authorization header"),
+        )]);
+
+        inject_plaintext_credentials_if_enabled(
+            enabled_state.as_ref(),
+            "api.github.com",
+            &mut enabled_headers,
+        )
+        .await
+        .expect("enabled plaintext injection check should succeed");
+        assert_eq!(
+            enabled_headers.get(header::AUTHORIZATION),
+            Some(&HeaderValue::from_str(&format!("Bearer {real_token}")).unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn http_connect_accept_blocks_hooked_host_in_full_mode_without_mitm_state() {
+        let mut policy = NetworkProxyConfig {
+            mitm: true,
+            mitm_hooks: vec![crate::mitm_hook::MitmHookConfig {
+                host: "api.github.com".to_string(),
+                matcher: crate::mitm_hook::MitmHookMatchConfig {
+                    methods: vec!["POST".to_string()],
+                    path_prefixes: vec!["/repos/openai/".to_string()],
+                    ..crate::mitm_hook::MitmHookMatchConfig::default()
+                },
+                actions: crate::mitm_hook::MitmHookActionsConfig::default(),
+            }],
+            ..Default::default()
+        };
+        policy.set_allowed_domains(vec!["api.github.com".to_string()]);
+        let state = Arc::new(network_proxy_state_for_policy(policy));
+
+        let mut req = Request::builder()
+            .method(Method::CONNECT)
+            .uri("https://api.github.com:8443")
+            .header("host", "api.github.com:8443")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(state);
+
+        let response = http_connect_accept(
+            /*policy_decider*/ None, /*environment_id*/ None, req,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response.headers().get("x-proxy-error").unwrap(),
+            "blocked-by-mitm-required"
+        );
+    }
+
+    #[tokio::test]
+    async fn brokered_connect_forwards_server_first_opaque_protocol_without_mitm() {
+        let server_banner = b"SSH-2.0-server\r\n";
         let target_listener = TokioTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("target listener should bind");
@@ -1064,23 +1343,37 @@ mod tests {
                 .accept()
                 .await
                 .expect("target listener should accept");
-            let mut buf = [0_u8; 1];
-            let _ = timeout(Duration::from_secs(1), stream.read(&mut buf)).await;
+            stream
+                .write_all(server_banner)
+                .await
+                .expect("target should write opaque server bytes");
         });
 
         let state = Arc::new(network_proxy_state_for_policy({
-            let mut network = NetworkProxySettings::default();
+            let mut network = NetworkProxyConfig {
+                credential_broker: true,
+                mitm: true,
+                ..NetworkProxyConfig::default()
+            };
             network.set_allowed_domains(vec!["127.0.0.1".to_string()]);
             network.allow_local_binding = true;
             network
         }));
+        let mut env = HashMap::from([
+            ("GH_HOST".to_string(), "127.0.0.1".to_string()),
+            (
+                "GH_ENTERPRISE_TOKEN".to_string(),
+                "ghp-enterprise-real".to_string(),
+            ),
+        ]);
+        state.virtualize_child_credentials(&mut env);
         let listener =
             StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("proxy listener should bind");
         let proxy_addr = listener
             .local_addr()
             .expect("proxy listener should expose local addr");
         let proxy_task = tokio::spawn(run_http_proxy_with_std_listener(
-            state, listener, /*policy_decider*/ None,
+            state, listener, /*policy_decider*/ None, /*environment_id*/ None,
         ));
 
         let mut stream = tokio::net::TcpStream::connect(proxy_addr)
@@ -1106,18 +1399,22 @@ mod tests {
             "unexpected proxy response: {response:?}"
         );
 
+        let mut buf = vec![0_u8; server_banner.len()];
+        timeout(Duration::from_secs(2), stream.read_exact(&mut buf))
+            .await
+            .expect("opaque server bytes should arrive before timeout")
+            .expect("client should read opaque server bytes");
+        assert_eq!(buf, server_banner);
+
         drop(stream);
         proxy_task.abort();
         let _ = proxy_task.await;
-        target_task.abort();
-        let _ = target_task.await;
+        target_task.await.expect("target task should finish");
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn http_plain_proxy_blocks_unix_socket_when_method_not_allowed() {
-        let state = Arc::new(network_proxy_state_for_policy(
-            NetworkProxySettings::default(),
-        ));
+        let state = Arc::new(network_proxy_state_for_policy(NetworkProxyConfig::default()));
         state
             .set_network_mode(NetworkMode::Limited)
             .await
@@ -1131,9 +1428,11 @@ mod tests {
             .expect("request should build");
         req.extensions_mut().insert(state);
 
-        let response = http_plain_proxy(/*policy_decider*/ None, req)
-            .await
-            .unwrap();
+        let response = http_plain_proxy(
+            /*policy_decider*/ None, /*environment_id*/ None, req,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(
@@ -1144,9 +1443,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn http_plain_proxy_rejects_unix_socket_when_not_allowlisted() {
-        let state = Arc::new(network_proxy_state_for_policy(
-            NetworkProxySettings::default(),
-        ));
+        let state = Arc::new(network_proxy_state_for_policy(NetworkProxyConfig::default()));
 
         let mut req = Request::builder()
             .method(Method::GET)
@@ -1156,9 +1453,11 @@ mod tests {
             .expect("request should build");
         req.extensions_mut().insert(state);
 
-        let response = http_plain_proxy(/*policy_decider*/ None, req)
-            .await
-            .unwrap();
+        let response = http_plain_proxy(
+            /*policy_decider*/ None, /*environment_id*/ None, req,
+        )
+        .await
+        .unwrap();
 
         if cfg!(target_os = "macos") {
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -1175,7 +1474,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn http_plain_proxy_attempts_allowed_unix_socket_proxy() {
         let state = Arc::new(network_proxy_state_for_policy({
-            let mut network = NetworkProxySettings::default();
+            let mut network = NetworkProxyConfig::default();
             network.set_allow_unix_sockets(vec!["/tmp/test.sock".to_string()]);
             network
         }));
@@ -1188,16 +1487,18 @@ mod tests {
             .expect("request should build");
         req.extensions_mut().insert(state);
 
-        let response = http_plain_proxy(/*policy_decider*/ None, req)
-            .await
-            .unwrap();
+        let response = http_plain_proxy(
+            /*policy_decider*/ None, /*environment_id*/ None, req,
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
     async fn http_connect_accept_denies_denylisted_host() {
         let policy = {
-            let mut policy = NetworkProxySettings::default();
+            let mut policy = NetworkProxyConfig::default();
             policy.set_allowed_domains(vec!["**.openai.com".to_string()]);
             policy.set_denied_domains(vec!["api.openai.com".to_string()]);
             policy
@@ -1212,9 +1513,11 @@ mod tests {
             .unwrap();
         req.extensions_mut().insert(state);
 
-        let response = http_connect_accept(/*policy_decider*/ None, req)
-            .await
-            .unwrap_err();
+        let response = http_connect_accept(
+            /*policy_decider*/ None, /*environment_id*/ None, req,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(
             response.headers().get("x-proxy-error").unwrap(),
@@ -1224,9 +1527,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_plain_proxy_rejects_absolute_uri_host_header_mismatch() {
-        let state = Arc::new(network_proxy_state_for_policy(
-            NetworkProxySettings::default(),
-        ));
+        let state = Arc::new(network_proxy_state_for_policy(NetworkProxyConfig::default()));
         let mut req = Request::builder()
             .method(Method::GET)
             .uri("http://raw.githubusercontent.com/openai/codex/main/README.md")
@@ -1235,7 +1536,10 @@ mod tests {
             .unwrap();
         req.extensions_mut().insert(state);
 
-        let response = http_plain_proxy(/*policy_decider*/ None, req).await;
+        let response = http_plain_proxy(
+            /*policy_decider*/ None, /*environment_id*/ None, req,
+        )
+        .await;
         assert_eq!(response.unwrap().status(), StatusCode::BAD_REQUEST);
     }
 

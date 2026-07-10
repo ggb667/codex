@@ -2,6 +2,7 @@ use crate::ApplyOutcome;
 use crate::ApplyStatus;
 use crate::AttemptStatus;
 use crate::CloudBackend;
+use crate::CloudBackendFuture;
 use crate::CloudTaskError;
 use crate::DiffSummary;
 use crate::Result;
@@ -14,6 +15,7 @@ use crate::api::TaskText;
 use chrono::DateTime;
 use chrono::Utc;
 
+use codex_api::SharedAuthProvider;
 use codex_backend_client as backend;
 use codex_backend_client::CodeTaskDetailsResponseExt;
 use codex_git_utils::ApplyGitRequest;
@@ -32,13 +34,13 @@ impl HttpClient {
         Ok(Self { base_url, backend })
     }
 
-    pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
-        self.backend = self.backend.clone().with_bearer_token(token);
+    pub fn with_user_agent(mut self, ua: impl Into<String>) -> Self {
+        self.backend = self.backend.clone().with_user_agent(ua);
         self
     }
 
-    pub fn with_user_agent(mut self, ua: impl Into<String>) -> Self {
-        self.backend = self.backend.clone().with_user_agent(ua);
+    pub fn with_auth_provider(mut self, auth: SharedAuthProvider) -> Self {
+        self.backend = self.backend.clone().with_auth_provider(auth);
         self
     }
 
@@ -60,68 +62,77 @@ impl HttpClient {
     }
 }
 
-#[async_trait::async_trait]
 impl CloudBackend for HttpClient {
-    async fn list_tasks(
-        &self,
-        env: Option<&str>,
+    fn list_tasks<'a>(
+        &'a self,
+        env: Option<&'a str>,
         limit: Option<i64>,
-        cursor: Option<&str>,
-    ) -> Result<TaskListPage> {
-        self.tasks_api().list(env, limit, cursor).await
+        cursor: Option<&'a str>,
+    ) -> CloudBackendFuture<'a, TaskListPage> {
+        Box::pin(async move { self.tasks_api().list(env, limit, cursor).await })
     }
 
-    async fn get_task_summary(&self, id: TaskId) -> Result<TaskSummary> {
-        self.tasks_api().summary(id).await
+    fn get_task_summary(&self, id: TaskId) -> CloudBackendFuture<'_, TaskSummary> {
+        Box::pin(async move { self.tasks_api().summary(id).await })
     }
 
-    async fn get_task_diff(&self, id: TaskId) -> Result<Option<String>> {
-        self.tasks_api().diff(id).await
+    fn get_task_diff(&self, id: TaskId) -> CloudBackendFuture<'_, Option<String>> {
+        Box::pin(async move { self.tasks_api().diff(id).await })
     }
 
-    async fn get_task_messages(&self, id: TaskId) -> Result<Vec<String>> {
-        self.tasks_api().messages(id).await
+    fn get_task_messages(&self, id: TaskId) -> CloudBackendFuture<'_, Vec<String>> {
+        Box::pin(async move { self.tasks_api().messages(id).await })
     }
 
-    async fn get_task_text(&self, id: TaskId) -> Result<TaskText> {
-        self.tasks_api().task_text(id).await
+    fn get_task_text(&self, id: TaskId) -> CloudBackendFuture<'_, TaskText> {
+        Box::pin(async move { self.tasks_api().task_text(id).await })
     }
 
-    async fn list_sibling_attempts(
+    fn list_sibling_attempts(
         &self,
         task: TaskId,
         turn_id: String,
-    ) -> Result<Vec<TurnAttempt>> {
-        self.attempts_api().list(task, turn_id).await
+    ) -> CloudBackendFuture<'_, Vec<TurnAttempt>> {
+        Box::pin(async move { self.attempts_api().list(task, turn_id).await })
     }
 
-    async fn apply_task(&self, id: TaskId, diff_override: Option<String>) -> Result<ApplyOutcome> {
-        self.apply_api()
-            .run(id, diff_override, /*preflight*/ false)
-            .await
-    }
-
-    async fn apply_task_preflight(
+    fn apply_task(
         &self,
         id: TaskId,
         diff_override: Option<String>,
-    ) -> Result<ApplyOutcome> {
-        self.apply_api()
-            .run(id, diff_override, /*preflight*/ true)
-            .await
+    ) -> CloudBackendFuture<'_, ApplyOutcome> {
+        Box::pin(async move {
+            self.apply_api()
+                .run(id, diff_override, /*preflight*/ false)
+                .await
+        })
     }
 
-    async fn create_task(
+    fn apply_task_preflight(
         &self,
-        env_id: &str,
-        prompt: &str,
-        git_ref: &str,
+        id: TaskId,
+        diff_override: Option<String>,
+    ) -> CloudBackendFuture<'_, ApplyOutcome> {
+        Box::pin(async move {
+            self.apply_api()
+                .run(id, diff_override, /*preflight*/ true)
+                .await
+        })
+    }
+
+    fn create_task<'a>(
+        &'a self,
+        env_id: &'a str,
+        prompt: &'a str,
+        git_ref: &'a str,
         qa_mode: bool,
         best_of_n: usize,
-    ) -> Result<crate::CreatedTask> {
-        self.tasks_api()
-            .create(env_id, prompt, git_ref, qa_mode, best_of_n)
-            .await
+    ) -> CloudBackendFuture<'a, crate::CreatedTask> {
+        Box::pin(async move {
+            self.tasks_api()
+                .create(env_id, prompt, git_ref, qa_mode, best_of_n)
+                .await
+        })
     }
 }
 

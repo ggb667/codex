@@ -239,12 +239,21 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
             Event::Key(key_event) => {
                 #[cfg(unix)]
                 if crate::tui::job_control::SUSPEND_KEY.is_press(key_event) {
-                    let _ = self.suspend_context.suspend(&self.alt_screen_active);
+                    self.broker.pause_events();
+                    let suspend_result = self.suspend_context.suspend(&self.alt_screen_active);
+                    self.broker.resume_events();
+                    if let Err(err) = suspend_result {
+                        tracing::warn!(
+                            event = "tui_suspend_failed",
+                            error = %err,
+                            "failed to suspend TUI process"
+                        );
+                    }
                     return Some(TuiEvent::Draw);
                 }
                 Some(TuiEvent::Key(key_event))
             }
-            Event::Resize(_, _) => Some(TuiEvent::Draw),
+            Event::Resize(_, _) => Some(TuiEvent::Resize),
             Event::Paste(pasted) => Some(TuiEvent::Paste(pasted)),
             Event::FocusGained => {
                 self.terminal_focused.store(true, Ordering::Relaxed);
@@ -449,6 +458,17 @@ mod tests {
 
         let first = stream.next().await;
         assert!(matches!(first, Some(TuiEvent::Draw)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resize_event_maps_to_resize() {
+        let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
+        let mut stream = make_stream(broker, draw_rx, terminal_focused);
+
+        handle.send(Ok(Event::Resize(80, 24)));
+
+        let next = stream.next().await;
+        assert!(matches!(next, Some(TuiEvent::Resize)));
     }
 
     #[tokio::test(flavor = "current_thread")]

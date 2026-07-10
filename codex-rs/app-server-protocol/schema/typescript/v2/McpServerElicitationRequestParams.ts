@@ -4,7 +4,7 @@
 import type { JsonValue } from "../serde_json/JsonValue";
 import type { McpElicitationSchema } from "./McpElicitationSchema";
 
-export type McpServerElicitationRequestParams = { threadId: string, 
+export type McpServerElicitationRequestParams = { threadId: string,
 /**
  * Active Codex turn when this elicitation was observed, if app-server could correlate one.
  *
@@ -13,4 +13,4 @@ export type McpServerElicitationRequestParams = { threadId: string,
  * context is app-server correlation rather than part of the protocol identity of the
  * elicitation itself.
  */
-turnId: string | null, serverName: string, } & ({ "mode": "form", _meta: JsonValue | null, message: string, requestedSchema: McpElicitationSchema, } | { "mode": "url", _meta: JsonValue | null, message: string, url: string, elicitationId: string, });
+turnId: string | null, serverName: string, } & ({ "mode": "form", _meta: JsonValue | null, message: string, requestedSchema: McpElicitationSchema, } | { "mode": "openai/form", _meta: JsonValue | null, message: string, requestedSchema: JsonValue, } | { "mode": "url", _meta: JsonValue | null, message: string, url: string, elicitationId: string, });

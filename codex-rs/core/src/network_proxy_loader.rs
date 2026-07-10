@@ -1,23 +1,29 @@
 use crate::config::find_codex_home;
+use crate::config::is_builtin_permission_profile_name;
+use crate::config::reject_unknown_builtin_permission_profile;
 use crate::config::resolve_permission_profile;
-use crate::config_loader::CloudRequirementsLoader;
-use crate::config_loader::ConfigLayerStack;
-use crate::config_loader::ConfigLayerStackOrdering;
-use crate::config_loader::LoaderOverrides;
-use crate::config_loader::load_config_layers_state;
-use crate::exec_policy::ExecPolicyError;
 use crate::exec_policy::format_exec_policy_error_with_source;
-use crate::exec_policy::load_exec_policy;
+use crate::exec_policy::load_exec_policy_with_warning;
 use anyhow::Context;
 use anyhow::Result;
-use async_trait::async_trait;
-use codex_app_server_protocol::ConfigLayerSource;
 use codex_config::CONFIG_TOML_FILE;
+use codex_config::ConfigLayerSource;
+use codex_config::ConfigLayerStack;
+use codex_config::ConfigLayerStackOrdering;
+use codex_config::LoaderOverrides;
+use codex_config::loader::load_config_layers_state;
+use codex_config::merge_toml_values;
+use codex_config::permissions_toml::NetworkMitmActionToml;
+use codex_config::permissions_toml::NetworkMitmHookToml;
+use codex_config::permissions_toml::NetworkMitmToml;
 use codex_config::permissions_toml::NetworkToml;
 use codex_config::permissions_toml::PermissionsToml;
 use codex_config::permissions_toml::overlay_network_domain_permissions;
+use codex_exec_server::LOCAL_FS;
 use codex_network_proxy::ConfigReloader;
+use codex_network_proxy::ConfigReloaderFuture;
 use codex_network_proxy::ConfigState;
+use codex_network_proxy::NetworkMode;
 use codex_network_proxy::NetworkProxyConfig;
 use codex_network_proxy::NetworkProxyConstraintError;
 use codex_network_proxy::NetworkProxyConstraints;
@@ -25,8 +31,9 @@ use codex_network_proxy::NetworkProxyState;
 use codex_network_proxy::build_config_state;
 use codex_network_proxy::normalize_host;
 use codex_network_proxy::validate_policy_against_constraints;
+use codex_utils_absolute_path::AbsolutePathBuf;
+use indexmap::IndexMap;
 use serde::Deserialize;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -46,22 +53,25 @@ async fn build_config_state_with_mtimes() -> Result<(ConfigState, Vec<LayerMtime
     let cli_overrides = Vec::new();
     let overrides = LoaderOverrides::default();
     let config_layer_stack = load_config_layers_state(
+        LOCAL_FS.as_ref(),
         &codex_home,
         /*cwd*/ None,
         &cli_overrides,
         overrides,
-        CloudRequirementsLoader::default(),
+        &codex_config::NoopThreadConfigLoader,
     )
     .await
     .context("failed to load Codex config")?;
 
-    let (exec_policy, warning) = match load_exec_policy(&config_layer_stack).await {
-        Ok(policy) => (policy, None),
-        Err(err @ ExecPolicyError::ParsePolicy { .. }) => {
-            (codex_execpolicy::Policy::empty(), Some(err))
-        }
-        Err(err) => return Err(err.into()),
-    };
+    let layer_mtimes = collect_layer_mtimes(&config_layer_stack);
+    let state = build_config_state_from_layers(&config_layer_stack).await?;
+    Ok((state, layer_mtimes))
+}
+
+async fn build_config_state_from_layers(
+    config_layer_stack: &ConfigLayerStack,
+) -> Result<ConfigState> {
+    let (exec_policy, warning) = load_exec_policy_with_warning(config_layer_stack).await?;
     if let Some(err) = warning.as_ref() {
         tracing::warn!(
             "failed to parse execpolicy while building network proxy state: {}",
@@ -69,12 +79,10 @@ async fn build_config_state_with_mtimes() -> Result<(ConfigState, Vec<LayerMtime
         );
     }
 
-    let config = config_from_layers(&config_layer_stack, &exec_policy)?;
+    let config = config_from_layers(config_layer_stack, &exec_policy)?;
 
-    let constraints = enforce_trusted_constraints(&config_layer_stack, &config)?;
-    let layer_mtimes = collect_layer_mtimes(&config_layer_stack);
-    let state = build_config_state(config, constraints)?;
-    Ok((state, layer_mtimes))
+    let constraints = enforce_trusted_constraints(config_layer_stack, &config)?;
+    build_config_state(config, constraints)
 }
 
 fn collect_layer_mtimes(stack: &ConfigLayerStack) -> Vec<LayerMtime> {
@@ -86,15 +94,12 @@ fn collect_layer_mtimes(stack: &ConfigLayerStack) -> Vec<LayerMtime> {
         .iter()
         .filter_map(|layer| {
             let path = match &layer.name {
-                ConfigLayerSource::System { file } => Some(file.as_path().to_path_buf()),
-                ConfigLayerSource::User { file } => Some(file.as_path().to_path_buf()),
-                ConfigLayerSource::Project { dot_codex_folder } => dot_codex_folder
-                    .join(CONFIG_TOML_FILE)
-                    .ok()
-                    .map(|p| p.as_path().to_path_buf()),
-                ConfigLayerSource::LegacyManagedConfigTomlFromFile { file } => {
-                    Some(file.as_path().to_path_buf())
+                ConfigLayerSource::System { file } => Some(file.clone()),
+                ConfigLayerSource::User { file, .. } => Some(file.clone()),
+                ConfigLayerSource::Project { dot_codex_folder } => {
+                    Some(dot_codex_folder.join(CONFIG_TOML_FILE))
                 }
+                ConfigLayerSource::LegacyManagedConfigTomlFromFile { file } => Some(file.clone()),
                 _ => None,
             };
             path.map(LayerMtime::new)
@@ -117,6 +122,7 @@ fn network_constraints_from_trusted_layers(
     layers: &ConfigLayerStack,
 ) -> Result<NetworkProxyConstraints> {
     let mut constraints = NetworkProxyConstraints::default();
+    let mut merged = toml::Value::Table(toml::map::Map::new());
     for layer in layers.get_layers(
         ConfigLayerStackOrdering::LowestPrecedenceFirst,
         /*include_disabled*/ false,
@@ -125,10 +131,12 @@ fn network_constraints_from_trusted_layers(
             continue;
         }
 
-        let parsed = network_tables_from_toml(&layer.config)?;
-        if let Some(network) = selected_network_from_tables(parsed)? {
-            apply_network_constraints(network, &mut constraints);
-        }
+        merge_toml_values(&mut merged, &layer.config);
+    }
+
+    let parsed = network_tables_from_toml(&merged)?;
+    if let Some(network) = selected_network_from_tables(parsed)? {
+        apply_network_constraints(network, &mut constraints);
     }
     Ok(constraints)
 }
@@ -154,14 +162,14 @@ fn apply_network_constraints(network: NetworkToml, constraints: &mut NetworkProx
     if let Some(domains) = network.domains.as_ref() {
         let mut config = NetworkProxyConfig::default();
         if let Some(allowed_domains) = constraints.allowed_domains.take() {
-            config.network.set_allowed_domains(allowed_domains);
+            config.set_allowed_domains(allowed_domains);
         }
         if let Some(denied_domains) = constraints.denied_domains.take() {
-            config.network.set_denied_domains(denied_domains);
+            config.set_denied_domains(denied_domains);
         }
         overlay_network_domain_permissions(&mut config, domains);
-        constraints.allowed_domains = config.network.allowed_domains();
-        constraints.denied_domains = config.network.denied_domains();
+        constraints.allowed_domains = config.allowed_domains();
+        constraints.denied_domains = config.denied_domains();
     }
     if let Some(unix_sockets) = network.unix_sockets.as_ref() {
         let allow_unix_sockets = unix_sockets.allow_unix_sockets();
@@ -189,15 +197,20 @@ fn selected_network_from_tables(parsed: NetworkTablesToml) -> Result<Option<Netw
     let Some(default_permissions) = parsed.default_permissions else {
         return Ok(None);
     };
+    if is_builtin_permission_profile_name(&default_permissions) {
+        return Ok(None);
+    }
+    reject_unknown_builtin_permission_profile(&default_permissions)?;
 
     let permissions = parsed
         .permissions
         .context("default_permissions requires a `[permissions]` table for network settings")?;
     let profile = resolve_permission_profile(&permissions, &default_permissions)
         .map_err(anyhow::Error::from)?;
-    Ok(profile.network.clone())
+    Ok(profile.network)
 }
 
+#[cfg(test)]
 fn apply_network_tables(config: &mut NetworkProxyConfig, parsed: NetworkTablesToml) -> Result<()> {
     if let Some(network) = selected_network_from_tables(parsed)? {
         network.apply_to_network_proxy_config(config);
@@ -205,18 +218,68 @@ fn apply_network_tables(config: &mut NetworkProxyConfig, parsed: NetworkTablesTo
     Ok(())
 }
 
+#[derive(Default)]
+struct NetworkConfigAccumulator {
+    config: NetworkProxyConfig,
+    mitm_hooks: IndexMap<String, NetworkMitmHookToml>,
+    mitm_actions: IndexMap<String, NetworkMitmActionToml>,
+}
+
+impl NetworkConfigAccumulator {
+    fn apply_network_tables(&mut self, parsed: NetworkTablesToml) -> Result<()> {
+        if let Some(network) = selected_network_from_tables(parsed)? {
+            self.apply_network(network);
+        }
+        Ok(())
+    }
+
+    fn apply_network(&mut self, mut network: NetworkToml) {
+        let mitm = network.mitm.take();
+        network.apply_to_network_proxy_config(&mut self.config);
+
+        if let Some(mitm) = mitm {
+            if let Some(actions) = mitm.actions {
+                self.mitm_actions.extend(actions);
+            }
+            if let Some(hooks) = mitm.hooks {
+                self.mitm_hooks.extend(hooks);
+            }
+        }
+    }
+
+    fn finish(mut self) -> Result<NetworkProxyConfig> {
+        if !self.mitm_hooks.is_empty() {
+            let actions = self.mitm_actions;
+            let mitm = NetworkMitmToml {
+                hooks: Some(self.mitm_hooks),
+                actions: Some(actions.clone()),
+            };
+            mitm.validate_action_references(&actions)
+                .map_err(anyhow::Error::msg)?;
+            self.config.mitm_hooks = mitm.to_runtime_hooks(Some(&actions));
+        }
+
+        self.config.mitm =
+            self.config.mode == NetworkMode::Limited || !self.config.mitm_hooks.is_empty();
+        Ok(self.config)
+    }
+}
+
 fn config_from_layers(
     layers: &ConfigLayerStack,
     exec_policy: &codex_execpolicy::Policy,
 ) -> Result<NetworkProxyConfig> {
-    let mut config = NetworkProxyConfig::default();
+    let mut merged = toml::Value::Table(toml::map::Map::new());
     for layer in layers.get_layers(
         ConfigLayerStackOrdering::LowestPrecedenceFirst,
         /*include_disabled*/ false,
     ) {
-        let parsed = network_tables_from_toml(&layer.config)?;
-        apply_network_tables(&mut config, parsed)?;
+        merge_toml_values(&mut merged, &layer.config);
     }
+    let parsed = network_tables_from_toml(&merged)?;
+    let mut accumulator = NetworkConfigAccumulator::default();
+    accumulator.apply_network_tables(parsed)?;
+    let mut config = accumulator.finish()?;
     apply_exec_policy_network_rules(&mut config, exec_policy);
     Ok(config)
 }
@@ -247,9 +310,7 @@ fn upsert_network_domain(
     host: String,
     permission: codex_network_proxy::NetworkDomainPermission,
 ) {
-    config
-        .network
-        .upsert_domain_permission(host, permission, normalize_host);
+    config.upsert_domain_permission(host, permission, normalize_host);
 }
 
 fn is_user_controlled_layer(layer: &ConfigLayerSource) -> bool {
@@ -263,12 +324,12 @@ fn is_user_controlled_layer(layer: &ConfigLayerSource) -> bool {
 
 #[derive(Clone)]
 struct LayerMtime {
-    path: PathBuf,
+    path: AbsolutePathBuf,
     mtime: Option<std::time::SystemTime>,
 }
 
 impl LayerMtime {
-    fn new(path: PathBuf) -> Self {
+    fn new(path: AbsolutePathBuf) -> Self {
         let mtime = path.metadata().and_then(|m| m.modified()).ok();
         Self { path, mtime }
     }
@@ -297,13 +358,6 @@ impl MtimeConfigReloader {
             }
         })
     }
-}
-
-#[async_trait]
-impl ConfigReloader for MtimeConfigReloader {
-    fn source_label(&self) -> String {
-        "config layers".to_string()
-    }
 
     async fn maybe_reload(&self) -> Result<Option<ConfigState>> {
         if !self.needs_reload().await {
@@ -321,6 +375,20 @@ impl ConfigReloader for MtimeConfigReloader {
         let mut guard = self.layer_mtimes.write().await;
         *guard = layer_mtimes;
         Ok(state)
+    }
+}
+
+impl ConfigReloader for MtimeConfigReloader {
+    fn source_label(&self) -> String {
+        "config layers".to_string()
+    }
+
+    fn maybe_reload(&self) -> ConfigReloaderFuture<'_, Option<ConfigState>> {
+        Box::pin(MtimeConfigReloader::maybe_reload(self))
+    }
+
+    fn reload_now(&self) -> ConfigReloaderFuture<'_, ConfigState> {
+        Box::pin(MtimeConfigReloader::reload_now(self))
     }
 }
 

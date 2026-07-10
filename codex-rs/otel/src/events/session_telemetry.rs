@@ -3,32 +3,36 @@ use crate::ToolDecisionSource;
 use crate::events::shared::log_and_trace_event;
 use crate::events::shared::log_event;
 use crate::events::shared::trace_event;
+use crate::metrics::API_CALL_COUNT_METRIC;
+use crate::metrics::API_CALL_DURATION_METRIC;
 use crate::metrics::MetricsClient;
 use crate::metrics::MetricsConfig;
 use crate::metrics::MetricsError;
+use crate::metrics::PLUGIN_INSTALL_ELICITATION_SENT_METRIC;
+use crate::metrics::PLUGIN_INSTALL_SUGGESTION_METRIC;
+use crate::metrics::RESPONSES_API_ENGINE_IAPI_TBT_DURATION_METRIC;
+use crate::metrics::RESPONSES_API_ENGINE_IAPI_TTFT_DURATION_METRIC;
+use crate::metrics::RESPONSES_API_ENGINE_SERVICE_TBT_DURATION_METRIC;
+use crate::metrics::RESPONSES_API_ENGINE_SERVICE_TTFT_DURATION_METRIC;
+use crate::metrics::RESPONSES_API_INFERENCE_TIME_DURATION_METRIC;
+use crate::metrics::RESPONSES_API_OVERHEAD_DURATION_METRIC;
 use crate::metrics::Result as MetricsResult;
-use crate::metrics::names::API_CALL_COUNT_METRIC;
-use crate::metrics::names::API_CALL_DURATION_METRIC;
-use crate::metrics::names::PROFILE_USAGE_METRIC;
-use crate::metrics::names::RESPONSES_API_ENGINE_IAPI_TBT_DURATION_METRIC;
-use crate::metrics::names::RESPONSES_API_ENGINE_IAPI_TTFT_DURATION_METRIC;
-use crate::metrics::names::RESPONSES_API_ENGINE_SERVICE_TBT_DURATION_METRIC;
-use crate::metrics::names::RESPONSES_API_ENGINE_SERVICE_TTFT_DURATION_METRIC;
-use crate::metrics::names::RESPONSES_API_INFERENCE_TIME_DURATION_METRIC;
-use crate::metrics::names::RESPONSES_API_OVERHEAD_DURATION_METRIC;
-use crate::metrics::names::SSE_EVENT_COUNT_METRIC;
-use crate::metrics::names::SSE_EVENT_DURATION_METRIC;
-use crate::metrics::names::TOOL_CALL_COUNT_METRIC;
-use crate::metrics::names::TOOL_CALL_DURATION_METRIC;
-use crate::metrics::names::WEBSOCKET_EVENT_COUNT_METRIC;
-use crate::metrics::names::WEBSOCKET_EVENT_DURATION_METRIC;
-use crate::metrics::names::WEBSOCKET_REQUEST_COUNT_METRIC;
-use crate::metrics::names::WEBSOCKET_REQUEST_DURATION_METRIC;
+use crate::metrics::SSE_EVENT_COUNT_METRIC;
+use crate::metrics::SSE_EVENT_DURATION_METRIC;
+use crate::metrics::STARTUP_PHASE_DURATION_METRIC;
+use crate::metrics::SessionMetricTagValues;
+use crate::metrics::TOOL_CALL_COUNT_METRIC;
+use crate::metrics::TOOL_CALL_DURATION_METRIC;
+use crate::metrics::TURN_TTFT_DURATION_METRIC;
+use crate::metrics::WEBSOCKET_EVENT_COUNT_METRIC;
+use crate::metrics::WEBSOCKET_EVENT_DURATION_METRIC;
+use crate::metrics::WEBSOCKET_REQUEST_COUNT_METRIC;
+use crate::metrics::WEBSOCKET_REQUEST_DURATION_METRIC;
 use crate::metrics::runtime_metrics::RuntimeMetricsSummary;
-use crate::metrics::tags::SessionMetricTagValues;
 use crate::metrics::timer::Timer;
 use crate::provider::OtelProvider;
 use crate::sanitize_metric_tag_value;
+use codex_api::AgentIdentityTelemetry;
 use codex_api::ApiError;
 use codex_api::ResponseEvent;
 use codex_protocol::ThreadId;
@@ -63,6 +67,12 @@ const RESPONSES_API_ENGINE_SERVICE_TTFT_FIELD: &str = "engine_service_ttft_total
 const RESPONSES_API_ENGINE_IAPI_TBT_FIELD: &str = "engine_iapi_tbt_across_engine_calls_ms";
 const RESPONSES_API_ENGINE_SERVICE_TBT_FIELD: &str = "engine_service_tbt_across_engine_calls_ms";
 
+fn trace_field_value<'a>(fields: &'a [(&str, &str)], key: &str) -> Option<&'a str> {
+    fields
+        .iter()
+        .find_map(|(field_key, value)| (*field_key == key).then_some(*value))
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuthEnvTelemetryMetadata {
     pub openai_api_key_env_present: bool,
@@ -85,6 +95,8 @@ pub struct SessionTelemetryMetadata {
     pub(crate) session_source: String,
     pub(crate) model: String,
     pub(crate) slug: String,
+    pub(crate) service_tier: Option<String>,
+    pub(crate) model_reasoning_effort: Option<String>,
     pub(crate) log_user_prompts: bool,
     pub(crate) app_version: &'static str,
     pub(crate) terminal_type: String,
@@ -106,6 +118,16 @@ impl SessionTelemetry {
     pub fn with_model(mut self, model: &str, slug: &str) -> Self {
         self.metadata.model = model.to_owned();
         self.metadata.slug = slug.to_owned();
+        self
+    }
+
+    pub fn with_inference_request(
+        mut self,
+        service_tier: Option<&str>,
+        model_reasoning_effort: Option<&ReasoningEffort>,
+    ) -> Self {
+        self.metadata.service_tier = service_tier.map(str::to_owned);
+        self.metadata.model_reasoning_effort = model_reasoning_effort.map(ToString::to_string);
         self
     }
 
@@ -181,6 +203,106 @@ impl SessionTelemetry {
         if let Err(e) = res {
             tracing::warn!("metrics duration [{name}] failed: {e}");
         }
+    }
+
+    /// Records a coarse startup phase for production latency breakdowns.
+    pub fn record_startup_phase(
+        &self,
+        phase: &'static str,
+        duration: Duration,
+        status: Option<&'static str>,
+    ) {
+        let tags = match status {
+            Some(status) => vec![("phase", phase), ("status", status)],
+            None => vec![("phase", phase)],
+        };
+        self.record_duration(STARTUP_PHASE_DURATION_METRIC, duration, &tags);
+        log_and_trace_event!(
+            self,
+            common: {
+                event.name = "codex.startup_phase",
+                startup.phase = phase,
+                startup.status = status,
+                duration_ms = %duration.as_millis(),
+            },
+            log: {},
+            trace: {},
+        );
+    }
+
+    /// Records time to first token as both a metric and a production telemetry event.
+    pub fn record_turn_ttft(&self, duration: Duration) {
+        self.record_duration(TURN_TTFT_DURATION_METRIC, duration, &[]);
+        log_and_trace_event!(
+            self,
+            common: {
+                event.name = "codex.turn_ttft",
+                duration_ms = %duration.as_millis(),
+            },
+            log: {},
+            trace: {},
+        );
+    }
+
+    /// Records the moment a plugin or connector install elicitation is dispatched.
+    pub fn record_plugin_install_elicitation_sent(
+        &self,
+        tool_type: &str,
+        tool_id: &str,
+        tool_name: &str,
+    ) {
+        self.counter(
+            PLUGIN_INSTALL_ELICITATION_SENT_METRIC,
+            /*inc*/ 1,
+            &[("tool_type", tool_type)],
+        );
+        log_and_trace_event!(
+            self,
+            common: {
+                event.name = "codex.plugin_install_elicitation_sent",
+                plugin_install.tool_type = tool_type,
+                plugin_install.tool_id = tool_id,
+                plugin_install.tool_name = tool_name,
+            },
+            log: {},
+            trace: {},
+        );
+    }
+
+    /// Records the outcome of a surfaced plugin or connector install suggestion.
+    pub fn record_plugin_install_suggestion(
+        &self,
+        tool_type: &str,
+        tool_id: &str,
+        tool_name: &str,
+        response_action: &str,
+        user_confirmed: bool,
+        completed: bool,
+    ) {
+        let completed_tag = if completed { "true" } else { "false" };
+        self.counter(
+            PLUGIN_INSTALL_SUGGESTION_METRIC,
+            /*inc*/ 1,
+            &[
+                ("tool_type", tool_type),
+                ("response_action", response_action),
+                ("completed", completed_tag),
+            ],
+        );
+        log_and_trace_event!(
+            self,
+            common: {
+                event.name = "codex.plugin_install_suggestion",
+                plugin_install.tool_type = tool_type,
+                plugin_install.tool_id = tool_id,
+                plugin_install.tool_name = tool_name,
+                plugin_install.response_action = response_action,
+                plugin_install.user_confirmed = user_confirmed,
+                plugin_install.completed = completed,
+            },
+            log: {},
+            trace: {},
+        );
     }
 
     pub fn start_timer(&self, name: &str, tags: &[(&str, &str)]) -> Result<Timer, MetricsError> {
@@ -280,6 +402,8 @@ impl SessionTelemetry {
                 session_source: session_source.to_string(),
                 model: model.to_owned(),
                 slug: slug.to_owned(),
+                service_tier: None,
+                model_reasoning_effort: None,
                 log_user_prompts,
                 app_version: env!("CARGO_PKG_VERSION"),
                 terminal_type,
@@ -305,6 +429,23 @@ impl SessionTelemetry {
                     handle_responses_span.record("tool_name", name.as_str());
                 }
             }
+            ResponseEvent::Completed {
+                token_usage: Some(token_usage),
+                ..
+            } => {
+                handle_responses_span.record("gen_ai.usage.input_tokens", token_usage.input_tokens);
+                handle_responses_span.record(
+                    "gen_ai.usage.cache_read.input_tokens",
+                    token_usage.cached_input(),
+                );
+                handle_responses_span
+                    .record("gen_ai.usage.output_tokens", token_usage.output_tokens);
+                handle_responses_span.record(
+                    "codex.usage.reasoning_output_tokens",
+                    token_usage.reasoning_output_tokens,
+                );
+                handle_responses_span.record("codex.usage.total_tokens", token_usage.total_tokens);
+            }
             _ => {}
         }
     }
@@ -320,11 +461,7 @@ impl SessionTelemetry {
         approval_policy: AskForApproval,
         sandbox_policy: SandboxPolicy,
         mcp_servers: Vec<&str>,
-        active_profile: Option<String>,
     ) {
-        if active_profile.is_some() {
-            self.counter(PROFILE_USAGE_METRIC, /*inc*/ 1, &[]);
-        }
         log_and_trace_event!(
             self,
             common: {
@@ -336,7 +473,7 @@ impl SessionTelemetry {
                 auth.env_provider_key_name = self.metadata.auth_env.provider_env_key_name.as_deref(),
                 auth.env_provider_key_present = self.metadata.auth_env.provider_env_key_present,
                 auth.env_refresh_token_url_override_present = self.metadata.auth_env.refresh_token_url_override_present,
-                reasoning_effort = reasoning_effort.map(|e| e.to_string()),
+                reasoning_effort = reasoning_effort.as_ref().map(ToString::to_string),
                 reasoning_summary = %reasoning_summary,
                 context_window = context_window,
                 auto_compact_token_limit = auto_compact_token_limit,
@@ -345,11 +482,9 @@ impl SessionTelemetry {
             },
             log: {
                 mcp_servers = mcp_servers.join(", "),
-                active_profile = active_profile,
             },
             trace: {
                 mcp_server_count = mcp_servers.len() as i64,
-                active_profile_present = active_profile.is_some(),
             },
         );
     }
@@ -382,6 +517,7 @@ impl SessionTelemetry {
             /*cf_ray*/ None,
             /*auth_error*/ None,
             /*auth_error_code*/ None,
+            /*agent_identity_telemetry*/ None,
         );
 
         response
@@ -404,6 +540,7 @@ impl SessionTelemetry {
         cf_ray: Option<&str>,
         auth_error: Option<&str>,
         auth_error_code: Option<&str>,
+        agent_identity_telemetry: Option<&AgentIdentityTelemetry>,
     ) {
         let success = status.is_some_and(|code| (200..=299).contains(&code)) && error.is_none();
         let success_str = if success { "true" } else { "false" };
@@ -444,6 +581,8 @@ impl SessionTelemetry {
                 auth.cf_ray = cf_ray,
                 auth.error = auth_error,
                 auth.error_code = auth_error_code,
+                auth.agent_id = agent_identity_telemetry.map(|metadata| metadata.agent_id.as_str()),
+                auth.task_id = agent_identity_telemetry.map(|metadata| metadata.task_id.as_str()),
             },
             log: {},
             trace: {},
@@ -467,6 +606,7 @@ impl SessionTelemetry {
         cf_ray: Option<&str>,
         auth_error: Option<&str>,
         auth_error_code: Option<&str>,
+        agent_identity_telemetry: Option<&AgentIdentityTelemetry>,
     ) {
         let success = error.is_none()
             && status
@@ -498,6 +638,8 @@ impl SessionTelemetry {
                 auth.cf_ray = cf_ray,
                 auth.error = auth_error,
                 auth.error_code = auth_error_code,
+                auth.agent_id = agent_identity_telemetry.map(|metadata| metadata.agent_id.as_str()),
+                auth.task_id = agent_identity_telemetry.map(|metadata| metadata.task_id.as_str()),
             },
             log: {},
             trace: {},
@@ -509,6 +651,7 @@ impl SessionTelemetry {
         duration: Duration,
         error: Option<&str>,
         connection_reused: bool,
+        agent_identity_telemetry: Option<&AgentIdentityTelemetry>,
     ) {
         let success_str = if error.is_none() { "true" } else { "false" };
         self.counter(
@@ -535,6 +678,8 @@ impl SessionTelemetry {
                 auth.env_provider_key_present = self.metadata.auth_env.provider_env_key_present,
                 auth.env_refresh_token_url_override_present = self.metadata.auth_env.refresh_token_url_override_present,
                 auth.connection_reused = connection_reused,
+                auth.agent_id = agent_identity_telemetry.map(|metadata| metadata.agent_id.as_str()),
+                auth.task_id = agent_identity_telemetry.map(|metadata| metadata.task_id.as_str()),
             },
             log: {},
             trace: {},
@@ -587,7 +732,6 @@ impl SessionTelemetry {
         duration: Duration,
     ) {
         let mut kind = None;
-        let mut error_message = None;
         let mut success = true;
 
         match result {
@@ -604,49 +748,26 @@ impl SessionTelemetry {
                             }
                             if kind.as_deref() == Some("response.failed") {
                                 success = false;
-                                error_message = value
-                                    .get("response")
-                                    .and_then(|value| value.get("error"))
-                                    .map(serde_json::Value::to_string)
-                                    .or_else(|| Some("response.failed event received".to_string()));
                             }
                         }
-                        Err(err) => {
+                        Err(_) => {
                             kind = Some("parse_error".to_string());
-                            error_message = Some(err.to_string());
                             success = false;
                         }
                     }
-                }
-                tokio_tungstenite::tungstenite::Message::Binary(_) => {
-                    success = false;
-                    error_message = Some("unexpected binary websocket event".to_string());
                 }
                 tokio_tungstenite::tungstenite::Message::Ping(_)
                 | tokio_tungstenite::tungstenite::Message::Pong(_) => {
                     return;
                 }
-                tokio_tungstenite::tungstenite::Message::Close(_) => {
+                tokio_tungstenite::tungstenite::Message::Binary(_)
+                | tokio_tungstenite::tungstenite::Message::Close(_)
+                | tokio_tungstenite::tungstenite::Message::Frame(_) => {
                     success = false;
-                    error_message =
-                        Some("websocket closed by server before response.completed".to_string());
-                }
-                tokio_tungstenite::tungstenite::Message::Frame(_) => {
-                    success = false;
-                    error_message = Some("unexpected websocket frame".to_string());
                 }
             },
-            Ok(Some(Err(err))) => {
+            Ok(Some(Err(_))) | Ok(None) | Err(_) => {
                 success = false;
-                error_message = Some(err.to_string());
-            }
-            Ok(None) => {
-                success = false;
-                error_message = Some("stream closed before response.completed".to_string());
-            }
-            Err(err) => {
-                success = false;
-                error_message = Some(err.to_string());
             }
         }
 
@@ -655,18 +776,6 @@ impl SessionTelemetry {
         let tags = [("kind", kind_str), ("success", success_str)];
         self.counter(WEBSOCKET_EVENT_COUNT_METRIC, /*inc*/ 1, &tags);
         self.record_duration(WEBSOCKET_EVENT_DURATION_METRIC, duration, &tags);
-        log_and_trace_event!(
-            self,
-            common: {
-                event.name = "codex.websocket_event",
-                event.kind = %kind_str,
-                duration_ms = %duration.as_millis(),
-                success = success_str,
-                error.message = error_message.as_deref(),
-            },
-            log: {},
-            trace: {},
-        );
     }
 
     pub fn log_sse_event<E>(
@@ -801,6 +910,7 @@ impl SessionTelemetry {
         cached_token_count: Option<i64>,
         reasoning_token_count: Option<i64>,
         tool_token_count: i64,
+        ttft_ms: Option<i64>,
     ) {
         log_and_trace_event!(
             self,
@@ -812,6 +922,9 @@ impl SessionTelemetry {
                 cached_token_count = cached_token_count,
                 reasoning_token_count = reasoning_token_count,
                 tool_token_count = %tool_token_count,
+                ttft_ms = ttft_ms,
+                service_tier = self.metadata.service_tier.as_deref(),
+                model_reasoning_effort = self.metadata.model_reasoning_effort.as_deref(),
             },
             log: {},
             trace: {},
@@ -878,6 +991,37 @@ impl SessionTelemetry {
         );
     }
 
+    pub fn sandbox_outcome(
+        &self,
+        tool_name: &str,
+        call_id: &str,
+        outcome: &str,
+        initial_duration: Duration,
+        escalated_duration: Option<Duration>,
+    ) {
+        let initial_duration_ms = initial_duration.as_millis().min(i64::MAX as u128) as i64;
+        let escalated_duration_ms =
+            escalated_duration.map(|duration| duration.as_millis().min(i64::MAX as u128) as i64);
+        log_event!(
+            self,
+            event.name = "codex.sandbox_outcome",
+            tool_name = %tool_name,
+            call_id = %call_id,
+            outcome = %outcome,
+            initial_duration_ms = initial_duration_ms,
+            escalated_duration_ms = escalated_duration_ms,
+        );
+        trace_event!(
+            self,
+            event.name = "codex.sandbox_outcome",
+            tool_name = %tool_name,
+            call_id = %call_id,
+            outcome = %outcome,
+            initial_duration_ms = initial_duration_ms,
+            escalated_duration_ms = escalated_duration_ms,
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn log_tool_result_with_tags<F, Fut, E>(
         &self,
@@ -885,8 +1029,7 @@ impl SessionTelemetry {
         call_id: &str,
         arguments: &str,
         extra_tags: &[(&str, &str)],
-        mcp_server: Option<&str>,
-        mcp_server_origin: Option<&str>,
+        extra_trace_fields: &[(&str, &str)],
         f: F,
     ) -> Result<(String, bool), E>
     where
@@ -911,8 +1054,7 @@ impl SessionTelemetry {
             success,
             output.as_ref(),
             extra_tags,
-            mcp_server,
-            mcp_server_origin,
+            extra_trace_fields,
         );
 
         result
@@ -952,8 +1094,7 @@ impl SessionTelemetry {
         success: bool,
         output: &str,
         extra_tags: &[(&str, &str)],
-        mcp_server: Option<&str>,
-        mcp_server_origin: Option<&str>,
+        extra_trace_fields: &[(&str, &str)],
     ) {
         let success_str = if success { "true" } else { "false" };
         let mut tags = Vec::with_capacity(2 + extra_tags.len());
@@ -962,8 +1103,9 @@ impl SessionTelemetry {
         tags.extend_from_slice(extra_tags);
         self.counter(TOOL_CALL_COUNT_METRIC, /*inc*/ 1, &tags);
         self.record_duration(TOOL_CALL_DURATION_METRIC, duration, &tags);
-        let mcp_server = mcp_server.unwrap_or("");
-        let mcp_server_origin = mcp_server_origin.unwrap_or("");
+        let mcp_server = trace_field_value(extra_trace_fields, "mcp_server").unwrap_or("");
+        let mcp_server_origin =
+            trace_field_value(extra_trace_fields, "mcp_server_origin").unwrap_or("");
         log_event!(
             self,
             event.name = "codex.tool_result",
@@ -1051,12 +1193,17 @@ impl SessionTelemetry {
             }
             ResponseEvent::Completed { .. } => "completed".into(),
             ResponseEvent::OutputTextDelta(_) => "text_delta".into(),
+            ResponseEvent::ToolCallInputDelta { .. } => "tool_input_delta".into(),
             ResponseEvent::ReasoningSummaryDelta { .. } => "reasoning_summary_delta".into(),
+            ResponseEvent::ReasoningSummaryDone { .. } => "reasoning_summary_done".into(),
             ResponseEvent::ReasoningContentDelta { .. } => "reasoning_content_delta".into(),
             ResponseEvent::ReasoningSummaryPartAdded { .. } => {
                 "reasoning_summary_part_added".into()
             }
             ResponseEvent::ServerModel(_) => "server_model".into(),
+            ResponseEvent::ModelVerifications(_) => "model_verifications".into(),
+            ResponseEvent::TurnModerationMetadata(_) => "turn_moderation_metadata".into(),
+            ResponseEvent::SafetyBuffering(_) => "safety_buffering".into(),
             ResponseEvent::ServerReasoningIncluded(_) => "server_reasoning_included".into(),
             ResponseEvent::RateLimits(_) => "rate_limits".into(),
             ResponseEvent::ModelsEtag(_) => "models_etag".into(),
@@ -1065,7 +1212,9 @@ impl SessionTelemetry {
 
     fn responses_item_type(item: &ResponseItem) -> String {
         match item {
+            ResponseItem::AdditionalTools { .. } => "additional_tools".into(),
             ResponseItem::Message { role, .. } => format!("message_from_{role}"),
+            ResponseItem::AgentMessage { .. } => "agent_message".into(),
             ResponseItem::Reasoning { .. } => "reasoning".into(),
             ResponseItem::LocalShellCall { .. } => "local_shell_call".into(),
             ResponseItem::FunctionCall { .. } => "function_call".into(),
@@ -1076,8 +1225,9 @@ impl SessionTelemetry {
             ResponseItem::CustomToolCallOutput { .. } => "custom_tool_call_output".into(),
             ResponseItem::WebSearchCall { .. } => "web_search_call".into(),
             ResponseItem::ImageGenerationCall { .. } => "image_generation_call".into(),
-            ResponseItem::GhostSnapshot { .. } => "ghost_snapshot".into(),
             ResponseItem::Compaction { .. } => "compaction".into(),
+            ResponseItem::CompactionTrigger { .. } => "compaction_trigger".into(),
+            ResponseItem::ContextCompaction { .. } => "context_compaction".into(),
             ResponseItem::Other => "other".into(),
         }
     }

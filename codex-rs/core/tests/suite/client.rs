@@ -1,18 +1,23 @@
+use codex_config::ConfigLayerStack;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::ModelClient;
 use codex_core::NewThread;
 use codex_core::Prompt;
 use codex_core::ResponseEvent;
 use codex_core::ThreadManager;
+use codex_core::resolve_installation_id;
+use codex_core::thread_store_from_config;
+use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
+use codex_login::AuthKeyringBackendKind;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
+use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_login::default_client::originator;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_model_provider_info::built_in_model_providers;
 use codex_models_manager::bundled_models_response;
-use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_otel::SessionTelemetry;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::ThreadId;
@@ -24,6 +29,7 @@ use codex_protocol::config_types::Settings;
 use codex_protocol::config_types::Verbosity;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
@@ -45,11 +51,14 @@ use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::user_input::UserInput;
 use core_test_support::PathBufExt;
+use core_test_support::TestCodexResponsesRequestKind;
 use core_test_support::apps_test_server::AppsTestServer;
 use core_test_support::load_default_config_for_test;
 use core_test_support::responses::ResponsesRequest;
+use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_completed_with_tokens;
+use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_message_item_added;
 use core_test_support::responses::ev_output_text_delta;
 use core_test_support::responses::ev_response_created;
@@ -58,8 +67,11 @@ use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::sse_failed;
+use core_test_support::responses::strip_metadata_from_json;
+use core_test_support::responses_metadata as test_responses_metadata;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
+use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use dunce::canonicalize as normalize_path;
@@ -70,6 +82,7 @@ use std::io::Write;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use tempfile::TempDir;
+use toml::toml;
 use uuid::Uuid;
 use wiremock::Mock;
 use wiremock::MockServer;
@@ -80,6 +93,27 @@ use wiremock::matchers::header_regex;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 use wiremock::matchers::query_param;
+
+const INSTALLATION_ID_FILENAME: &str = "installation_id";
+const TEST_WINDOW_ID: &str = "test-thread:0";
+const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+fn test_turn_responses_metadata(
+    _client: &ModelClient,
+    thread_id: ThreadId,
+) -> codex_core::CodexResponsesMetadata {
+    let thread_id = thread_id.to_string();
+    test_responses_metadata(
+        TEST_INSTALLATION_ID,
+        &thread_id,
+        &thread_id,
+        /*turn_id*/ None,
+        TEST_WINDOW_ID.to_string(),
+        &SessionSource::Exec,
+        /*parent_thread_id*/ None,
+        TestCodexResponsesRequestKind::Turn,
+    )
+}
 
 #[expect(clippy::unwrap_used)]
 fn assert_message_role(request_body: &serde_json::Value, role: &str) {
@@ -101,6 +135,390 @@ fn message_input_text_contains(request: &ResponsesRequest, role: &str, needle: &
         .message_input_texts(role)
         .iter()
         .any(|text| text.contains(needle))
+}
+
+fn response_message_item_id(request: &ResponsesRequest, role: &str, text: &str) -> String {
+    request
+        .inputs_of_type("message")
+        .into_iter()
+        .find(|item| {
+            item.get("role").and_then(serde_json::Value::as_str) == Some(role)
+                && message_input_texts(item).contains(&text)
+        })
+        .and_then(|item| {
+            item.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| panic!("missing item ID for {role} message {text:?}"))
+}
+
+fn assert_codex_client_metadata(
+    request_body: &serde_json::Value,
+    installation_id: &str,
+    session_id: &str,
+    thread_id: &str,
+) {
+    let client_metadata = &request_body["client_metadata"];
+    assert_eq!(
+        client_metadata["x-codex-installation-id"].as_str(),
+        Some(installation_id)
+    );
+    assert_eq!(client_metadata["session_id"].as_str(), Some(session_id));
+    assert_eq!(client_metadata["thread_id"].as_str(), Some(thread_id));
+    let turn_metadata_str = client_metadata["x-codex-turn-metadata"]
+        .as_str()
+        .expect("missing x-codex-turn-metadata client metadata");
+    let turn_metadata = serde_json::from_str::<serde_json::Value>(turn_metadata_str)
+        .expect("invalid x-codex-turn-metadata json");
+    assert_eq!(
+        turn_metadata["installation_id"].as_str(),
+        Some(installation_id)
+    );
+    assert_eq!(turn_metadata["session_id"].as_str(), Some(session_id));
+    assert_eq!(turn_metadata["thread_id"].as_str(), Some(thread_id));
+    assert_eq!(
+        client_metadata["turn_id"].as_str(),
+        turn_metadata["turn_id"].as_str()
+    );
+    assert_eq!(
+        client_metadata["x-codex-window-id"].as_str(),
+        turn_metadata["window_id"].as_str()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn openai_stateless_responses_requests_preserve_item_turn_metadata_across_turns() {
+    let server = MockServer::start().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp1"),
+                ev_assistant_message("msg-1", "first answer"),
+                ev_completed("resp1"),
+            ]),
+            sse(vec![ev_response_created("resp2"), ev_completed("resp2")]),
+        ],
+    )
+    .await;
+    let test = test_codex().build(&server).await.unwrap();
+
+    test.submit_turn("turn one").await.unwrap();
+    test.submit_turn("turn two").await.unwrap();
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 2);
+    let first = requests[0].body_json();
+    let second = requests[1].body_json();
+    let first_turn_id = first["client_metadata"]["turn_id"]
+        .as_str()
+        .expect("first request should include turn id");
+    let second_turn_id = second["client_metadata"]["turn_id"]
+        .as_str()
+        .expect("second request should include turn id");
+    assert_ne!(first_turn_id, second_turn_id);
+
+    let first_input = first["input"].as_array().expect("first input");
+    let second_input = second["input"].as_array().expect("second input");
+    assert_eq!(&second_input[..first_input.len()], first_input.as_slice());
+    for item in first_input {
+        assert_eq!(
+            item["internal_chat_message_metadata_passthrough"]["turn_id"].as_str(),
+            Some(first_turn_id)
+        );
+    }
+
+    let item_turn_id = |text: &str| {
+        second_input
+            .iter()
+            .find(|item| {
+                item["content"].as_array().is_some_and(|content| {
+                    content
+                        .iter()
+                        .any(|content_item| content_item["text"].as_str() == Some(text))
+                })
+            })
+            .and_then(|item| item["internal_chat_message_metadata_passthrough"]["turn_id"].as_str())
+    };
+    assert_eq!(item_turn_id("turn one"), Some(first_turn_id));
+    assert_eq!(item_turn_id("first answer"), Some(first_turn_id));
+    assert_eq!(item_turn_id("turn two"), Some(second_turn_id));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_openai_responses_requests_omit_item_passthrough_metadata() {
+    let server = MockServer::start().await;
+    let response_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
+    let mut provider =
+        built_in_model_providers(/* openai_base_url */ /*openai_base_url*/ None)["openai"].clone();
+    provider.name = "Test Responses".to_string();
+    provider.base_url = Some(format!("{}/v1", server.uri()));
+    provider.supports_websockets = false;
+    let codex = test_codex()
+        .with_config(move |config| {
+            config.model_provider_id = provider.name.clone();
+            config.model_provider = provider;
+        })
+        .build(&server)
+        .await
+        .unwrap()
+        .codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "hello".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .unwrap();
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let body = response_mock.single_request().body_json();
+    let input = body["input"]
+        .as_array()
+        .expect("request should include input items");
+    assert!(!input.is_empty(), "request should include input items");
+    for item in input {
+        assert!(
+            item.get("internal_chat_message_metadata_passthrough")
+                .is_none(),
+            "input item should omit internal chat message metadata passthrough: {item}"
+        );
+        assert!(
+            item.get("id").is_none(),
+            "input item should omit generated IDs: {item}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_item_ids_persist_across_resume_and_preserve_server_ids() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_assistant_message("msg_server", "first reply"),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+        ],
+    )
+    .await;
+    let mut builder = test_codex().with_config(|config| {
+        let _ = config.features.enable(Feature::ItemIds);
+    });
+    let initial = builder.build(&server).await?;
+    let home = Arc::clone(&initial.home);
+    let rollout_path = initial
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+
+    initial.submit_turn("before resume").await?;
+    initial.codex.submit(Op::Shutdown).await?;
+    wait_for_event(&initial.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
+
+    builder = builder.with_config(|config| {
+        let _ = config.features.enable(Feature::ItemIds);
+    });
+    let resumed = builder.resume(&server, home, rollout_path).await?;
+    resumed.submit_turn("after resume").await?;
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 2);
+    let user_id = response_message_item_id(&requests[0], "user", "before resume");
+    let user_uuid = user_id
+        .strip_prefix("msg_")
+        .expect("message ID should have the Responses API prefix");
+    assert_eq!(
+        Uuid::parse_str(user_uuid)?.get_version(),
+        Some(uuid::Version::SortRand)
+    );
+    assert_eq!(
+        response_message_item_id(&requests[1], "user", "before resume"),
+        user_id
+    );
+    assert_eq!(
+        response_message_item_id(&requests[1], "assistant", "first reply"),
+        "msg_server"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn synthetic_call_output_id_is_stable_across_resumes() -> anyhow::Result<()> {
+    let function_call_id = "missing-output-call";
+    let thread_id = ThreadId::default();
+    let rollout = vec![
+        RolloutLine {
+            timestamp: "2024-01-01T00:00:00.000Z".to_string(),
+            item: RolloutItem::SessionMeta(SessionMetaLine {
+                meta: SessionMeta {
+                    session_id: thread_id.into(),
+                    id: thread_id,
+                    parent_thread_id: None,
+                    timestamp: "2024-01-01T00:00:00Z".to_string(),
+                    cwd: ".".into(),
+                    originator: "test_originator".to_string(),
+                    cli_version: "test_version".to_string(),
+                    model_provider: Some("test-provider".to_string()),
+                    ..Default::default()
+                },
+                git: None,
+            }),
+        },
+        RolloutLine {
+            timestamp: "2024-01-01T00:00:01.000Z".to_string(),
+            item: RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+                id: Some("fc_existing".to_string()),
+                name: "do_it".to_string(),
+                namespace: None,
+                arguments: "{}".to_string(),
+                call_id: function_call_id.to_string(),
+                internal_chat_message_metadata_passthrough: None,
+            }),
+        },
+    ];
+    let tmpdir = TempDir::new()?;
+    let session_path = tmpdir.path().join("normalized-call-output-item-id.jsonl");
+    let mut file = std::fs::File::create(&session_path)?;
+    for line in rollout {
+        writeln!(file, "{}", serde_json::to_string(&line)?)?;
+    }
+
+    let server = MockServer::start().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+            sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+        ],
+    )
+    .await;
+    let codex_home = Arc::new(TempDir::new()?);
+    let mut builder = test_codex().with_config(|config| {
+        let _ = config.features.enable(Feature::ItemIds);
+    });
+    let first = builder
+        .resume(&server, Arc::clone(&codex_home), session_path.clone())
+        .await?;
+
+    first.submit_turn("first resume").await?;
+    first.codex.submit(Op::Shutdown).await?;
+    wait_for_event(&first.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
+    assert!(
+        !std::fs::read_to_string(&session_path)?.contains("\"type\":\"function_call_output\""),
+        "prompt-only repair should not be persisted to the rollout"
+    );
+
+    builder = builder.with_config(|config| {
+        let _ = config.features.enable(Feature::ItemIds);
+    });
+    let second = builder.resume(&server, codex_home, session_path).await?;
+    second.submit_turn("second resume").await?;
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 2);
+    let first_output = requests[0].function_call_output(function_call_id);
+    let first_output_id = first_output
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .expect("reconstructed output should have an item ID")
+        .to_string();
+    let first_output_uuid = first_output_id
+        .strip_prefix("fco_")
+        .expect("synthetic output should use the Responses API prefix");
+    assert_eq!(
+        Uuid::parse_str(first_output_uuid)?.get_version(),
+        Some(uuid::Version::Sha1)
+    );
+    assert_eq!(
+        requests[1]
+            .function_call_output(function_call_id)
+            .get("id")
+            .and_then(serde_json::Value::as_str),
+        Some(first_output_id.as_str())
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_item_ids_are_sent_for_all_remote_v2_compaction_requests() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+            sse(vec![
+                json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "compaction",
+                        "encrypted_content": "ENCRYPTED_CONTEXT_COMPACTION_SUMMARY",
+                    }
+                }),
+                ev_completed("resp-compact"),
+            ]),
+            sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+        ],
+    )
+    .await;
+    let test = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(|config| {
+            let _ = config.features.enable(Feature::ItemIds);
+            let _ = config.features.enable(Feature::RemoteCompactionV2);
+        })
+        .build(&server)
+        .await?;
+
+    test.submit_turn("before compaction").await?;
+    test.codex.submit(Op::Compact).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    test.submit_turn("after compaction").await?;
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 3);
+    for (request_index, request) in requests.iter().enumerate() {
+        let input = request.input();
+        assert!(!input.is_empty(), "request {request_index} input is empty");
+        for item in input {
+            if item.get("type").and_then(serde_json::Value::as_str) == Some("compaction_trigger") {
+                continue;
+            }
+            assert!(
+                item.get("id").and_then(serde_json::Value::as_str).is_some(),
+                "request {request_index} item should have an ID: {item:#?}"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Writes an `auth.json` into the provided `codex_home` with the specified parameters.
@@ -232,22 +650,17 @@ move /y tokens.next tokens.txt >nul
         ModelProviderAuthInfo {
             command: self.command.clone(),
             args: self.args.clone(),
-            // Match the provider-auth default to avoid brittle shell-startup timing in CI.
+            // Match the model-provider default to avoid brittle shell-startup timing in CI.
             timeout_ms: non_zero_u64(/*value*/ 5_000),
             refresh_interval_ms: 60_000,
-            cwd: match codex_utils_absolute_path::AbsolutePathBuf::try_from(self.tempdir.path()) {
-                Ok(cwd) => cwd,
-                Err(err) => panic!("tempdir should be absolute: {err}"),
-            },
+            cwd: codex_utils_absolute_path::AbsolutePathBuf::try_from(self.tempdir.path())
+                .expect("tempdir should be absolute"),
         }
     }
 }
 
 fn non_zero_u64(value: u64) -> NonZeroU64 {
-    match NonZeroU64::new(value) {
-        Some(value) => value,
-        None => panic!("expected non-zero value: {value}"),
-    }
+    NonZeroU64::new(value).expect("expected non-zero value")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -266,6 +679,7 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
             "timestamp": "2024-01-01T00:00:00.000Z",
             "type": "session_meta",
             "payload": {
+                "session_id": convo_id,
                 "id": convo_id,
                 "timestamp": "2024-01-01T00:00:00Z",
                 "instructions": "be nice",
@@ -285,8 +699,8 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
         content: vec![codex_protocol::models::ContentItem::InputText {
             text: "resumed user message".to_string(),
         }],
-        end_turn: None,
         phase: None,
+        internal_chat_message_metadata_passthrough: None,
     };
     let prior_user_json = serde_json::to_value(&prior_user).unwrap();
     writeln!(
@@ -307,8 +721,8 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
         content: vec![codex_protocol::models::ContentItem::OutputText {
             text: "resumed system instruction".to_string(),
         }],
-        end_turn: None,
         phase: None,
+        internal_chat_message_metadata_passthrough: None,
     };
     let prior_system_json = serde_json::to_value(&prior_system).unwrap();
     writeln!(
@@ -329,8 +743,8 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
         content: vec![codex_protocol::models::ContentItem::OutputText {
             text: "resumed assistant message".to_string(),
         }],
-        end_turn: None,
         phase: Some(MessagePhase::Commentary),
+        internal_chat_message_metadata_passthrough: None,
     };
     let prior_item_json = serde_json::to_value(&prior_item).unwrap();
     writeln!(
@@ -357,9 +771,8 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
     let codex_home = Arc::new(TempDir::new().unwrap());
     let mut builder = test_codex()
         .with_home(codex_home.clone())
-        .with_config(|config| {
-            // Ensure user instructions are NOT delivered on resume.
-            config.user_instructions = Some("be nice".to_string());
+        .with_pre_build_hook(|home| {
+            std::fs::write(home.join("AGENTS.md"), "be nice").expect("write global instructions");
         });
     let test = builder
         .resume(&server, codex_home, session_path.clone())
@@ -385,6 +798,9 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -438,7 +854,7 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
         .position(|(role, text)| {
             role == "user"
                 && text.contains("be nice")
-                && (text.starts_with("# AGENTS.md instructions for "))
+                && text.starts_with("# AGENTS.md instructions")
         })
         .expect("user instructions");
     let pos_environment = messages
@@ -470,15 +886,20 @@ async fn resume_replays_legacy_js_repl_image_rollout_shapes() {
         status: None,
         call_id: "legacy-js-call".to_string(),
         name: "js_repl".to_string(),
+        namespace: None,
         input: "console.log('legacy image flow')".to_string(),
+        internal_chat_message_metadata_passthrough: None,
     };
     let legacy_image_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+    let thread_id = ThreadId::default();
     let rollout = vec![
         RolloutLine {
             timestamp: "2024-01-01T00:00:00.000Z".to_string(),
             item: RolloutItem::SessionMeta(SessionMetaLine {
                 meta: SessionMeta {
-                    id: ThreadId::default(),
+                    session_id: thread_id.into(),
+                    id: thread_id,
+                    parent_thread_id: None,
                     timestamp: "2024-01-01T00:00:00Z".to_string(),
                     cwd: ".".into(),
                     originator: "test_originator".to_string(),
@@ -496,9 +917,11 @@ async fn resume_replays_legacy_js_repl_image_rollout_shapes() {
         RolloutLine {
             timestamp: "2024-01-01T00:00:02.000Z".to_string(),
             item: RolloutItem::ResponseItem(ResponseItem::CustomToolCallOutput {
+                id: None,
                 call_id: "legacy-js-call".to_string(),
                 name: None,
                 output: FunctionCallOutputPayload::from_text("legacy js_repl stdout".to_string()),
+                internal_chat_message_metadata_passthrough: None,
             }),
         },
         RolloutLine {
@@ -508,9 +931,10 @@ async fn resume_replays_legacy_js_repl_image_rollout_shapes() {
                 role: "user".to_string(),
                 content: vec![ContentItem::InputImage {
                     image_url: legacy_image_url.to_string(),
+                    detail: Some(DEFAULT_IMAGE_DETAIL),
                 }],
-                end_turn: None,
                 phase: None,
+                internal_chat_message_metadata_passthrough: None,
             }),
         },
     ];
@@ -532,7 +956,7 @@ async fn resume_replays_legacy_js_repl_image_rollout_shapes() {
     .await;
 
     let codex_home = Arc::new(TempDir::new().unwrap());
-    let mut builder = test_codex().with_model("gpt-5.1");
+    let mut builder = test_codex().with_model("gpt-5.4");
     let test = builder
         .resume(&server, codex_home, session_path.clone())
         .await
@@ -600,15 +1024,18 @@ async fn resume_replays_legacy_js_repl_image_rollout_shapes() {
 async fn resume_replays_image_tool_outputs_with_detail() {
     skip_if_no_network!();
 
-    let image_url = "data:image/webp;base64,UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEAAUAmJaACdLoB+AADsAD+8ut//NgVzXPv9//S4P0uD9Lg/9KQAAA=";
+    let image_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
     let function_call_id = "view-image-call";
     let custom_call_id = "js-repl-call";
+    let thread_id = ThreadId::default();
     let rollout = vec![
         RolloutLine {
             timestamp: "2024-01-01T00:00:00.000Z".to_string(),
             item: RolloutItem::SessionMeta(SessionMetaLine {
                 meta: SessionMeta {
-                    id: ThreadId::default(),
+                    session_id: thread_id.into(),
+                    id: thread_id,
+                    parent_thread_id: None,
                     timestamp: "2024-01-01T00:00:00Z".to_string(),
                     cwd: ".".into(),
                     originator: "test_originator".to_string(),
@@ -625,13 +1052,15 @@ async fn resume_replays_image_tool_outputs_with_detail() {
                 id: None,
                 name: "view_image".to_string(),
                 namespace: None,
-                arguments: "{\"path\":\"/tmp/example.webp\"}".to_string(),
+                arguments: "{\"path\":\"/tmp/example.png\"}".to_string(),
                 call_id: function_call_id.to_string(),
+                internal_chat_message_metadata_passthrough: None,
             }),
         },
         RolloutLine {
             timestamp: "2024-01-01T00:00:01.500Z".to_string(),
             item: RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+                id: None,
                 call_id: function_call_id.to_string(),
                 output: FunctionCallOutputPayload::from_content_items(vec![
                     FunctionCallOutputContentItem::InputImage {
@@ -639,6 +1068,7 @@ async fn resume_replays_image_tool_outputs_with_detail() {
                         detail: Some(ImageDetail::Original),
                     },
                 ]),
+                internal_chat_message_metadata_passthrough: None,
             }),
         },
         RolloutLine {
@@ -648,12 +1078,15 @@ async fn resume_replays_image_tool_outputs_with_detail() {
                 status: Some("completed".to_string()),
                 call_id: custom_call_id.to_string(),
                 name: "js_repl".to_string(),
+                namespace: None,
                 input: "console.log('image flow')".to_string(),
+                internal_chat_message_metadata_passthrough: None,
             }),
         },
         RolloutLine {
             timestamp: "2024-01-01T00:00:02.500Z".to_string(),
             item: RolloutItem::ResponseItem(ResponseItem::CustomToolCallOutput {
+                id: None,
                 call_id: custom_call_id.to_string(),
                 name: None,
                 output: FunctionCallOutputPayload::from_content_items(vec![
@@ -662,6 +1095,7 @@ async fn resume_replays_image_tool_outputs_with_detail() {
                         detail: Some(ImageDetail::Original),
                     },
                 ]),
+                internal_chat_message_metadata_passthrough: None,
             }),
         },
     ];
@@ -683,7 +1117,7 @@ async fn resume_replays_image_tool_outputs_with_detail() {
     .await;
 
     let codex_home = Arc::new(TempDir::new().unwrap());
-    let mut builder = test_codex().with_model("gpt-5.1");
+    let mut builder = test_codex().with_model("gpt-5.4");
     let test = builder
         .resume(&server, codex_home, session_path.clone())
         .await
@@ -720,7 +1154,7 @@ async fn resume_replays_image_tool_outputs_with_detail() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn includes_conversation_id_and_model_headers_in_request() {
+async fn includes_session_id_thread_id_and_model_headers_in_request() {
     skip_if_no_network!();
 
     // Mock server
@@ -738,7 +1172,8 @@ async fn includes_conversation_id_and_model_headers_in_request() {
         .await
         .expect("create new conversation");
     let codex = test.codex.clone();
-    let session_id = test.session_configured.session_id;
+    let expected_session_id = test.session_configured.session_id;
+    let expected_thread_id = test.session_configured.thread_id;
 
     codex
         .submit(Op::UserInput {
@@ -747,6 +1182,9 @@ async fn includes_conversation_id_and_model_headers_in_request() {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -755,15 +1193,33 @@ async fn includes_conversation_id_and_model_headers_in_request() {
 
     let request = resp_mock.single_request();
     assert_eq!(request.path(), "/v1/responses");
-    let request_session_id = request.header("session_id").expect("session_id header");
+    let request_session_id = request.header("session-id").expect("session-id header");
+    let request_thread_id = request.header("thread-id").expect("thread-id header");
     let request_authorization = request
         .header("authorization")
         .expect("authorization header");
     let request_originator = request.header("originator").expect("originator header");
+    let request_body = request.body_json();
+    let installation_id =
+        std::fs::read_to_string(test.codex_home_path().join(INSTALLATION_ID_FILENAME))
+            .expect("read installation id");
+    let session_id_string = expected_session_id.to_string();
+    let thread_id_string = expected_thread_id.to_string();
 
-    assert_eq!(request_session_id, session_id.to_string());
+    assert_eq!(request_session_id, session_id_string.as_str());
+    assert_eq!(request_thread_id, thread_id_string.as_str());
     assert_eq!(request_originator, originator().value);
     assert_eq!(request_authorization, "Bearer Test API Key");
+    assert_eq!(
+        request_body["prompt_cache_key"].as_str(),
+        Some(thread_id_string.as_str())
+    );
+    assert_codex_client_metadata(
+        &request_body,
+        installation_id.as_str(),
+        session_id_string.as_str(),
+        thread_id_string.as_str(),
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -818,7 +1274,7 @@ async fn provider_auth_command_refreshes_after_401() {
 ///
 /// The caller owns the server-side assertions, so this helper only validates that the request
 /// reaches `Completed` without surfacing an auth or transport error to the client.
-#[expect(clippy::expect_used, clippy::unwrap_used)]
+#[expect(clippy::unwrap_used)]
 async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuthInfo) {
     let provider = ModelProviderInfo {
         name: "corp".into(),
@@ -827,6 +1283,7 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
         env_key_instructions: None,
         experimental_bearer_token: None,
         auth: Some(auth),
+        aws: None,
         wire_api: WireApi::Responses,
         query_params: None,
         http_headers: None,
@@ -843,16 +1300,16 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
     let mut config = load_default_config_for_test(&codex_home).await;
     config.model_provider_id = provider.name.clone();
     config.model_provider = provider.clone();
-    let effort = config.model_reasoning_effort;
+    let effort = config.model_reasoning_effort.clone();
     let summary = config.model_reasoning_summary;
     let model = codex_core::test_support::get_model_offline(config.model.as_deref());
     config.model = Some(model.clone());
     let config = Arc::new(config);
     let model_info =
         codex_core::test_support::construct_model_info_offline(model.as_str(), &config);
-    let conversation_id = ThreadId::new();
+    let thread_id = ThreadId::new();
     let session_telemetry = SessionTelemetry::new(
-        conversation_id,
+        thread_id,
         model.as_str(),
         model_info.slug.as_str(),
         /*account_id*/ None,
@@ -867,14 +1324,24 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
         Some(AuthManager::from_auth_for_testing(CodexAuth::from_api_key(
             "unused-api-key",
         ))),
-        conversation_id,
+        AgentIdentityAuthPolicy::JwtOnly,
+        thread_id,
         provider,
         SessionSource::Exec,
+        "test_originator".to_string(),
         config.model_verbosity,
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
+        /*item_ids_enabled*/ config.features.enabled(Feature::ItemIds),
+        /*concurrent_reasoning_summaries_enabled*/
+        config
+            .features
+            .enabled(Feature::ConcurrentReasoningSummaries),
+        /*attestation_provider*/ None,
+        config.http_client_factory(),
     );
+    let responses_metadata = test_turn_responses_metadata(&client, thread_id);
     let mut client_session = client.new_session();
     let mut prompt = Prompt::default();
     prompt.input.push(ResponseItem::Message {
@@ -883,8 +1350,8 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
         content: vec![ContentItem::InputText {
             text: "hello".to_string(),
         }],
-        end_turn: None,
         phase: None,
+        internal_chat_message_metadata_passthrough: None,
     });
 
     let mut stream = client_session
@@ -895,7 +1362,8 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
             effort,
             summary.unwrap_or(ReasoningSummary::Auto),
             /*service_tier*/ None,
-            /*turn_metadata_header*/ None,
+            &responses_metadata,
+            &codex_rollout_trace::InferenceTraceContext::disabled(),
         )
         .await
         .expect("responses stream to start");
@@ -936,6 +1404,9 @@ async fn includes_base_instructions_override_in_request() {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -980,7 +1451,8 @@ async fn chatgpt_auth_sends_correct_request() {
         .await
         .expect("create new conversation");
     let codex = test.codex.clone();
-    let thread_id = test.session_configured.session_id;
+    let expected_session_id = test.session_configured.session_id;
+    let expected_thread_id = test.session_configured.thread_id;
 
     codex
         .submit(Op::UserInput {
@@ -989,6 +1461,9 @@ async fn chatgpt_auth_sends_correct_request() {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -1006,12 +1481,25 @@ async fn chatgpt_auth_sends_correct_request() {
         .expect("chatgpt-account-id header");
     let request_body = request.body_json();
 
-    let session_id = request.header("session_id").expect("session_id header");
-    assert_eq!(session_id, thread_id.to_string());
+    let request_session_id = request.header("session-id").expect("session-id header");
+    let request_thread_id = request.header("thread-id").expect("thread-id header");
+    let installation_id =
+        std::fs::read_to_string(test.codex_home_path().join(INSTALLATION_ID_FILENAME))
+            .expect("read installation id");
+    let session_id_string = expected_session_id.to_string();
+    let thread_id_string = expected_thread_id.to_string();
+    assert_eq!(request_session_id, session_id_string.as_str());
+    assert_eq!(request_thread_id, thread_id_string.as_str());
 
     assert_eq!(request_originator, originator().value);
     assert_eq!(request_authorization, "Bearer Access Token");
     assert_eq!(request_chatgpt_account_id, "account_id");
+    assert_codex_client_metadata(
+        &request_body,
+        installation_id.as_str(),
+        session_id_string.as_str(),
+        thread_id_string.as_str(),
+    );
     assert!(request_body["stream"].as_bool().unwrap());
     assert_eq!(
         request_body["include"][0].as_str().unwrap(),
@@ -1063,27 +1551,36 @@ async fn prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens() {
     let mut config = load_default_config_for_test(&codex_home).await;
     config.model_provider = model_provider;
 
-    let auth_manager =
-        match CodexAuth::from_auth_storage(codex_home.path(), AuthCredentialsStoreMode::File) {
-            Ok(Some(auth)) => codex_core::test_support::auth_manager_from_auth(auth),
-            Ok(None) => panic!("No CodexAuth found in codex_home"),
-            Err(e) => panic!("Failed to load CodexAuth: {e}"),
-        };
+    let auth = CodexAuth::from_auth_storage(
+        codex_home.path(),
+        AuthCredentialsStoreMode::File,
+        /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        /*auth_route_config*/ None,
+    )
+    .await
+    .expect("Failed to load CodexAuth")
+    .expect("No CodexAuth found in codex_home");
+    let auth_manager = codex_core::test_support::auth_manager_from_auth(auth);
+    let installation_id = resolve_installation_id(&config.codex_home)
+        .await
+        .expect("resolve installation id");
     let thread_manager = ThreadManager::new(
         &config,
         auth_manager,
         SessionSource::Exec,
-        CollaborationModesConfig {
-            default_mode_request_user_input: config
-                .features
-                .enabled(Feature::DefaultModeRequestUserInput),
-        },
-        Arc::new(codex_exec_server::EnvironmentManager::new(
-            /*exec_server_url*/ None,
-        )),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        empty_extension_registry(),
+        Arc::new(codex_core::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        thread_store_from_config(&config, /*state_db*/ None),
+        /*agent_graph_store*/ None,
+        installation_id,
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
     );
     let NewThread { thread: codex, .. } = thread_manager
-        .start_thread(config)
+        .start_thread(config.clone())
         .await
         .expect("create new conversation");
 
@@ -1094,6 +1591,9 @@ async fn prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens() {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -1114,8 +1614,8 @@ async fn includes_user_instructions_message_in_request() {
 
     let mut builder = test_codex()
         .with_auth(CodexAuth::from_api_key("Test API Key"))
-        .with_config(|config| {
-            config.user_instructions = Some("be nice".to_string());
+        .with_pre_build_hook(|home| {
+            std::fs::write(home.join("AGENTS.md"), "be nice").expect("write global instructions");
         });
     let codex = builder
         .build(&server)
@@ -1130,6 +1630,9 @@ async fn includes_user_instructions_message_in_request() {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -1159,7 +1662,7 @@ async fn includes_user_instructions_message_in_request() {
     assert!(
         user_context_texts
             .iter()
-            .any(|text| text.starts_with("# AGENTS.md instructions for ")),
+            .any(|text| text.starts_with("# AGENTS.md instructions")),
         "expected AGENTS text in contextual user message, got {user_context_texts:?}"
     );
     let ui_text = user_context_texts
@@ -1215,6 +1718,9 @@ async fn includes_apps_guidance_as_developer_message_for_chatgpt_auth() {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -1275,6 +1781,9 @@ async fn omits_apps_guidance_for_api_key_auth_even_when_feature_enabled() {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -1331,6 +1840,9 @@ async fn omits_apps_guidance_when_configured_off() {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -1342,6 +1854,123 @@ async fn omits_apps_guidance_when_configured_off() {
         !message_input_text_contains(&request, "developer", "<apps_instructions>"),
         "did not expect apps instructions when include_apps_instructions = false, got {:?}",
         request.body_json()["input"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn omits_apps_guidance_when_orchestrator_mcp_is_disabled() {
+    skip_if_no_network!();
+    let server = MockServer::start().await;
+    let apps_server = AppsTestServer::mount(&server)
+        .await
+        .expect("mount apps MCP mock");
+    let apps_base_url = apps_server.chatgpt_base_url.clone();
+
+    let list_call_id = "list-resources";
+    let read_call_id = "read-resource";
+    let resp_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp1"),
+                ev_function_call(list_call_id, "list_mcp_resources", "{}"),
+                ev_completed("resp1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp2"),
+                ev_function_call(
+                    read_call_id,
+                    "read_mcp_resource",
+                    &json!({
+                        "server": "codex_apps",
+                        "uri": "skill://demo/SKILL.md",
+                    })
+                    .to_string(),
+                ),
+                ev_completed("resp2"),
+            ]),
+            sse(vec![ev_response_created("resp3"), ev_completed("resp3")]),
+        ],
+    )
+    .await;
+
+    let mut builder = test_codex()
+        .with_auth(create_dummy_codex_auth())
+        .with_config(move |config| {
+            config
+                .features
+                .enable(Feature::Apps)
+                .expect("test config should allow feature update");
+            config.chatgpt_base_url = apps_base_url;
+            config.orchestrator_mcp_enabled = false;
+        });
+    let codex = builder
+        .build(&server)
+        .await
+        .expect("create new conversation")
+        .codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "hello".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = resp_mock.requests();
+    assert_eq!(requests.len(), 3);
+    let request = &requests[0];
+    assert!(
+        !message_input_text_contains(request, "developer", "<apps_instructions>"),
+        "did not expect apps instructions when orchestrator MCP is disabled, got {:?}",
+        request.body_json()["input"]
+    );
+    assert!(
+        !request.body_contains_text("mcp__codex_apps"),
+        "did not expect codex_apps MCP tools when orchestrator MCP is disabled, got {:?}",
+        request.body_json()["tools"]
+    );
+    let list_output = requests[1]
+        .function_call_output_text(list_call_id)
+        .expect("resource list output should be sent to the model");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&list_output)
+            .expect("parse resource list output"),
+        json!({"resources": []})
+    );
+    let read_output = requests[2]
+        .function_call_output_text(read_call_id)
+        .expect("resource read output should be sent to the model");
+    assert!(
+        read_output.contains("disabled by `orchestrator.mcp.enabled`"),
+        "unexpected resource read output: {read_output}"
+    );
+
+    let resource_methods = server
+        .received_requests()
+        .await
+        .expect("read recorded requests")
+        .into_iter()
+        .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
+        .filter_map(|body| {
+            body.get("method")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .filter(|method| method.starts_with("resources/"))
+        .collect::<Vec<_>>();
+    assert!(
+        resource_methods.is_empty(),
+        "did not expect codex_apps resource calls: {resource_methods:?}"
     );
 }
 
@@ -1370,6 +1999,9 @@ async fn omits_environment_context_when_configured_off() {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -1424,6 +2056,9 @@ async fn skills_append_to_developer_message() {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -1451,7 +2086,97 @@ async fn skills_append_to_developer_message() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn includes_configured_effort_in_request() -> anyhow::Result<()> {
+async fn skills_use_aliases_in_developer_message_under_budget_pressure() {
+    skip_if_no_network!();
+    let server = MockServer::start().await;
+
+    let resp_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
+
+    let codex_home_parent = TempDir::new().unwrap();
+    let long_home_parent = codex_home_parent
+        .path()
+        .join("codex-home-with-long-shared-prefix-for-skill-alias-budget-test");
+    std::fs::create_dir_all(&long_home_parent).expect("create long home parent");
+    let codex_home = Arc::new(TempDir::new_in(long_home_parent).unwrap());
+    let skill_root = codex_home.path().join("skills");
+    for index in 0..12 {
+        let skill_dir = skill_root.join(format!("s{index:02}"));
+        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: s{index:02}\ndescription: d\n---\n\n# body\n"),
+        )
+        .expect("write skill");
+    }
+
+    let codex_home_path = codex_home.path().to_path_buf();
+    let mut builder = test_codex()
+        .with_home(codex_home.clone())
+        .with_auth(CodexAuth::from_api_key("Test API Key"))
+        .with_config(move |config| {
+            config.cwd = codex_home_path.abs();
+            let user_config_path = codex_home_path.join("config.toml").abs();
+            config.config_layer_stack = ConfigLayerStack::default().with_user_config(
+                &user_config_path,
+                toml! { skills = { bundled = { enabled = false } } }.into(),
+            );
+            config.model_context_window = Some(12_000);
+        });
+    let codex = builder
+        .build(&server)
+        .await
+        .expect("create new conversation")
+        .codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "hello".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let request = resp_mock.single_request();
+    let developer_messages = request.message_input_texts("developer");
+    let developer_text = developer_messages.join("\n\n");
+    let expected_root = normalize_path(skill_root).unwrap();
+    let expected_root_str = expected_root.to_string_lossy().replace('\\', "/");
+    assert!(
+        developer_text.contains("### Skill roots"),
+        "expected aliased skills root section: {developer_messages:?}"
+    );
+    assert!(
+        developer_text.contains(&format!("- `r0` = `{expected_root_str}`")),
+        "expected root alias for {expected_root_str}: {developer_messages:?}"
+    );
+    assert!(
+        developer_text.contains("- s00: d (file: r0/s00/SKILL.md)"),
+        "expected skill path to use root alias: {developer_messages:?}"
+    );
+    assert!(
+        developer_text.contains(
+            "expand the listed short `path` with the matching alias from `### Skill roots`"
+        ),
+        "expected alias-specific skill instructions: {developer_messages:?}"
+    );
+    let _codex_home_guard = codex_home;
+    let _codex_home_parent_guard = codex_home_parent;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn includes_configured_max_effort_in_request() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
     let server = MockServer::start().await;
 
@@ -1461,9 +2186,9 @@ async fn includes_configured_effort_in_request() -> anyhow::Result<()> {
     )
     .await;
     let TestCodex { codex, .. } = test_codex()
-        .with_model("gpt-5.1-codex")
+        .with_model("gpt-5.4")
         .with_config(|config| {
-            config.model_reasoning_effort = Some(ReasoningEffort::Medium);
+            config.model_reasoning_effort = Some(ReasoningEffort::Max);
         })
         .build(&server)
         .await?;
@@ -1475,6 +2200,9 @@ async fn includes_configured_effort_in_request() -> anyhow::Result<()> {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -1489,7 +2217,7 @@ async fn includes_configured_effort_in_request() -> anyhow::Result<()> {
             .get("reasoning")
             .and_then(|t| t.get("effort"))
             .and_then(|v| v.as_str()),
-        Some("medium")
+        Some("max")
     );
 
     Ok(())
@@ -1505,10 +2233,7 @@ async fn includes_no_effort_in_request() -> anyhow::Result<()> {
         sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
     )
     .await;
-    let TestCodex { codex, .. } = test_codex()
-        .with_model("gpt-5.1-codex")
-        .build(&server)
-        .await?;
+    let TestCodex { codex, .. } = test_codex().with_model("gpt-5.4").build(&server).await?;
 
     codex
         .submit(Op::UserInput {
@@ -1517,6 +2242,9 @@ async fn includes_no_effort_in_request() -> anyhow::Result<()> {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -1548,7 +2276,7 @@ async fn includes_default_reasoning_effort_in_request_when_defined_by_model_info
         sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
     )
     .await;
-    let TestCodex { codex, .. } = test_codex().with_model("gpt-5.1").build(&server).await?;
+    let TestCodex { codex, .. } = test_codex().with_model("gpt-5.4").build(&server).await?;
 
     codex
         .submit(Op::UserInput {
@@ -1557,6 +2285,9 @@ async fn includes_default_reasoning_effort_in_request_when_defined_by_model_info
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -1587,53 +2318,45 @@ async fn user_turn_collaboration_mode_overrides_model_and_effort() -> anyhow::Re
         sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
     )
     .await;
-    let TestCodex {
-        codex,
-        config,
-        session_configured,
-        ..
-    } = test_codex()
-        .with_model("gpt-5.1-codex")
-        .build(&server)
-        .await?;
+    let TestCodex { codex, config, .. } = test_codex().with_model("gpt-5.4").build(&server).await?;
 
     let collaboration_mode = CollaborationMode {
         mode: ModeKind::Default,
         settings: Settings {
-            model: "gpt-5.1".to_string(),
+            model: "gpt-5.4".to_string(),
             reasoning_effort: Some(ReasoningEffort::High),
             developer_instructions: None,
         },
     };
 
     codex
-        .submit(Op::UserTurn {
+        .submit(Op::UserInput {
             items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
             }],
-            cwd: config.cwd.to_path_buf(),
-            approval_policy: config.permissions.approval_policy.value(),
-            approvals_reviewer: None,
-            sandbox_policy: config.permissions.sandbox_policy.get().clone(),
-            model: session_configured.model.clone(),
-            effort: Some(ReasoningEffort::Low),
-            summary: Some(
-                config
-                    .model_reasoning_summary
-                    .unwrap_or(ReasoningSummary::Auto),
-            ),
-            service_tier: None,
-            collaboration_mode: Some(collaboration_mode),
             final_output_json_schema: None,
-            personality: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                environments: Some(local_selections(config.cwd.clone())),
+                approval_policy: Some(config.permissions.approval_policy.value()),
+                sandbox_policy: Some(config.legacy_sandbox_policy()),
+                summary: Some(
+                    config
+                        .model_reasoning_summary
+                        .unwrap_or(ReasoningSummary::Auto),
+                ),
+                collaboration_mode: Some(collaboration_mode),
+                ..Default::default()
+            },
         })
         .await?;
 
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let request_body = resp_mock.single_request().body_json();
-    assert_eq!(request_body["model"].as_str(), Some("gpt-5.1"));
+    assert_eq!(request_body["model"].as_str(), Some("gpt-5.4"));
     assert_eq!(
         request_body
             .get("reasoning")
@@ -1658,6 +2381,9 @@ async fn configured_reasoning_summary_is_sent() -> anyhow::Result<()> {
     let TestCodex { codex, .. } = test_codex()
         .with_config(|config| {
             config.model_reasoning_summary = Some(ReasoningSummary::Concise);
+            let _ = config
+                .features
+                .enable(Feature::ConcurrentReasoningSummaries);
         })
         .build(&server)
         .await?;
@@ -1669,6 +2395,9 @@ async fn configured_reasoning_summary_is_sent() -> anyhow::Result<()> {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -1685,6 +2414,109 @@ async fn configured_reasoning_summary_is_sent() -> anyhow::Result<()> {
             .and_then(|value| value.as_str()),
         Some("concise")
     );
+    pretty_assertions::assert_eq!(
+        request_body
+            .get("reasoning")
+            .and_then(|reasoning| reasoning.get("context")),
+        None
+    );
+    pretty_assertions::assert_eq!(
+        request_body
+            .get("stream_options")
+            .and_then(|stream_options| stream_options.get("reasoning_summary_delivery"))
+            .and_then(|value| value.as_str()),
+        Some("sequential_cutoff")
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sequential_cutoff_is_omitted_for_non_openai_provider() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = MockServer::start().await;
+
+    let resp_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
+    let TestCodex { codex, .. } = test_codex()
+        .with_config(|config| {
+            config.model_provider.name = "mock".to_string();
+            let _ = config
+                .features
+                .enable(Feature::ConcurrentReasoningSummaries);
+        })
+        .build(&server)
+        .await?;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "hello".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let request_body = resp_mock.single_request().body_json();
+    pretty_assertions::assert_eq!(request_body.get("stream_options"), None);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_lite_sets_all_turns_context_and_disables_parallel_tool_calls()
+-> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = MockServer::start().await;
+
+    let resp_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
+
+    let TestCodex { codex, .. } = test_codex()
+        .with_model_info_override("gpt-5.4", |model_info| {
+            model_info.use_responses_lite = true;
+            model_info.supports_parallel_tool_calls = true;
+        })
+        .build(&server)
+        .await?;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "hello".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let request_body = resp_mock.single_request().body_json();
+    pretty_assertions::assert_eq!(
+        request_body
+            .get("reasoning")
+            .and_then(|reasoning| reasoning.get("context"))
+            .and_then(|value| value.as_str()),
+        Some("all_turns")
+    );
+    pretty_assertions::assert_eq!(request_body.get("parallel_tool_calls"), Some(&json!(false)));
 
     Ok(())
 }
@@ -1701,13 +2533,12 @@ async fn user_turn_explicit_reasoning_summary_overrides_model_catalog_default() 
     )
     .await;
 
-    let mut model_catalog = bundled_models_response()
-        .unwrap_or_else(|err| panic!("bundled models.json should parse: {err}"));
+    let mut model_catalog = bundled_models_response().expect("bundled models.json should parse");
     let model = model_catalog
         .models
         .iter_mut()
-        .find(|model| model.slug == "gpt-5.1")
-        .expect("gpt-5.1 exists in bundled models.json");
+        .find(|model| model.slug == "gpt-5.4")
+        .expect("gpt-5.4 exists in bundled models.json");
     model.supports_reasoning_summaries = true;
     model.default_reasoning_summary = ReasoningSummary::Detailed;
 
@@ -1717,7 +2548,7 @@ async fn user_turn_explicit_reasoning_summary_overrides_model_catalog_default() 
         session_configured,
         ..
     } = test_codex()
-        .with_model("gpt-5.1")
+        .with_model("gpt-5.4")
         .with_config(move |config| {
             config.model_catalog = Some(model_catalog);
         })
@@ -1725,22 +2556,29 @@ async fn user_turn_explicit_reasoning_summary_overrides_model_catalog_default() 
         .await?;
 
     codex
-        .submit(Op::UserTurn {
+        .submit(Op::UserInput {
             items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
             }],
-            cwd: config.cwd.to_path_buf(),
-            approval_policy: config.permissions.approval_policy.value(),
-            approvals_reviewer: None,
-            sandbox_policy: config.permissions.sandbox_policy.get().clone(),
-            model: session_configured.model,
-            effort: None,
-            summary: Some(ReasoningSummary::Concise),
-            service_tier: None,
-            collaboration_mode: None,
             final_output_json_schema: None,
-            personality: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                environments: Some(local_selections(config.cwd.clone())),
+                approval_policy: Some(config.permissions.approval_policy.value()),
+                sandbox_policy: Some(config.legacy_sandbox_policy()),
+                summary: Some(ReasoningSummary::Concise),
+                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
+                    mode: codex_protocol::config_types::ModeKind::Default,
+                    settings: codex_protocol::config_types::Settings {
+                        model: session_configured.model,
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            },
         })
         .await
         .unwrap();
@@ -1784,6 +2622,9 @@ async fn reasoning_summary_is_omitted_when_disabled() -> anyhow::Result<()> {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -1799,6 +2640,7 @@ async fn reasoning_summary_is_omitted_when_disabled() -> anyhow::Result<()> {
             .and_then(|reasoning| reasoning.get("summary")),
         None
     );
+    pretty_assertions::assert_eq!(request_body.get("stream_options"), None);
 
     Ok(())
 }
@@ -1814,18 +2656,17 @@ async fn reasoning_summary_none_overrides_model_catalog_default() -> anyhow::Res
     )
     .await;
 
-    let mut model_catalog = bundled_models_response()
-        .unwrap_or_else(|err| panic!("bundled models.json should parse: {err}"));
+    let mut model_catalog = bundled_models_response().expect("bundled models.json should parse");
     let model = model_catalog
         .models
         .iter_mut()
-        .find(|model| model.slug == "gpt-5.1")
-        .expect("gpt-5.1 exists in bundled models.json");
+        .find(|model| model.slug == "gpt-5.4")
+        .expect("gpt-5.4 exists in bundled models.json");
     model.supports_reasoning_summaries = true;
     model.default_reasoning_summary = ReasoningSummary::Detailed;
 
     let TestCodex { codex, .. } = test_codex()
-        .with_model("gpt-5.1")
+        .with_model("gpt-5.4")
         .with_config(move |config| {
             config.model_reasoning_summary = Some(ReasoningSummary::None);
             config.model_catalog = Some(model_catalog);
@@ -1840,6 +2681,9 @@ async fn reasoning_summary_none_overrides_model_catalog_default() -> anyhow::Res
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -1867,7 +2711,7 @@ async fn includes_default_verbosity_in_request() -> anyhow::Result<()> {
         sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
     )
     .await;
-    let TestCodex { codex, .. } = test_codex().with_model("gpt-5.1").build(&server).await?;
+    let TestCodex { codex, .. } = test_codex().with_model("gpt-5.4").build(&server).await?;
 
     codex
         .submit(Op::UserInput {
@@ -1876,6 +2720,9 @@ async fn includes_default_verbosity_in_request() -> anyhow::Result<()> {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -1907,7 +2754,7 @@ async fn configured_verbosity_not_sent_for_models_without_support() -> anyhow::R
     )
     .await;
     let TestCodex { codex, .. } = test_codex()
-        .with_model("gpt-5.1-codex")
+        .with_model("test-no-verbosity")
         .with_config(|config| {
             config.model_verbosity = Some(Verbosity::High);
         })
@@ -1921,6 +2768,9 @@ async fn configured_verbosity_not_sent_for_models_without_support() -> anyhow::R
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -1951,7 +2801,7 @@ async fn configured_verbosity_is_sent() -> anyhow::Result<()> {
     )
     .await;
     let TestCodex { codex, .. } = test_codex()
-        .with_model("gpt-5.1")
+        .with_model("gpt-5.4")
         .with_config(|config| {
             config.model_verbosity = Some(Verbosity::High);
         })
@@ -1965,6 +2815,9 @@ async fn configured_verbosity_is_sent() -> anyhow::Result<()> {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -1997,8 +2850,10 @@ async fn includes_developer_instructions_message_in_request() {
     .await;
     let mut builder = test_codex()
         .with_auth(CodexAuth::from_api_key("Test API Key"))
+        .with_pre_build_hook(|home| {
+            std::fs::write(home.join("AGENTS.md"), "be nice").expect("write global instructions");
+        })
         .with_config(|config| {
-            config.user_instructions = Some("be nice".to_string());
             config.developer_instructions = Some("be useful".to_string());
         });
     let codex = builder
@@ -2014,6 +2869,9 @@ async fn includes_developer_instructions_message_in_request() {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -2058,7 +2916,7 @@ async fn includes_developer_instructions_message_in_request() {
     assert!(
         user_context_texts
             .iter()
-            .any(|text| text.starts_with("# AGENTS.md instructions for ")),
+            .any(|text| text.starts_with("# AGENTS.md instructions")),
         "expected AGENTS text in contextual user message, got {user_context_texts:?}"
     );
     let ui_text = user_context_texts
@@ -2096,6 +2954,7 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
         env_key_instructions: None,
         experimental_bearer_token: None,
         auth: None,
+        aws: None,
         wire_api: WireApi::Responses,
         query_params: None,
         http_headers: None,
@@ -2112,18 +2971,18 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
     let mut config = load_default_config_for_test(&codex_home).await;
     config.model_provider_id = provider.name.clone();
     config.model_provider = provider.clone();
-    let effort = config.model_reasoning_effort;
+    let effort = config.model_reasoning_effort.clone();
     let summary = config.model_reasoning_summary;
     let model = codex_core::test_support::get_model_offline(config.model.as_deref());
     config.model = Some(model.clone());
     let config = Arc::new(config);
     let model_info =
         codex_core::test_support::construct_model_info_offline(model.as_str(), &config);
-    let conversation_id = ThreadId::new();
+    let thread_id = ThreadId::new();
     let auth_manager =
         codex_core::test_support::auth_manager_from_auth(CodexAuth::from_api_key("Test API Key"));
     let session_telemetry = SessionTelemetry::new(
-        conversation_id,
+        thread_id,
         model.as_str(),
         model_info.slug.as_str(),
         /*account_id*/ None,
@@ -2137,19 +2996,26 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
 
     let client = ModelClient::new(
         /*auth_manager*/ None,
-        conversation_id,
+        AgentIdentityAuthPolicy::JwtOnly,
+        thread_id,
         provider.clone(),
         SessionSource::Exec,
+        "test_originator".to_string(),
         config.model_verbosity,
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
+        /*item_ids_enabled*/ false,
+        /*concurrent_reasoning_summaries_enabled*/ false,
+        /*attestation_provider*/ None,
+        config.http_client_factory(),
     );
+    let responses_metadata = test_turn_responses_metadata(&client, thread_id);
     let mut client_session = client.new_session();
 
     let mut prompt = Prompt::default();
     prompt.input.push(ResponseItem::Reasoning {
-        id: "reasoning-id".into(),
+        id: Some("reasoning-id".into()),
         summary: vec![ReasoningItemReasoningSummary::SummaryText {
             text: "summary".into(),
         }],
@@ -2157,6 +3023,7 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
             text: "content".into(),
         }]),
         encrypted_content: None,
+        internal_chat_message_metadata_passthrough: None,
     });
     prompt.input.push(ResponseItem::Message {
         id: Some("message-id".into()),
@@ -2164,8 +3031,8 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
         content: vec![ContentItem::OutputText {
             text: "message".into(),
         }],
-        end_turn: None,
         phase: None,
+        internal_chat_message_metadata_passthrough: None,
     });
     prompt.input.push(ResponseItem::WebSearchCall {
         id: Some("web-search-id".into()),
@@ -2174,6 +3041,7 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
             query: Some("weather".into()),
             queries: None,
         }),
+        internal_chat_message_metadata_passthrough: None,
     });
     prompt.input.push(ResponseItem::FunctionCall {
         id: Some("function-id".into()),
@@ -2181,10 +3049,13 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
         namespace: None,
         arguments: "{}".into(),
         call_id: "function-call-id".into(),
+        internal_chat_message_metadata_passthrough: None,
     });
     prompt.input.push(ResponseItem::FunctionCallOutput {
+        id: None,
         call_id: "function-call-id".into(),
         output: FunctionCallOutputPayload::from_text("ok".into()),
+        internal_chat_message_metadata_passthrough: None,
     });
     prompt.input.push(ResponseItem::LocalShellCall {
         id: Some("local-shell-id".into()),
@@ -2197,18 +3068,23 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
             env: None,
             user: None,
         }),
+        internal_chat_message_metadata_passthrough: None,
     });
     prompt.input.push(ResponseItem::CustomToolCall {
         id: Some("custom-tool-id".into()),
         status: Some("completed".into()),
         call_id: "custom-tool-call-id".into(),
         name: "custom_tool".into(),
+        namespace: None,
         input: "{}".into(),
+        internal_chat_message_metadata_passthrough: None,
     });
     prompt.input.push(ResponseItem::CustomToolCallOutput {
+        id: None,
         call_id: "custom-tool-call-id".into(),
         name: None,
         output: FunctionCallOutputPayload::from_text("ok".into()),
+        internal_chat_message_metadata_passthrough: None,
     });
 
     let mut stream = client_session
@@ -2219,7 +3095,8 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
             effort,
             summary.unwrap_or(ReasoningSummary::Auto),
             /*service_tier*/ None,
-            /*turn_metadata_header*/ None,
+            &responses_metadata,
+            &codex_rollout_trace::InferenceTraceContext::disabled(),
         )
         .await
         .expect("responses stream to start");
@@ -2303,40 +3180,12 @@ async fn token_count_includes_rate_limits_snapshot() {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
-
-    let first_token_event =
-        wait_for_event(&codex, |msg| matches!(msg, EventMsg::TokenCount(_))).await;
-    let rate_limit_only = match first_token_event {
-        EventMsg::TokenCount(ev) => ev,
-        _ => unreachable!(),
-    };
-
-    let rate_limit_json = serde_json::to_value(&rate_limit_only).unwrap();
-    pretty_assertions::assert_eq!(
-        rate_limit_json,
-        json!({
-            "info": null,
-            "rate_limits": {
-                "limit_id": "codex",
-                "limit_name": null,
-                "primary": {
-                    "used_percent": 12.5,
-                    "window_minutes": 10,
-                    "resets_at": 1704069000
-                },
-                "secondary": {
-                    "used_percent": 40.0,
-                    "window_minutes": 60,
-                    "resets_at": 1704074400
-                },
-                "credits": null,
-                "plan_type": null
-            }
-        })
-    );
 
     let token_event = wait_for_event(
         &codex,
@@ -2367,7 +3216,7 @@ async fn token_count_includes_rate_limits_snapshot() {
                     "reasoning_output_tokens": 0,
                     "total_tokens": 123
                 },
-                // Default model is gpt-5.1-codex-max in tests → 95% usable context window
+                // Default model is gpt-5.4 in tests → 95% usable context window
                 "model_context_window": 258400
             },
             "rate_limits": {
@@ -2384,7 +3233,9 @@ async fn token_count_includes_rate_limits_snapshot() {
                     "resets_at": 1704074400
                 },
                 "credits": null,
-                "plan_type": null
+                "individual_limit": null,
+                "plan_type": null,
+                "rate_limit_reached_type": null
             }
         })
     );
@@ -2458,7 +3309,9 @@ async fn usage_limit_error_emits_rate_limit_event() -> anyhow::Result<()> {
             "resets_at": null
         },
         "credits": null,
-        "plan_type": null
+        "individual_limit": null,
+        "plan_type": null,
+        "rate_limit_reached_type": null
     });
 
     let submission_id = codex
@@ -2468,6 +3321,9 @@ async fn usage_limit_error_emits_rate_limit_event() -> anyhow::Result<()> {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .expect("submission should succeed while emitting usage limit error events");
@@ -2529,7 +3385,7 @@ async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Res
 
     let TestCodex { codex, .. } = test_codex()
         .with_config(|config| {
-            config.model = Some("gpt-5.1".to_string());
+            config.model = Some("gpt-5.4".to_string());
             config.model_context_window = Some(272_000);
         })
         .build(&server)
@@ -2542,6 +3398,9 @@ async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Res
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await?;
 
@@ -2554,6 +3413,9 @@ async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Res
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await?;
 
@@ -2636,6 +3498,9 @@ async fn incomplete_response_emits_content_filter_error_message() -> anyhow::Res
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await?;
 
@@ -2705,6 +3570,7 @@ async fn azure_overrides_assign_properties_used_for_responses_url() {
         env_key: Some(EXISTING_ENV_VAR_WITH_NON_EMPTY_VALUE.to_string()),
         experimental_bearer_token: None,
         auth: None,
+        aws: None,
         query_params: Some(std::collections::HashMap::from([(
             "api-version".to_string(),
             "2025-04-01-preview".to_string(),
@@ -2743,6 +3609,9 @@ async fn azure_overrides_assign_properties_used_for_responses_url() {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -2795,6 +3664,7 @@ async fn env_var_overrides_loaded_auth() {
         env_key_instructions: None,
         experimental_bearer_token: None,
         auth: None,
+        aws: None,
         wire_api: WireApi::Responses,
         http_headers: Some(std::collections::HashMap::from([(
             "Custom-Header".to_string(),
@@ -2828,6 +3698,9 @@ async fn env_var_overrides_loaded_auth() {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -2855,22 +3728,15 @@ async fn history_dedupes_streamed_and_final_messages_across_turns() {
     let server = MockServer::start().await;
 
     // Build a small SSE stream with deltas and a final assistant message.
-    // We emit the same body for all 3 turns; ids vary but are unused by assertions.
-    let sse_raw = r##"[
-        {"type":"response.output_item.added", "item":{
-            "type":"message", "role":"assistant",
-            "content":[{"type":"output_text","text":""}]
-        }},
-        {"type":"response.output_text.delta", "delta":"Hey "},
-        {"type":"response.output_text.delta", "delta":"there"},
-        {"type":"response.output_text.delta", "delta":"!\n"},
-        {"type":"response.output_item.done", "item":{
-            "type":"message", "role":"assistant",
-            "content":[{"type":"output_text","text":"Hey there!\n"}]
-        }},
-        {"type":"response.completed", "response": {"id": "__ID__"}}
-    ]"##;
-    let sse1 = core_test_support::load_sse_fixture_with_id_from_str(sse_raw, "resp1");
+    // We emit the same body for all 3 turns.
+    let sse1 = sse(vec![
+        ev_message_item_added("msg-1", ""),
+        ev_output_text_delta("Hey "),
+        ev_output_text_delta("there"),
+        ev_output_text_delta("!\n"),
+        ev_assistant_message("msg-1", "Hey there!\n"),
+        ev_completed("resp1"),
+    ]);
 
     let request_log = mount_sse_sequence(&server, vec![sse1.clone(), sse1.clone(), sse1]).await;
 
@@ -2889,6 +3755,9 @@ async fn history_dedupes_streamed_and_final_messages_across_turns() {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -2902,6 +3771,9 @@ async fn history_dedupes_streamed_and_final_messages_across_turns() {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -2915,6 +3787,9 @@ async fn history_dedupes_streamed_and_final_messages_across_turns() {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -2966,7 +3841,7 @@ async fn history_dedupes_streamed_and_final_messages_across_turns() {
     let tail_len = r3_tail_expected.as_array().unwrap().len();
     let actual_tail = &r3_input_array[r3_input_array.len() - tail_len..];
     assert_eq!(
-        serde_json::Value::Array(actual_tail.to_vec()),
+        strip_metadata_from_json(serde_json::Value::Array(actual_tail.to_vec())),
         r3_tail_expected,
         "request 3 tail mismatch",
     );
