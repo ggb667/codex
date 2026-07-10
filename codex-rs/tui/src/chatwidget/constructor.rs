@@ -241,9 +241,13 @@ impl ChatWidget {
             external_editor_state: ExternalEditorState::Closed,
             last_rendered_user_message_display: None,
             last_non_retry_error: None,
+            pony_ipc_identity: None,
+            pony_ipc_task: None,
+            pending_pony_messages: VecDeque::new(),
         };
 
         widget.prefetch_rate_limits();
+        widget.maybe_start_pony_ipc();
         if let Some(keymap) = runtime_keymap {
             widget.bottom_pane.set_keymap_bindings(&keymap);
         }

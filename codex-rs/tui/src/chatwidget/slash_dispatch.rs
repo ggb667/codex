@@ -14,6 +14,8 @@ use crate::bottom_pane::slash_commands::SlashCommandItem;
 use crate::bottom_pane::slash_commands::find_slash_command;
 use crate::goal_display::GOAL_USAGE;
 use crate::goal_files::GoalDraft;
+use crate::pony_ipc;
+use crate::pony_ipc::PonySendCommand;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SlashCommandDispatchSource {
@@ -365,6 +367,11 @@ impl ChatWidget {
             SlashCommand::SandboxReadRoot => {
                 self.add_error_message(
                     "Usage: /sandbox-add-read-dir <absolute-directory-path>".to_string(),
+                );
+            }
+            SlashCommand::Tell => {
+                self.add_error_message(
+                    "Usage: /tell list | /tell <pony-name|all> <message>".to_string(),
                 );
             }
             SlashCommand::Experimental => {
@@ -879,6 +886,17 @@ impl ChatWidget {
                 self.app_event_tx
                     .send(AppEvent::BeginWindowsSandboxGrantReadRoot { path: args });
             }
+            SlashCommand::Tell if !trimmed.is_empty() => {
+                match pony_ipc::parse_send_command(&args) {
+                    Ok(PonySendCommand::List) => {
+                        self.app_event_tx.send(AppEvent::PonyListActive);
+                    }
+                    Ok(PonySendCommand::Send { target, text }) => {
+                        self.app_event_tx.send(AppEvent::PonySend { target, text });
+                    }
+                    Err(err) => self.add_error_message(err),
+                }
+            }
             SlashCommand::Pets
                 if matches!(
                     args.trim().to_ascii_lowercase().as_str(),
@@ -1058,7 +1076,8 @@ impl ChatWidget {
             | SlashCommand::Diff
             | SlashCommand::App
             | SlashCommand::Rename
-            | SlashCommand::TestApproval => QueueDrain::Continue,
+            | SlashCommand::TestApproval
+            | SlashCommand::Tell => QueueDrain::Continue,
             SlashCommand::Feedback
             | SlashCommand::New
             | SlashCommand::Archive

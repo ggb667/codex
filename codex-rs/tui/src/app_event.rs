@@ -52,6 +52,7 @@ use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
 
 use crate::history_cell::HistoryCell;
+use crate::pony_ipc::PonyChatEntry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ThreadGoalSetMode {
@@ -258,6 +259,15 @@ pub(crate) enum AppEvent {
     /// Forward a command to the Agent. Using an `AppEvent` for this avoids
     /// bubbling channels through layers of widgets.
     CodexOp(AppCommand),
+
+    PonySend {
+        target: String,
+        text: String,
+    },
+
+    PonyListActive,
+
+    PonyMessageReceived(PonyChatEntry),
 
     /// Restore an output-free interrupted turn into the composer and roll it back.
     RestoreCancelledTurn(UserMessage),

@@ -33,6 +33,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -62,6 +63,8 @@ use crate::mention_codec::encode_history_mentions;
 use crate::model_catalog::ModelCatalog;
 use crate::multi_agents;
 use crate::multi_agents::AgentMetadata;
+use crate::pony_ipc::PonyChatEntry;
+use crate::pony_ipc::PonyIdentity;
 use crate::session_state::SessionNetworkProxyRuntime;
 use crate::session_state::ThreadSessionState;
 use crate::status::RateLimitWindowDisplay;
@@ -183,6 +186,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
 use ratatui::widgets::Wrap;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::task::JoinHandle;
 use tracing::debug;
 use tracing::warn;
 
@@ -367,6 +371,7 @@ use self::skills::find_skill_mentions_with_tool_mentions;
 use self::skills::is_app_mentionable;
 mod plugin_catalog;
 mod plugins;
+mod pony;
 use self::plugins::PluginInstallAuthFlowState;
 use self::plugins::PluginListFetchState;
 use self::plugins::PluginsCacheState;
@@ -747,6 +752,9 @@ pub(crate) struct ChatWidget {
     external_editor_state: ExternalEditorState,
     last_rendered_user_message_display: Option<UserMessageDisplay>,
     last_non_retry_error: Option<(String, String)>,
+    pony_ipc_identity: Option<PonyIdentity>,
+    pony_ipc_task: Option<JoinHandle<()>>,
+    pending_pony_messages: VecDeque<PonyChatEntry>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2020,6 +2028,9 @@ fn has_websocket_timing_metrics(summary: RuntimeMetricsSummary) -> bool {
 impl Drop for ChatWidget {
     fn drop(&mut self) {
         self.stop_rate_limit_poller();
+        if let Some(task) = self.pony_ipc_task.take() {
+            task.abort();
+        }
     }
 }
 

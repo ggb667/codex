@@ -46,6 +46,18 @@ impl App {
             AppEvent::RawOutputModeChanged { enabled } => {
                 self.apply_raw_output_mode(tui, enabled, /*notify*/ false);
             }
+            AppEvent::PonySend { target, text } => {
+                self.chat_widget.handle_pony_send(target, text);
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::PonyListActive => {
+                self.chat_widget.handle_pony_list_active();
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::PonyMessageReceived(message) => {
+                self.chat_widget.queue_or_buffer_pony_message(message);
+                tui.frame_requester().schedule_frame();
+            }
             AppEvent::ClearUiAndSubmitUserMessage { text } => {
                 self.clear_terminal_ui(tui, /*redraw_header*/ false)?;
                 self.reset_app_ui_state_after_clear();

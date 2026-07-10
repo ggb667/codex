@@ -71,6 +71,7 @@ pub enum SlashCommand {
     TestApproval,
     #[strum(serialize = "subagents")]
     MultiAgents,
+    Tell,
     // Debugging commands.
     #[strum(serialize = "debug-m-drop")]
     MemoryDrop,
@@ -121,6 +122,7 @@ impl SlashCommand {
             SlashCommand::Plan => "switch to Plan mode",
             SlashCommand::Goal => "set or view the goal for a long-running task",
             SlashCommand::Agent | SlashCommand::MultiAgents => "switch the active agent thread",
+            SlashCommand::Tell => "send a local letter",
             SlashCommand::Side | SlashCommand::Btw => {
                 "start a side conversation in an ephemeral fork"
             }
@@ -167,6 +169,7 @@ impl SlashCommand {
                 | SlashCommand::Btw
                 | SlashCommand::Resume
                 | SlashCommand::SandboxReadRoot
+                | SlashCommand::Tell
         )
     }
 
@@ -181,6 +184,7 @@ impl SlashCommand {
                 | SlashCommand::Status
                 | SlashCommand::Usage
                 | SlashCommand::Ide
+                | SlashCommand::Tell
         )
     }
 
@@ -235,6 +239,7 @@ impl SlashCommand {
             | SlashCommand::Quit
             | SlashCommand::Exit
             | SlashCommand::Side
+            | SlashCommand::Tell
             | SlashCommand::Btw => true,
             SlashCommand::Rollout => true,
             SlashCommand::TestApproval => true,

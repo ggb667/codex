@@ -696,7 +696,10 @@ mod tests {
         append_json_line(&chat_path, &fresh_from_dash).unwrap();
 
         let first = read_new_messages_at(&chat_path, &lock_path, &identity).unwrap();
-        assert_eq!(first, vec![fresh_from_dash.clone(), fresh_from_pinkie.clone()]);
+        assert_eq!(
+            first,
+            vec![fresh_from_dash.clone(), fresh_from_pinkie.clone()]
+        );
 
         let second = read_new_messages_at(&chat_path, &lock_path, &identity).unwrap();
         assert_eq!(second, vec![fresh_from_dash, fresh_from_pinkie]);
