@@ -44,7 +44,7 @@ use crate::key_hint;
 use crate::key_hint::KeyBinding;
 use crate::key_hint::KeyBindingListExt;
 use crate::key_hint::has_ctrl_or_alt;
-use crate::ui_consts::FOOTER_INDENT_COLS;
+use crate::ui_consts::footer_indent_cols;
 
 /// Active composer-owned state for one Ctrl+R search interaction.
 ///
@@ -472,7 +472,7 @@ impl ChatComposer {
         let query_width = Line::from(search.query.clone()).width() as u16;
         let desired_x = hint_rect
             .x
-            .saturating_add(FOOTER_INDENT_COLS as u16)
+            .saturating_add(footer_indent_cols() as u16)
             .saturating_add(prompt_width)
             .saturating_add(query_width);
         let max_x = hint_rect

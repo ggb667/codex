@@ -20,6 +20,9 @@ pub(crate) const PONY_IPC_POLL_INTERVAL: std::time::Duration = std::time::Durati
 const STALE_AFTER_SECS: i64 = 60 * 60;
 const BROADCAST_TARGET: &str = "*";
 const UNKNOWN_BRANCH: &str = "unknown";
+const PONY_CHAT_LOG_PATH_ENV: &str = "AGENIC_PONY_CHAT_LOG_PATH";
+const PONY_REGISTRY_LOG_PATH_ENV: &str = "AGENIC_PONY_REGISTRY_LOG_PATH";
+const PROJECT_ROOT_ENV: &str = "AGENIC_PROJECT_ROOT";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PonySendCommand {
@@ -442,19 +445,80 @@ fn git_branch_for_path(path: &Path) -> String {
 }
 
 fn pony_registry_log_path() -> PathBuf {
-    std::env::temp_dir().join("codex-pony-registry.jsonl")
+    pony_ipc_log_path(
+        PONY_REGISTRY_LOG_PATH_ENV,
+        "pony.registry.jsonl",
+        "codex-pony-registry.jsonl",
+    )
 }
 
 fn pony_registry_lock_path() -> PathBuf {
-    std::env::temp_dir().join("codex-pony-registry.cleanup.lock")
+    cleanup_lock_path_for(&pony_registry_log_path(), "pony.registry.cleanup.lock")
 }
 
 fn pony_chat_log_path() -> PathBuf {
-    std::env::temp_dir().join("codex-pony-chat.jsonl")
+    pony_ipc_log_path(
+        PONY_CHAT_LOG_PATH_ENV,
+        "pony.chat.jsonl",
+        "codex-pony-chat.jsonl",
+    )
 }
 
 fn pony_chat_lock_path() -> PathBuf {
-    std::env::temp_dir().join("codex-pony-chat.cleanup.lock")
+    cleanup_lock_path_for(&pony_chat_log_path(), "pony.chat.cleanup.lock")
+}
+
+fn pony_ipc_log_path(env_name: &str, project_file_name: &str, legacy_file_name: &str) -> PathBuf {
+    let explicit_path = std::env::var(env_name).ok();
+    let project_root = std::env::var(PROJECT_ROOT_ENV).ok();
+    let current_dir = std::env::current_dir().ok();
+    pony_ipc_log_path_for(
+        explicit_path.as_deref(),
+        project_root.as_deref(),
+        current_dir.as_deref(),
+        project_file_name,
+        legacy_file_name,
+    )
+}
+
+fn pony_ipc_log_path_for(
+    explicit_path: Option<&str>,
+    project_root: Option<&str>,
+    current_dir: Option<&Path>,
+    project_file_name: &str,
+    legacy_file_name: &str,
+) -> PathBuf {
+    let project_root = project_root.and_then(non_empty_path);
+    if let Some(path) = explicit_path.and_then(non_empty_path)
+        && project_root
+            .as_ref()
+            .is_none_or(|root| path.starts_with(root))
+    {
+        return path;
+    }
+
+    if let Some(root) = project_root {
+        return project_runtime_path(&root, project_file_name);
+    }
+
+    if let Some(cwd) = current_dir {
+        return project_runtime_path(cwd, project_file_name);
+    }
+
+    std::env::temp_dir().join(legacy_file_name)
+}
+
+fn non_empty_path(value: &str) -> Option<PathBuf> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+}
+
+fn project_runtime_path(project_root: &Path, file_name: &str) -> PathBuf {
+    project_root.join("pony/runtime").join(file_name)
+}
+
+fn cleanup_lock_path_for(log_path: &Path, lock_file_name: &str) -> PathBuf {
+    log_path.with_file_name(lock_file_name)
 }
 
 fn split_subject_and_body(text: &str) -> (String, String) {
@@ -757,5 +821,60 @@ mod tests {
         let entries = read_jsonl::<PonyRegistryEntry>(&registry_path).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].pony_name, "TWILIGHT_SPARKLE");
+    }
+    #[test]
+    fn ipc_log_path_defaults_to_project_runtime_when_project_root_is_set() {
+        assert_eq!(
+            pony_ipc_log_path_for(
+                /*explicit_path*/ None,
+                Some("/tmp/project"),
+                Some(Path::new("/tmp/other")),
+                "pony.chat.jsonl",
+                "codex-pony-chat.jsonl",
+            ),
+            PathBuf::from("/tmp/project/pony/runtime/pony.chat.jsonl")
+        );
+    }
+
+    #[test]
+    fn ipc_log_path_ignores_explicit_path_from_another_project() {
+        assert_eq!(
+            pony_ipc_log_path_for(
+                Some("/tmp/source/pony/runtime/pony.chat.jsonl"),
+                Some("/tmp/codex"),
+                Some(Path::new("/tmp/other")),
+                "pony.chat.jsonl",
+                "codex-pony-chat.jsonl",
+            ),
+            PathBuf::from("/tmp/codex/pony/runtime/pony.chat.jsonl")
+        );
+    }
+
+    #[test]
+    fn ipc_log_path_accepts_explicit_path_under_project_root() {
+        assert_eq!(
+            pony_ipc_log_path_for(
+                Some("/tmp/codex/pony/runtime/custom.chat.jsonl"),
+                Some("/tmp/codex"),
+                Some(Path::new("/tmp/other")),
+                "pony.chat.jsonl",
+                "codex-pony-chat.jsonl",
+            ),
+            PathBuf::from("/tmp/codex/pony/runtime/custom.chat.jsonl")
+        );
+    }
+
+    #[test]
+    fn ipc_log_path_uses_current_dir_before_legacy_tmp_fallback() {
+        assert_eq!(
+            pony_ipc_log_path_for(
+                /*explicit_path*/ None,
+                /*project_root*/ None,
+                Some(Path::new("/tmp/cwd")),
+                "pony.chat.jsonl",
+                "codex-pony-chat.jsonl",
+            ),
+            PathBuf::from("/tmp/cwd/pony/runtime/pony.chat.jsonl")
+        );
     }
 }

@@ -744,6 +744,18 @@ pub struct Tui {
     #[serde(default)]
     pub theme: Option<String>,
 
+    /// Prompt glyph rendered for the composer and selection cursors.
+    ///
+    /// Defaults to `›` when unset.
+    #[serde(default)]
+    pub prompt_glyph: Option<String>,
+
+    /// Background color override for user prompt surfaces.
+    ///
+    /// Accepts a `#RRGGBB` hex color when set.
+    #[serde(default)]
+    pub prompt_background: Option<String>,
+
     /// Pet id to preselect in the terminal pet picker.
     ///
     /// Custom pet ids resolve against CODEX_HOME/pets/<pet-id>/pet.json.

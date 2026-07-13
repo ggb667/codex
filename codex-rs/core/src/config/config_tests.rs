@@ -827,6 +827,8 @@ fn config_toml_deserializes_model_availability_nux() {
             status_line_use_colors: true,
             terminal_title: None,
             theme: None,
+            prompt_glyph: None,
+            prompt_background: None,
             pet: None,
             pet_anchor: TuiPetAnchor::Composer,
             session_picker_view: None,
@@ -962,6 +964,49 @@ fn test_tui_raw_output_mode_true() {
             .expect("config should include tui section")
             .raw_output_mode
     );
+}
+
+#[test]
+fn test_tui_prompt_customization_deserializes() {
+    let toml = r##"
+        [tui]
+        prompt_glyph = "☀︎"
+        prompt_background = "#112233"
+    "##;
+    let parsed: ConfigToml = toml::from_str(toml).expect("deserialize prompt customization");
+    let tui = parsed.tui.expect("config should include tui section");
+
+    assert_eq!(
+        tui,
+        Tui {
+            animations: true,
+            show_tooltips: true,
+            status_line_use_colors: true,
+            prompt_glyph: Some("☀︎".to_string()),
+            prompt_background: Some("#112233".to_string()),
+            ..Default::default()
+        }
+    );
+}
+
+#[tokio::test]
+async fn runtime_config_uses_tui_prompt_customization() {
+    let toml = r##"
+        [tui]
+        prompt_glyph = "☀︎"
+        prompt_background = "#112233"
+    "##;
+    let cfg_toml: ConfigToml = toml::from_str(toml).expect("deserialize prompt customization");
+    let cfg = Config::load_from_base_config_with_overrides(
+        cfg_toml,
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").abs(),
+    )
+    .await
+    .expect("load config");
+
+    assert_eq!(cfg.tui_prompt_glyph, Some("☀︎".to_string()));
+    assert_eq!(cfg.tui_prompt_background, Some("#112233".to_string()));
 }
 
 #[tokio::test]
@@ -3666,6 +3711,8 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
             status_line_use_colors: true,
             terminal_title: None,
             theme: None,
+            prompt_glyph: None,
+            prompt_background: None,
             pet: None,
             pet_anchor: TuiPetAnchor::Composer,
             session_picker_view: None,

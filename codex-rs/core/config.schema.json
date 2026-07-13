@@ -3233,6 +3233,16 @@
           "default": "composer",
           "description": "Where the terminal pet should anchor vertically.\n\nDefaults to `composer`, which follows the current TUI composer viewport."
         },
+        "prompt_background": {
+          "default": null,
+          "description": "Background color override for user prompt surfaces.\n\nAccepts a `#RRGGBB` hex color when set.",
+          "type": "string"
+        },
+        "prompt_glyph": {
+          "default": null,
+          "description": "Prompt glyph rendered for the composer and selection cursors.\n\nDefaults to `›` when unset.",
+          "type": "string"
+        },
         "raw_output_mode": {
           "default": false,
           "description": "Start the TUI in raw scrollback mode for copy-friendly transcript output. Defaults to `false`.",
@@ -3246,16 +3256,6 @@
           ],
           "default": null,
           "description": "Preferred layout for resume/fork session picker results."
-        },
-        "prompt_background": {
-          "default": null,
-          "description": "Background color override for user prompt surfaces.\n\nAccepts a `#RRGGBB` hex color when set.",
-          "type": "string"
-        },
-        "prompt_glyph": {
-          "default": null,
-          "description": "Prompt glyph rendered for the composer and selection cursors.\n\nDefaults to `›` when unset.",
-          "type": "string"
         },
         "show_tooltips": {
           "default": true,

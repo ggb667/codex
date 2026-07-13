@@ -150,7 +150,7 @@ use crate::key_hint;
 use crate::key_hint::KeyBinding;
 use crate::key_hint::has_ctrl_or_alt;
 use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
-use crate::ui_consts::FOOTER_INDENT_COLS;
+use crate::ui_consts::footer_indent_cols;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
@@ -257,7 +257,8 @@ use crate::clipboard_paste::pasted_image_format;
 use crate::history_cell;
 use crate::skills_helpers::skill_display_name;
 use crate::tui::FrameRequester;
-use crate::ui_consts::LIVE_PREFIX_COLS;
+use crate::ui_consts::live_prefix_cols;
+use crate::ui_consts::prompt_glyph;
 use codex_connectors::AppInfo;
 #[cfg(test)]
 use codex_core_skills::model::SkillInterface;
@@ -762,7 +763,7 @@ impl ChatComposer {
             Layout::vertical([Constraint::Min(3), popup_constraint]).areas(area);
         let mut textarea_rect = composer_rect.inset(Insets::tlbr(
             /*top*/ 1,
-            LIVE_PREFIX_COLS,
+            live_prefix_cols(),
             /*bottom*/ 1,
             /*right*/ 1u16.saturating_add(textarea_right_reserve),
         ));
@@ -4169,9 +4170,9 @@ impl ChatComposer {
             .unwrap_or_else(|| footer_height(&footer_props));
         let footer_spacing = Self::footer_spacing(footer_hint_height);
         let footer_total_height = footer_hint_height + footer_spacing;
-        const COLS_WITH_MARGIN: u16 = LIVE_PREFIX_COLS + 1;
+        let cols_with_margin = live_prefix_cols() + 1;
         let inner_width =
-            width.saturating_sub(COLS_WITH_MARGIN.saturating_add(textarea_right_reserve));
+            width.saturating_sub(cols_with_margin.saturating_add(textarea_right_reserve));
         let remote_images_height: u16 = self
             .attachments
             .remote_image_lines()
@@ -4260,7 +4261,7 @@ impl ChatComposer {
                     render_footer_line(hint_rect, buf, line);
                 } else if self.footer.plan_mode_nudge_visible {
                     let available_width =
-                        hint_rect.width.saturating_sub(FOOTER_INDENT_COLS as u16) as usize;
+                        hint_rect.width.saturating_sub(footer_indent_cols() as u16) as usize;
                     render_footer_line(
                         hint_rect,
                         buf,
@@ -4271,7 +4272,7 @@ impl ChatComposer {
                     );
                 } else {
                     let available_width =
-                        hint_rect.width.saturating_sub(FOOTER_INDENT_COLS as u16) as usize;
+                        hint_rect.width.saturating_sub(footer_indent_cols() as u16) as usize;
                     let status_line_active = uses_passive_footer_status_layout(&footer_props);
                     let combined_status_line = if status_line_active {
                         passive_footer_status_line(&footer_props)
@@ -4463,13 +4464,13 @@ impl ChatComposer {
                 if self.draft.is_bash_mode {
                     Span::from("!").light_red().bold()
                 } else {
-                    "›".bold()
+                    Span::from(prompt_glyph()).bold()
                 }
             } else {
-                "›".dim()
+                Span::from(prompt_glyph()).dim()
             };
             buf.set_span(
-                textarea_rect.x - LIVE_PREFIX_COLS,
+                textarea_rect.x - live_prefix_cols(),
                 textarea_rect.y,
                 &prompt,
                 textarea_rect.width,

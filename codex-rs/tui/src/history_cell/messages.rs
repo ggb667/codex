@@ -115,7 +115,7 @@ impl HistoryCell for UserHistoryCell {
         };
         let wrap_width = width
             .saturating_sub(
-                LIVE_PREFIX_COLS + 1, /* keep a one-column right margin for wrapping */
+                live_prefix_cols() + 1, /* keep a one-column right margin for wrapping */
             )
             .max(1);
 
@@ -176,8 +176,8 @@ impl HistoryCell for UserHistoryCell {
         if let Some(wrapped_remote_images) = wrapped_remote_images {
             lines.extend(prefix_lines(
                 wrapped_remote_images,
-                "  ".into(),
-                "  ".into(),
+                live_prefix_spaces().into(),
+                live_prefix_spaces().into(),
             ));
             if wrapped_message.is_some() {
                 lines.push(Line::from("").style(style));
@@ -185,10 +185,11 @@ impl HistoryCell for UserHistoryCell {
         }
 
         if let Some(wrapped_message) = wrapped_message {
+            let prompt_glyph = prompt_glyph();
             lines.extend(prefix_lines(
                 wrapped_message,
-                "› ".bold().dim(),
-                "  ".into(),
+                Span::from(format!("{prompt_glyph} ")).bold().dim(),
+                live_prefix_spaces().into(),
             ));
         }
 
