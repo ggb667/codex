@@ -23,6 +23,7 @@ const UNKNOWN_BRANCH: &str = "unknown";
 const PONY_CHAT_LOG_PATH_ENV: &str = "AGENIC_PONY_CHAT_LOG_PATH";
 const PONY_REGISTRY_LOG_PATH_ENV: &str = "AGENIC_PONY_REGISTRY_LOG_PATH";
 const PROJECT_ROOT_ENV: &str = "AGENIC_PROJECT_ROOT";
+const AGENT_CONFIG_ENV: &str = "CODEX_AGENT_CONFIG";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PonySendCommand {
@@ -34,9 +35,54 @@ pub(crate) enum PonySendCommand {
 pub(crate) struct PonyIdentity {
     pub(crate) instance_id: String,
     pub(crate) pony_name: String,
+    pub(crate) pony_symbol: String,
+    pub(crate) pony_aliases: Vec<String>,
+    pub(crate) mailbox_path: Option<PathBuf>,
     pub(crate) project_path: String,
     pub(crate) git_branch: String,
     pub(crate) pid: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct AgentConfig {
+    agent_id: String,
+    route_id: String,
+    label: String,
+    icon: String,
+    #[serde(default)]
+    aliases: Vec<String>,
+    project_root: String,
+    #[serde(default)]
+    mailbox_path: String,
+    #[serde(default)]
+    message_log_path: String,
+    #[serde(default)]
+    registry_path: String,
+    #[serde(default)]
+    global_singleton: bool,
+    #[serde(default)]
+    agents: Vec<AgentConfigAgent>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct AgentConfigAgent {
+    agent_id: String,
+    route_id: String,
+    label: String,
+    icon: String,
+    #[serde(default)]
+    aliases: Vec<String>,
+    project_root: String,
+    #[serde(default)]
+    mailbox_path: String,
+    #[serde(default)]
+    message_log_path: String,
+    #[serde(default)]
+    registry_path: String,
+    #[serde(default)]
+    global_singleton: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -117,7 +163,6 @@ pub(crate) fn pony_identity_from_env(cwd: &Path) -> Option<PonyIdentity> {
     let raw_name = std::env::var("AGENIC_LAUNCH_PERSONALITY")
         .ok()
         .or_else(|| std::env::var("PERSONALITY").ok())?;
-    let pony_name = canonicalize_pony_name(&raw_name);
     let project_path = std::env::var("AGENIC_PROJECT_ROOT")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -126,10 +171,32 @@ pub(crate) fn pony_identity_from_env(cwd: &Path) -> Option<PonyIdentity> {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| git_branch_for_path(Path::new(&project_path)));
+    let roster = agent_config_from_env();
+    let agent = roster
+        .as_ref()
+        .and_then(|roster| roster.current_agent(&raw_name, &project_path));
+    let pony_name = agent
+        .as_ref()
+        .map(AgentConfigAgent::route)
+        .unwrap_or_else(|| normalize_agent_name(&raw_name));
+    let pony_symbol = agent
+        .as_ref()
+        .map(|agent| agent.icon.clone())
+        .unwrap_or_default();
+    let pony_aliases = agent
+        .as_ref()
+        .map(AgentConfigAgent::match_names)
+        .unwrap_or_else(|| vec![pony_name.clone(), raw_name]);
+    let mailbox_path = agent
+        .as_ref()
+        .and_then(|agent| non_empty_path(&agent.mailbox_path));
 
     Some(PonyIdentity {
         instance_id: Uuid::new_v4().to_string(),
         pony_name,
+        pony_symbol,
+        pony_aliases,
+        mailbox_path,
         project_path,
         git_branch,
         pid: std::process::id(),
@@ -156,7 +223,7 @@ pub(crate) fn parse_send_command(args: &str) -> Result<PonySendCommand, String> 
     let target = if target.eq_ignore_ascii_case("all") {
         BROADCAST_TARGET.to_string()
     } else {
-        canonicalize_target_pony_name(target)?
+        resolve_target_agent(target)?
     };
 
     Ok(PonySendCommand::Send {
@@ -176,8 +243,8 @@ pub(crate) fn append_chat_message(
     target: &str,
     text: &str,
 ) -> io::Result<PonyChatEntry> {
-    let chat_path = pony_chat_log_path();
-    let lock_path = pony_chat_lock_path();
+    let chat_path = pony_chat_log_path_for_target(target);
+    let lock_path = cleanup_lock_path_for(&chat_path, "pony.chat.cleanup.lock");
     append_chat_message_at(&chat_path, &lock_path, identity, target, text)
 }
 
@@ -198,59 +265,203 @@ pub(crate) fn append_incoming_message_to_mailbox(
     message: &PonyChatEntry,
 ) -> io::Result<()> {
     let project_root = Path::new(&identity.project_path);
-    let mailbox_path = pony_mailbox_path(project_root, &identity.pony_name);
+    let mailbox_path = identity
+        .mailbox_path
+        .clone()
+        .unwrap_or_else(|| pony_mailbox_path(project_root, &identity.pony_name));
     append_text_block(&mailbox_path, &message.mailbox_markdown())
 }
 
 pub(crate) fn display_pony_name(name: &str) -> String {
-    canonicalize_pony_name(name)
-        .split('_')
-        .filter(|part| !part.is_empty())
-        .map(title_case_word)
-        .collect::<Vec<_>>()
-        .join(" ")
+    agent_config_from_env()
+        .and_then(|roster| roster.resolve_display_name(name))
+        .unwrap_or_else(|| display_agent_name(name))
 }
 
 pub(crate) fn canonicalize_pony_name(name: &str) -> String {
-    let normalized = name.trim().to_ascii_uppercase().replace([' ', '-'], "_");
-    match normalized.as_str() {
-        "TIA"
-        | "CELESTIA"
-        | "PRINCESS"
-        | "CELLY"
-        | "SUNBUTT"
-        | "PRINCESS_CELESTIA_SOL_INVICTUS" => "PRINCESS_CELESTIA_SOL_INVICTUS".to_string(),
-        "TWI" | "TWILIGHT" | "TWILIGHT_SPARKLE" => "TWILIGHT_SPARKLE".to_string(),
-        "AJ" | "APPLEJACK" => "APPLEJACK".to_string(),
-        "FS" | "FLUTTERSHY" | "SHY" | "FLUTTERS" => "FLUTTERSHY".to_string(),
-        "PINKIE" | "PINKIE_PIE" => "PINKIE_PIE".to_string(),
-        "RARITY" | "RARES" => "RARITY".to_string(),
-        "RD" | "RAINBOW" | "RAINBOW_DASH" | "DASH" => "RAINBOW_DASH".to_string(),
-        "SPIKE" => "SPIKE".to_string(),
-        other => other.to_string(),
-    }
+    agent_config_from_env()
+        .and_then(|roster| roster.resolve_route(name).ok())
+        .unwrap_or_else(|| normalize_agent_name(name))
 }
 
-fn canonicalize_target_pony_name(name: &str) -> Result<String, String> {
-    let canonical = canonicalize_pony_name(name);
-    match canonical.as_str() {
-        "PRINCESS_CELESTIA_SOL_INVICTUS"
-        | "TWILIGHT_SPARKLE"
-        | "APPLEJACK"
-        | "FLUTTERSHY"
-        | "PINKIE_PIE"
-        | "RARITY"
-        | "RAINBOW_DASH"
-        | "SPIKE" => Ok(canonical),
-        _ => Err(format!(
-            "Unknown pony '{}'. Usage: /tell list | /tell <pony-name|all> <message>",
-            name.trim()
-        )),
+fn resolve_target_agent(name: &str) -> Result<String, String> {
+    if let Some(roster) = agent_config_from_env() {
+        roster.resolve_route(name)
+    } else {
+        Ok(normalize_agent_name(name))
     }
 }
 
 fn pony_usage() -> &'static str {
     "Usage: /tell list | /tell <pony-name|all> <message>"
+}
+
+impl AgentConfig {
+    fn current_agent(&self, raw_name: &str, project_path: &str) -> Option<AgentConfigAgent> {
+        let normalized_project = normalize_alias(project_path);
+        self.candidates().into_iter().find(|agent| {
+            agent.matches(raw_name) && normalize_alias(&agent.project_root) == normalized_project
+        })
+    }
+
+    fn resolve_route(&self, name: &str) -> Result<String, String> {
+        self.resolve_agent(name).map(|agent| agent.route())
+    }
+
+    fn resolve_agent(&self, name: &str) -> Result<AgentConfigAgent, String> {
+        let raw = name.trim();
+        let matches = self.matching_agents(raw);
+        if matches.is_empty() {
+            return Err(format!("Unknown pony '{}'. {}", raw, pony_usage()));
+        }
+
+        let unique = unique_agents_by_route(matches);
+        if raw.contains(':') {
+            return unique_agent_or_ambiguous(raw, unique);
+        }
+
+        let local = unique
+            .iter()
+            .filter(|agent| same_project(&agent.project_root, &self.project_root))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !local.is_empty() {
+            return unique_agent_or_ambiguous(raw, local);
+        }
+
+        if unique.len() == 1 && unique[0].is_global_singleton() {
+            return Ok(unique[0].clone());
+        }
+
+        Err(format!(
+            "Ambiguous pony '{raw}'. Use a disambiguated alias such as <project>:<name>."
+        ))
+    }
+
+    fn resolve_display_name(&self, name: &str) -> Option<String> {
+        let matches = self.matching_agents(name);
+        let unique = unique_agents_by_route(matches);
+        unique
+            .iter()
+            .find(|agent| same_project(&agent.project_root, &self.project_root))
+            .or_else(|| unique.iter().find(|agent| agent.is_global_singleton()))
+            .or_else(|| unique.first())
+            .map(|agent| agent.label.clone())
+    }
+
+    fn target_matches_agent(&self, target: &str, pony_name: &str) -> bool {
+        let Ok(target_route) = self.resolve_route(target) else {
+            return false;
+        };
+        let matches = self.matching_agents(pony_name);
+        unique_agents_by_route(matches)
+            .iter()
+            .any(|agent| normalize_alias(&agent.route()) == normalize_alias(&target_route))
+    }
+
+    fn matching_agents(&self, name: &str) -> Vec<AgentConfigAgent> {
+        self.candidates()
+            .into_iter()
+            .filter(|agent| agent.matches(name))
+            .collect()
+    }
+
+    fn candidates(&self) -> Vec<AgentConfigAgent> {
+        let mut agents = Vec::with_capacity(self.agents.len() + 1);
+        agents.push(AgentConfigAgent {
+            agent_id: self.agent_id.clone(),
+            route_id: self.route_id.clone(),
+            label: self.label.clone(),
+            icon: self.icon.clone(),
+            aliases: self.aliases.clone(),
+            project_root: self.project_root.clone(),
+            mailbox_path: self.mailbox_path.clone(),
+            message_log_path: self.message_log_path.clone(),
+            registry_path: self.registry_path.clone(),
+            global_singleton: self.global_singleton,
+        });
+        agents.extend(self.agents.clone());
+        agents
+    }
+}
+
+impl AgentConfigAgent {
+    fn route(&self) -> String {
+        if self.route_id.trim().is_empty() {
+            self.agent_id.clone()
+        } else {
+            self.route_id.clone()
+        }
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        let needle = normalize_alias(name);
+        self.match_names()
+            .iter()
+            .any(|alias| normalize_alias(alias) == needle)
+    }
+
+    fn match_names(&self) -> Vec<String> {
+        let mut names = vec![self.agent_id.clone(), self.route()];
+        names.extend(self.aliases.clone());
+        names
+    }
+
+    fn is_global_singleton(&self) -> bool {
+        self.global_singleton
+            || self.agent_id == "PRINCESS_CELESTIA_SOL_INVICTUS"
+            || self.route_id == "PRINCESS_CELESTIA_SOL_INVICTUS"
+    }
+}
+
+fn agent_config_from_env() -> Option<AgentConfig> {
+    let path = std::env::var(AGENT_CONFIG_ENV).ok()?;
+    let path = non_empty_path(&path)?;
+    let text = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn unique_agent_or_ambiguous(
+    raw: &str,
+    agents: Vec<AgentConfigAgent>,
+) -> Result<AgentConfigAgent, String> {
+    if agents.len() == 1 {
+        Ok(agents[0].clone())
+    } else {
+        Err(format!(
+            "Ambiguous pony '{raw}'. Use a disambiguated alias such as <project>:<name>."
+        ))
+    }
+}
+
+fn unique_agents_by_route(agents: Vec<AgentConfigAgent>) -> Vec<AgentConfigAgent> {
+    let mut unique = HashMap::new();
+    for agent in agents {
+        unique.entry(agent.route()).or_insert(agent);
+    }
+    unique.into_values().collect()
+}
+
+fn same_project(left: &str, right: &str) -> bool {
+    normalize_alias(left) == normalize_alias(right)
+}
+
+fn normalize_alias(name: &str) -> String {
+    name.trim().to_lowercase()
+}
+
+fn normalize_agent_name(name: &str) -> String {
+    name.trim().to_ascii_uppercase().replace([' ', '-'], "_")
+}
+
+fn display_agent_name(name: &str) -> String {
+    let name = name.rsplit_once(':').map_or(name, |(_, name)| name);
+    normalize_agent_name(name)
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .map(title_case_word)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn append_registry_heartbeat_at(
@@ -276,9 +487,7 @@ fn append_chat_message_at(
         id: Uuid::new_v4().to_string(),
         from_instance_id: identity.instance_id.clone(),
         from_pony_name: identity.pony_name.clone(),
-        from_symbol: pony_symbol_for_name(&identity.pony_name)
-            .unwrap_or("")
-            .to_string(),
+        from_symbol: identity.pony_symbol.clone(),
         to: normalize_target(target),
         subject,
         body,
@@ -323,7 +532,7 @@ fn read_new_messages_at(
         if entry.from_instance_id == identity.instance_id {
             continue;
         }
-        if !target_matches(&entry.to, &identity.pony_name) {
+        if !target_matches(&entry.to, identity) {
             continue;
         }
         let sender = canonicalize_pony_name(&entry.from_pony_name);
@@ -335,7 +544,7 @@ fn read_new_messages_at(
         }
     }
     let mut messages = latest_by_sender.into_values().collect::<Vec<_>>();
-    messages.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+    messages.sort_by_key(|left| left.created_at);
     Ok(messages)
 }
 
@@ -445,8 +654,11 @@ fn git_branch_for_path(path: &Path) -> String {
 }
 
 fn pony_registry_log_path() -> PathBuf {
-    pony_ipc_log_path(
+    let config_path =
+        agent_config_from_env().and_then(|config| non_empty_path(&config.registry_path));
+    pony_ipc_log_path_with_config(
         PONY_REGISTRY_LOG_PATH_ENV,
+        config_path.as_deref(),
         "pony.registry.jsonl",
         "codex-pony-registry.jsonl",
     )
@@ -457,23 +669,45 @@ fn pony_registry_lock_path() -> PathBuf {
 }
 
 fn pony_chat_log_path() -> PathBuf {
-    pony_ipc_log_path(
+    let config_path =
+        agent_config_from_env().and_then(|config| non_empty_path(&config.message_log_path));
+    pony_ipc_log_path_with_config(
         PONY_CHAT_LOG_PATH_ENV,
+        config_path.as_deref(),
         "pony.chat.jsonl",
         "codex-pony-chat.jsonl",
     )
+}
+
+fn pony_chat_log_path_for_target(target: &str) -> PathBuf {
+    if target != BROADCAST_TARGET
+        && !target.eq_ignore_ascii_case("all")
+        && let Some(path) = agent_config_from_env()
+            .and_then(|config| config.resolve_agent(target).ok())
+            .and_then(|agent| non_empty_path(&agent.message_log_path))
+    {
+        return path;
+    }
+
+    pony_chat_log_path()
 }
 
 fn pony_chat_lock_path() -> PathBuf {
     cleanup_lock_path_for(&pony_chat_log_path(), "pony.chat.cleanup.lock")
 }
 
-fn pony_ipc_log_path(env_name: &str, project_file_name: &str, legacy_file_name: &str) -> PathBuf {
+fn pony_ipc_log_path_with_config(
+    env_name: &str,
+    config_path: Option<&Path>,
+    project_file_name: &str,
+    legacy_file_name: &str,
+) -> PathBuf {
     let explicit_path = std::env::var(env_name).ok();
     let project_root = std::env::var(PROJECT_ROOT_ENV).ok();
     let current_dir = std::env::current_dir().ok();
     pony_ipc_log_path_for(
         explicit_path.as_deref(),
+        config_path,
         project_root.as_deref(),
         current_dir.as_deref(),
         project_file_name,
@@ -483,6 +717,7 @@ fn pony_ipc_log_path(env_name: &str, project_file_name: &str, legacy_file_name: 
 
 fn pony_ipc_log_path_for(
     explicit_path: Option<&str>,
+    config_path: Option<&Path>,
     project_root: Option<&str>,
     current_dir: Option<&Path>,
     project_file_name: &str,
@@ -495,6 +730,14 @@ fn pony_ipc_log_path_for(
             .is_none_or(|root| path.starts_with(root))
     {
         return path;
+    }
+
+    if let Some(path) = config_path
+        && project_root
+            .as_ref()
+            .is_none_or(|root| path.starts_with(root))
+    {
+        return path.to_path_buf();
     }
 
     if let Some(root) = project_root {
@@ -540,38 +783,34 @@ fn split_subject_and_body(text: &str) -> (String, String) {
     (subject, body)
 }
 
-fn pony_symbol_for_name(name: &str) -> Option<&'static str> {
-    match canonicalize_pony_name(name).as_str() {
-        "PRINCESS_CELESTIA_SOL_INVICTUS" => Some("☀︎"),
-        "TWILIGHT_SPARKLE" => Some("✶"),
-        "APPLEJACK" => Some("🍎"),
-        "FLUTTERSHY" => Some("🦋"),
-        "PINKIE_PIE" => Some("🎈"),
-        "RARITY" => Some("💎"),
-        "RAINBOW_DASH" => Some("⚡"),
-        "SPIKE" => Some("🐲"),
-        _ => None,
-    }
-}
-
 fn pony_mailbox_path(project_root: &Path, pony_name: &str) -> PathBuf {
+    if let Some(roster) = agent_config_from_env()
+        && let Some(path) = roster
+            .matching_agents(pony_name)
+            .into_iter()
+            .find(|agent| same_project(&agent.project_root, &roster.project_root))
+            .and_then(|agent| non_empty_path(&agent.mailbox_path))
+    {
+        return path;
+    }
+
     project_root
         .join("pony/team.coordination")
         .join(format!("{}.mailbox.md", pony_mailbox_stem(pony_name)))
 }
 
-fn pony_mailbox_stem(pony_name: &str) -> &'static str {
-    match canonicalize_pony_name(pony_name).as_str() {
-        "PRINCESS_CELESTIA_SOL_INVICTUS" => "celestia",
-        "TWILIGHT_SPARKLE" => "twi",
-        "APPLEJACK" => "aj",
-        "FLUTTERSHY" => "fs",
-        "PINKIE_PIE" => "pinkie",
-        "RARITY" => "rarity",
-        "RAINBOW_DASH" => "rd",
-        "SPIKE" => "spike",
-        _ => "unknown",
-    }
+fn pony_mailbox_stem(pony_name: &str) -> String {
+    normalize_agent_name(pony_name)
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn append_text_block(path: &Path, block: &str) -> io::Result<()> {
@@ -587,13 +826,19 @@ fn normalize_target(target: &str) -> String {
     if target == BROADCAST_TARGET || target.eq_ignore_ascii_case("all") {
         BROADCAST_TARGET.to_string()
     } else {
-        canonicalize_pony_name(target)
+        resolve_target_agent(target).unwrap_or_else(|_| normalize_agent_name(target))
     }
 }
 
-fn target_matches(target: &str, pony_name: &str) -> bool {
+fn target_matches(target: &str, identity: &PonyIdentity) -> bool {
     target == BROADCAST_TARGET
-        || canonicalize_pony_name(target) == canonicalize_pony_name(pony_name)
+        || normalize_alias(target) == normalize_alias(&identity.pony_name)
+        || identity
+            .pony_aliases
+            .iter()
+            .any(|alias| normalize_alias(target) == normalize_alias(alias))
+        || agent_config_from_env()
+            .is_some_and(|roster| roster.target_matches_agent(target, &identity.pony_name))
 }
 
 fn is_stale(timestamp: DateTime<Utc>) -> bool {
@@ -652,9 +897,72 @@ mod tests {
         PonyIdentity {
             instance_id: "uuid-1".to_string(),
             pony_name: "TWILIGHT_SPARKLE".to_string(),
+            pony_symbol: "✶".to_string(),
+            pony_aliases: vec![
+                "TWILIGHT_SPARKLE".to_string(),
+                "Twilight Sparkle".to_string(),
+                "Twilight".to_string(),
+            ],
+            mailbox_path: None,
             project_path: "/tmp/project".to_string(),
             git_branch: "pony/twi/main".to_string(),
             pid: 42,
+        }
+    }
+
+    fn sample_roster() -> AgentConfig {
+        AgentConfig {
+            agent_id: "TWILIGHT_SPARKLE".to_string(),
+            route_id: "CODEX:TWILIGHT_SPARKLE".to_string(),
+            label: "Twilight Sparkle".to_string(),
+            icon: "✶".to_string(),
+            aliases: vec![
+                "Twilight Sparkle".to_string(),
+                "Twilight".to_string(),
+                "CODEX:Twilight Sparkle".to_string(),
+            ],
+            project_root: "/tmp/codex".to_string(),
+            mailbox_path: "/tmp/codex/pony/team.coordination/twi.mailbox.md".to_string(),
+            message_log_path: "/tmp/codex/pony/runtime/pony.chat.jsonl".to_string(),
+            registry_path: "/tmp/codex/pony/runtime/pony.registry.jsonl".to_string(),
+            global_singleton: false,
+            agents: vec![
+                AgentConfigAgent {
+                    agent_id: "TWILIGHT_SPARKLE".to_string(),
+                    route_id: "EVH:TWILIGHT_SPARKLE".to_string(),
+                    label: "Twilight Sparkle".to_string(),
+                    icon: "✶".to_string(),
+                    aliases: vec![
+                        "Twilight Sparkle".to_string(),
+                        "Twilight".to_string(),
+                        "EVH:Twilight Sparkle".to_string(),
+                    ],
+                    project_root: "/tmp/evh".to_string(),
+                    mailbox_path: "/tmp/evh/pony/team.coordination/twi.mailbox.md".to_string(),
+                    message_log_path: "/tmp/evh/pony/runtime/pony.chat.jsonl".to_string(),
+                    registry_path: "/tmp/evh/pony/runtime/pony.registry.jsonl".to_string(),
+                    global_singleton: false,
+                },
+                AgentConfigAgent {
+                    agent_id: "PRINCESS_CELESTIA_SOL_INVICTUS".to_string(),
+                    route_id: "PRINCESS_CELESTIA_SOL_INVICTUS".to_string(),
+                    label: "Princess Celestia Sol Invictus".to_string(),
+                    icon: "☀︎".to_string(),
+                    aliases: vec![
+                        "Princess Celestia Sol Invictus".to_string(),
+                        "Celestia".to_string(),
+                    ],
+                    project_root: "/tmp/agenic-pony-system".to_string(),
+                    mailbox_path:
+                        "/tmp/agenic-pony-system/pony/team.coordination/celestia.mailbox.md"
+                            .to_string(),
+                    message_log_path: "/tmp/agenic-pony-system/pony/runtime/pony.chat.jsonl"
+                        .to_string(),
+                    registry_path: "/tmp/agenic-pony-system/pony/runtime/pony.registry.jsonl"
+                        .to_string(),
+                    global_singleton: true,
+                },
+            ],
         }
     }
 
@@ -662,7 +970,7 @@ mod tests {
     fn parse_send_command_supports_list_direct_and_broadcast() {
         assert_eq!(parse_send_command("list").unwrap(), PonySendCommand::List);
         assert_eq!(
-            parse_send_command("pinkie hello there").unwrap(),
+            parse_send_command("PINKIE_PIE hello there").unwrap(),
             PonySendCommand::Send {
                 target: "PINKIE_PIE".to_string(),
                 text: "hello there".to_string(),
@@ -675,25 +983,48 @@ mod tests {
                 text: "status check".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn roster_keeps_unqualified_ambiguous_aliases_local() {
         assert_eq!(
-            parse_send_command("princess status report").unwrap(),
-            PonySendCommand::Send {
-                target: "PRINCESS_CELESTIA_SOL_INVICTUS".to_string(),
-                text: "status report".to_string(),
-            }
-        );
-        assert_eq!(
-            parse_send_command("rd clear the sky").unwrap(),
-            PonySendCommand::Send {
-                target: "RAINBOW_DASH".to_string(),
-                text: "clear the sky".to_string(),
-            }
+            sample_roster().resolve_route("Twilight").unwrap(),
+            "CODEX:TWILIGHT_SPARKLE"
         );
     }
 
     #[test]
-    fn parse_send_command_rejects_unknown_target() {
-        let err = parse_send_command("discord status check").unwrap_err();
+    fn roster_allows_explicit_qualified_cross_repo_targets() {
+        assert_eq!(
+            sample_roster()
+                .resolve_route("EVH:Twilight Sparkle")
+                .unwrap(),
+            "EVH:TWILIGHT_SPARKLE"
+        );
+    }
+
+    #[test]
+    fn roster_selects_target_message_log_for_qualified_cross_repo_target() {
+        let target = sample_roster()
+            .resolve_agent("EVH:Twilight Sparkle")
+            .unwrap();
+        assert_eq!(
+            non_empty_path(&target.message_log_path).unwrap(),
+            PathBuf::from("/tmp/evh/pony/runtime/pony.chat.jsonl")
+        );
+    }
+
+    #[test]
+    fn roster_preserves_celestia_as_singleton() {
+        assert_eq!(
+            sample_roster().resolve_route("Celestia").unwrap(),
+            "PRINCESS_CELESTIA_SOL_INVICTUS"
+        );
+    }
+
+    #[test]
+    fn roster_rejects_unknown_target() {
+        let err = sample_roster().resolve_route("discord").unwrap_err();
         assert!(err.contains("Unknown pony 'discord'"));
     }
 
@@ -827,6 +1158,7 @@ mod tests {
         assert_eq!(
             pony_ipc_log_path_for(
                 /*explicit_path*/ None,
+                /*config_path*/ None,
                 Some("/tmp/project"),
                 Some(Path::new("/tmp/other")),
                 "pony.chat.jsonl",
@@ -841,6 +1173,7 @@ mod tests {
         assert_eq!(
             pony_ipc_log_path_for(
                 Some("/tmp/source/pony/runtime/pony.chat.jsonl"),
+                /*config_path*/ None,
                 Some("/tmp/codex"),
                 Some(Path::new("/tmp/other")),
                 "pony.chat.jsonl",
@@ -855,6 +1188,7 @@ mod tests {
         assert_eq!(
             pony_ipc_log_path_for(
                 Some("/tmp/codex/pony/runtime/custom.chat.jsonl"),
+                /*config_path*/ None,
                 Some("/tmp/codex"),
                 Some(Path::new("/tmp/other")),
                 "pony.chat.jsonl",
@@ -869,12 +1203,28 @@ mod tests {
         assert_eq!(
             pony_ipc_log_path_for(
                 /*explicit_path*/ None,
+                /*config_path*/ None,
                 /*project_root*/ None,
                 Some(Path::new("/tmp/cwd")),
                 "pony.chat.jsonl",
                 "codex-pony-chat.jsonl",
             ),
             PathBuf::from("/tmp/cwd/pony/runtime/pony.chat.jsonl")
+        );
+    }
+
+    #[test]
+    fn ipc_log_path_uses_config_path_under_project_root() {
+        assert_eq!(
+            pony_ipc_log_path_for(
+                /*explicit_path*/ None,
+                Some(Path::new("/tmp/project/pony/runtime/config.chat.jsonl")),
+                Some("/tmp/project"),
+                Some(Path::new("/tmp/other")),
+                "pony.chat.jsonl",
+                "codex-pony-chat.jsonl",
+            ),
+            PathBuf::from("/tmp/project/pony/runtime/config.chat.jsonl")
         );
     }
 }
