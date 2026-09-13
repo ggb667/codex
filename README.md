@@ -9,7 +9,7 @@ If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="http
 
 ---
 
-## Codex-side integration for Agenic Pony
+## Codex-side integration for multi-agent Codex orchestration such as the Agenic Pony System
 
 This fork is the customized **Codex TUI** used by the separate **Agenic Pony System** runtime.
 
