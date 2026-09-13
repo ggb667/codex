@@ -9,6 +9,30 @@ If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="http
 
 ---
 
+## Agenic Pony System — multi-agent Codex orchestration
+
+This fork extends OpenAI Codex CLI with the **Agenic Pony System**, a local multi-agent development environment built around persistent, named Codex agents that can coordinate work across a project.
+
+The goal is to make several specialized agents behave more like a software team than a collection of isolated chat sessions.
+
+### What this fork adds
+
+- **Persistent named agents** with distinct identities, prompts, and working roles.
+- **Inter-agent messaging** through Pony IPC, including `/tell` for direct agent-to-agent communication.
+- **Generated agent roster and routing** so agents can discover and address the current team without hard-coded recipient lists.
+- **Shared project coordination** through project-local runtime and coordination state.
+- **Agent-specific TUI identity** with configurable prompt glyphs and backgrounds, making parallel sessions easy to distinguish visually.
+- **Shared launcher/runtime tooling** for starting team members consistently across projects.
+- **Terminal input recovery** so TUI input can restart after an underlying terminal event stream closes unexpectedly.
+
+The current system includes personalities such as **Twilight Sparkle** and **Princess Celestia Sol Invictus**, but the orchestration layer is designed around generated configuration rather than a fixed set of agents.
+
+For implementation details, see [Pony IPC](./docs/pony-ipc.md).
+
+> **Status:** This is an experimental fork of OpenAI Codex. The Pony extensions are maintained separately from upstream Codex and are periodically rebased/ported onto newer Codex releases.
+
+---
+
 ## Quickstart
 
 ### Installing and running Codex CLI
