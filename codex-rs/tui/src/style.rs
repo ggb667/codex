@@ -89,7 +89,7 @@ pub(crate) fn footer_hint_label_style() -> Style {
 pub fn user_message_style_for(terminal_bg: Option<(u8, u8, u8)>) -> Style {
     if let Some(color) = *user_message_bg_override_lock()
         .read()
-        .expect("user message background lock poisoned")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
     {
         return Style::default().bg(color);
     }
@@ -158,7 +158,7 @@ pub(crate) fn set_user_message_bg_override(value: Option<String>) -> Option<Stri
             Err(err) => {
                 *user_message_bg_override_lock()
                     .write()
-                    .expect("user message background lock poisoned") = None;
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                 return Some(format!("Ignoring tui.prompt_background={value:?}: {err}"));
             }
         },
@@ -167,7 +167,7 @@ pub(crate) fn set_user_message_bg_override(value: Option<String>) -> Option<Stri
 
     *user_message_bg_override_lock()
         .write()
-        .expect("user message background lock poisoned") = override_color;
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = override_color;
     None
 }
 
@@ -180,11 +180,11 @@ fn parse_hex_color(value: &str) -> Result<Color, &'static str> {
     }
 
     let rgb = u32::from_str_radix(hex, 16).map_err(|_| "expected only hex digits")?;
-    Ok(Color::Rgb(
+    Ok(rgb_color((
         ((rgb >> 16) & 0xff) as u8,
         ((rgb >> 8) & 0xff) as u8,
         (rgb & 0xff) as u8,
-    ))
+    )))
 }
 
 #[cfg(test)]
