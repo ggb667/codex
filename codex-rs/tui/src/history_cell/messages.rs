@@ -4,6 +4,7 @@ use super::markdown_render_cache::MarkdownRenderCache;
 use super::*;
 use crate::terminal_hyperlinks::annotate_web_urls_in_line;
 use crate::terminal_hyperlinks::remap_wrapped_line;
+use crate::ui_consts::prompt_glyph;
 use crate::wrapping::url_preserving_wrap_options;
 use crate::wrapping::word_wrap_line;
 use std::borrow::Cow;
@@ -165,7 +166,7 @@ impl HistoryCell for UserHistoryCell {
         };
         let wrap_width = width
             .saturating_sub(
-                LIVE_PREFIX_COLS + 1, /* keep a one-column right margin for wrapping */
+                live_prefix_cols().saturating_add(1), /* keep a one-column right margin for wrapping */
             )
             .max(1);
 
@@ -251,8 +252,8 @@ impl HistoryCell for UserHistoryCell {
         if let Some(wrapped_remote_images) = wrapped_remote_images {
             lines.extend(prefix_hyperlink_lines(
                 wrapped_remote_images,
-                "  ".into(),
-                "  ".into(),
+                live_prefix_spaces().into(),
+                live_prefix_spaces().into(),
             ));
             if wrapped_message.is_some() {
                 lines.push(HyperlinkLine::new(Line::from("").style(style)));
@@ -262,8 +263,8 @@ impl HistoryCell for UserHistoryCell {
         if let Some(wrapped_message) = wrapped_message {
             lines.extend(prefix_hyperlink_lines(
                 wrapped_message,
-                "› ".bold().dim(),
-                "  ".into(),
+                Span::from(format!("{} ", prompt_glyph())).bold().dim(),
+                live_prefix_spaces().into(),
             ));
         }
 

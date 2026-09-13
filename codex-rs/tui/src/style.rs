@@ -9,6 +9,8 @@ use crate::terminal_palette::rgb_color;
 use crate::terminal_palette::stdout_color_level;
 use ratatui::style::Color;
 use ratatui::style::Style;
+use std::sync::OnceLock;
+use std::sync::RwLock;
 
 const LIGHT_BG_ACCENT_RGB: (u8, u8, u8) = (0, 95, 135);
 
@@ -42,6 +44,12 @@ fn status_style_for(
 }
 // Decorative table rules should remain visible without competing with cell content.
 const TABLE_SEPARATOR_FG_ALPHA: f32 = 0.20;
+
+static USER_MESSAGE_BG_OVERRIDE: OnceLock<RwLock<Option<Color>>> = OnceLock::new();
+
+fn user_message_bg_override_lock() -> &'static RwLock<Option<Color>> {
+    USER_MESSAGE_BG_OVERRIDE.get_or_init(|| RwLock::new(None))
+}
 
 pub fn user_message_style() -> Style {
     user_message_style_for(default_bg())
@@ -79,6 +87,13 @@ pub(crate) fn footer_hint_label_style() -> Style {
 
 /// Returns the style for a user-authored message using the provided terminal background.
 pub fn user_message_style_for(terminal_bg: Option<(u8, u8, u8)>) -> Style {
+    if let Some(color) = *user_message_bg_override_lock()
+        .read()
+        .expect("user message background lock poisoned")
+    {
+        return Style::default().bg(color);
+    }
+
     match terminal_bg {
         Some(bg) => Style::default().bg(user_message_bg(bg)),
         None => Style::default(),
@@ -134,6 +149,42 @@ pub(crate) fn user_message_bg_rgb(terminal_bg: (u8, u8, u8)) -> (u8, u8, u8) {
 #[allow(clippy::disallowed_methods)]
 pub fn proposed_plan_bg(terminal_bg: (u8, u8, u8)) -> Color {
     user_message_bg(terminal_bg)
+}
+
+pub(crate) fn set_user_message_bg_override(value: Option<String>) -> Option<String> {
+    let override_color = match value {
+        Some(value) => match parse_hex_color(&value) {
+            Ok(color) => Some(color),
+            Err(err) => {
+                *user_message_bg_override_lock()
+                    .write()
+                    .expect("user message background lock poisoned") = None;
+                return Some(format!("Ignoring tui.prompt_background={value:?}: {err}"));
+            }
+        },
+        None => None,
+    };
+
+    *user_message_bg_override_lock()
+        .write()
+        .expect("user message background lock poisoned") = override_color;
+    None
+}
+
+fn parse_hex_color(value: &str) -> Result<Color, &'static str> {
+    let hex = value
+        .strip_prefix('#')
+        .ok_or("expected a #RRGGBB hex color")?;
+    if hex.len() != 6 {
+        return Err("expected exactly 6 hex digits");
+    }
+
+    let rgb = u32::from_str_radix(hex, 16).map_err(|_| "expected only hex digits")?;
+    Ok(Color::Rgb(
+        ((rgb >> 16) & 0xff) as u8,
+        ((rgb >> 8) & 0xff) as u8,
+        (rgb & 0xff) as u8,
+    ))
 }
 
 #[cfg(test)]
