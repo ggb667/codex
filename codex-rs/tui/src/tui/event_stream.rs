@@ -17,6 +17,7 @@
 //!
 //! See https://ratatui.rs/recipes/apps/spawn-vim/ and https://www.reddit.com/r/rust/comments/1f3o33u/myterious_crossterm_input_after_running_vim for more details.
 
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -24,10 +25,13 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
+use std::time::Duration;
 
 use crossterm::event::Event;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
+use tokio::time::Sleep;
+use tokio::time::sleep;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::WatchStream;
@@ -37,6 +41,8 @@ use super::TuiEvent;
 
 /// Result type produced by an event source.
 pub type EventResult = std::io::Result<Event>;
+
+const INPUT_RESTART_DELAY: Duration = Duration::from_millis(100);
 
 /// Abstraction over a source of terminal events. Allows swapping in a fake for tests.
 /// Value in production is [`CrosstermEventSource`].
@@ -156,6 +162,7 @@ pub struct TuiEventStream<S: EventSource + Default + Unpin = CrosstermEventSourc
     resume_stream: WatchStream<()>,
     terminal_focused: Arc<AtomicBool>,
     poll_draw_first: bool,
+    input_restart_sleep: Option<Pin<Box<Sleep>>>,
     #[cfg(unix)]
     suspend_context: crate::tui::job_control::SuspendContext,
     #[cfg(unix)]
@@ -177,6 +184,7 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
             resume_stream,
             terminal_focused,
             poll_draw_first: false,
+            input_restart_sleep: None,
             #[cfg(unix)]
             suspend_context,
             #[cfg(unix)]
@@ -189,7 +197,20 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
     /// This skips events we don't use (mouse events, etc.) and keeps polling until it yields
     /// a mapped event, hits `Pending`, or sees EOF/error. When the broker is paused, it drops
     /// the underlying stream and returns `Pending` to fully release stdin.
+    fn schedule_input_restart(&mut self, cx: &mut Context<'_>) {
+        let mut sleep = Box::pin(sleep(INPUT_RESTART_DELAY));
+        let _ = Pin::new(&mut sleep).poll(cx);
+        self.input_restart_sleep = Some(sleep);
+    }
+
     pub fn poll_crossterm_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<TuiEvent>> {
+        if let Some(sleep) = self.input_restart_sleep.as_mut() {
+            if Pin::new(sleep).poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            self.input_restart_sleep = None;
+        }
+
         // Some crossterm events map to None (e.g. mouse); loop so we keep polling
         // until we return a mapped event, hit Pending, or see EOF/error.
         loop {
@@ -213,9 +234,22 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
                 };
                 match Pin::new(events).poll_next(cx) {
                     Poll::Ready(Some(Ok(event))) => Some(event),
-                    Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
+                    Poll::Ready(Some(Err(err))) => {
+                        tracing::warn!(
+                            error = %err,
+                            "terminal input event source failed; restarting"
+                        );
                         *state = EventBrokerState::Start;
-                        return Poll::Ready(None);
+                        drop(state);
+                        self.schedule_input_restart(cx);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(None) => {
+                        tracing::warn!("terminal input event source ended; restarting");
+                        *state = EventBrokerState::Start;
+                        drop(state);
+                        self.schedule_input_restart(cx);
+                        return Poll::Pending;
                     }
                     Poll::Pending => {
                         drop(state);
@@ -560,14 +594,37 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn error_or_eof_ends_stream() {
+    async fn error_restarts_input_stream() {
         let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
-        let mut stream = make_stream(broker, draw_rx, terminal_focused);
+        let mut stream = make_stream(broker.clone(), draw_rx, terminal_focused);
 
         handle.send(Err(std::io::Error::other("boom")));
+        let task = tokio::spawn(async move { stream.next().await });
+        for _ in 0..10 {
+            if matches!(
+                &*broker
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                EventBrokerState::Start
+            ) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(INPUT_RESTART_DELAY + Duration::from_millis(/*millis*/ 50)).await;
 
-        let next = stream.next().await;
-        assert!(next.is_none());
+        let expected_key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        handle.send(Ok(Event::Key(expected_key)));
+
+        let next = timeout(Duration::from_millis(/*millis*/ 500), task)
+            .await
+            .expect("timed out waiting for restarted input stream")
+            .expect("join failed");
+        match next {
+            Some(TuiEvent::Key(key)) => assert_eq!(key, expected_key),
+            other => panic!("expected key event after restart, got {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
