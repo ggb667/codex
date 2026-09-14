@@ -754,8 +754,12 @@ impl ChatWidget {
             }
             SlashCommand::Tell => match crate::pony_ipc::parse_send_command(trimmed) {
                 Ok(crate::pony_ipc::PonySendCommand::List) => self.handle_pony_list_active(),
-                Ok(crate::pony_ipc::PonySendCommand::Send { target, text }) => {
-                    self.handle_pony_send(target, text);
+                Ok(crate::pony_ipc::PonySendCommand::Send {
+                    target,
+                    text,
+                    delivery_class,
+                }) => {
+                    self.handle_pony_send(target, text, delivery_class);
                 }
                 Err(err) => self.add_error_message(err),
             },

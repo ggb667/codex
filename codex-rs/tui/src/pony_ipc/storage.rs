@@ -17,6 +17,7 @@ use std::process::Command;
 use uuid::Uuid;
 
 use super::BROADCAST_TARGET;
+use super::DeliveryClass;
 use super::PONY_CHAT_LOG_PATH_ENV;
 use super::PONY_REGISTRY_LOG_PATH_ENV;
 use super::PROJECT_ROOT_ENV;
@@ -48,8 +49,11 @@ pub(super) fn append_chat_message_at(
     identity: &PonyIdentity,
     target: &str,
     text: &str,
+    delivery_class: DeliveryClass,
 ) -> io::Result<PonyChatEntry> {
-    maybe_reset_stale_chat_log(chat_path, lock_path)?;
+    if delivery_class == DeliveryClass::Ephemeral {
+        maybe_reset_stale_chat_log(chat_path, lock_path)?;
+    }
     let trimmed = text.trim();
     let (subject, body) = split_subject_and_body(trimmed);
     let entry = PonyChatEntry {
@@ -61,6 +65,7 @@ pub(super) fn append_chat_message_at(
         subject,
         body,
         created_at: Utc::now(),
+        delivery_class,
     };
     append_json_line(chat_path, &entry)?;
     Ok(entry)
@@ -95,7 +100,7 @@ pub(super) fn read_new_messages_at(
     maybe_reset_stale_chat_log(chat_path, lock_path)?;
     let mut latest_by_sender: HashMap<String, PonyChatEntry> = HashMap::new();
     for entry in read_jsonl::<PonyChatEntry>(chat_path)? {
-        if is_stale(entry.created_at) {
+        if entry.delivery_class == DeliveryClass::Ephemeral && is_stale(entry.created_at) {
             continue;
         }
         if entry.from_instance_id == identity.instance_id {
@@ -159,10 +164,14 @@ fn latest_registry_timestamp(path: &Path) -> io::Result<Option<DateTime<Utc>>> {
 }
 
 fn latest_chat_timestamp(path: &Path) -> io::Result<Option<DateTime<Utc>>> {
-    Ok(read_jsonl::<PonyChatEntry>(path)?
-        .into_iter()
-        .map(|entry| entry.created_at)
-        .max())
+    let mut latest = None;
+    for entry in read_jsonl::<PonyChatEntry>(path)? {
+        if entry.delivery_class == DeliveryClass::Durable {
+            return Ok(None);
+        }
+        latest = latest.max(Some(entry.created_at));
+    }
+    Ok(latest)
 }
 
 pub(super) fn append_json_line<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
@@ -263,6 +272,14 @@ pub(super) fn pony_chat_log_path_for_target(target: &str) -> PathBuf {
 
 pub(super) fn pony_chat_lock_path() -> PathBuf {
     cleanup_lock_path_for(&pony_chat_log_path(), "pony.chat.cleanup.lock")
+}
+
+pub(super) fn receipt_ledger_path(pony_name: &str) -> PathBuf {
+    let file_name = format!(
+        "pony.receipts-{}.jsonl",
+        normalize_agent_name(pony_name).to_ascii_lowercase()
+    );
+    pony_chat_log_path().with_file_name(file_name)
 }
 
 fn pony_ipc_log_path_with_config(

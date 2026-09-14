@@ -16,6 +16,7 @@ use roster::agent_config_from_env;
 use roster::display_agent_name;
 use roster::normalize_agent_name;
 use storage::append_chat_message_at;
+use storage::append_json_line;
 use storage::append_registry_heartbeat_at;
 use storage::append_text_block;
 use storage::cleanup_lock_path_for;
@@ -26,8 +27,10 @@ use storage::pony_chat_log_path_for_target;
 use storage::pony_mailbox_path;
 use storage::pony_registry_lock_path;
 use storage::pony_registry_log_path;
+use storage::read_jsonl;
 use storage::read_live_registry_at;
 use storage::read_new_messages_at;
+use storage::receipt_ledger_path;
 
 pub(crate) const PONY_IPC_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6);
 pub(super) const STALE_AFTER_SECS: i64 = 60 * 60;
@@ -41,7 +44,24 @@ pub(super) const AGENT_CONFIG_ENV: &str = "CODEX_AGENT_CONFIG";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PonySendCommand {
     List,
-    Send { target: String, text: String },
+    Send {
+        target: String,
+        text: String,
+        delivery_class: DeliveryClass,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum DeliveryClass {
+    Ephemeral,
+    Durable,
+}
+
+impl Default for DeliveryClass {
+    fn default() -> Self {
+        Self::Ephemeral
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -76,6 +96,8 @@ pub(crate) struct PonyChatEntry {
     pub(crate) subject: String,
     pub(crate) body: String,
     pub(crate) created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub(crate) delivery_class: DeliveryClass,
 }
 
 impl PonyChatEntry {
@@ -199,6 +221,19 @@ fn parse_send_command_with_roster(
         return Err(pony_usage().to_string());
     }
 
+    let (delivery_class, target, text) = if target.eq_ignore_ascii_case("durable") {
+        let Some((target, text)) = text.split_once(char::is_whitespace) else {
+            return Err(pony_usage().to_string());
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(pony_usage().to_string());
+        }
+        (DeliveryClass::Durable, target, text.to_string())
+    } else {
+        (DeliveryClass::Ephemeral, target, text.to_string())
+    };
+
     let target = if target.eq_ignore_ascii_case("all") {
         BROADCAST_TARGET.to_string()
     } else {
@@ -207,7 +242,8 @@ fn parse_send_command_with_roster(
 
     Ok(PonySendCommand::Send {
         target,
-        text: text.to_string(),
+        text,
+        delivery_class,
     })
 }
 
@@ -221,10 +257,22 @@ pub(crate) fn append_chat_message(
     identity: &PonyIdentity,
     target: &str,
     text: &str,
+    delivery_class: DeliveryClass,
 ) -> io::Result<PonyChatEntry> {
-    let chat_path = pony_chat_log_path_for_target(target);
+    let chat_path = if delivery_class == DeliveryClass::Durable {
+        pony_chat_log_path_for_target(target)
+    } else {
+        pony_chat_log_path()
+    };
     let lock_path = cleanup_lock_path_for(&chat_path, "pony.chat.cleanup.lock");
-    append_chat_message_at(&chat_path, &lock_path, identity, target, text)
+    append_chat_message_at(
+        &chat_path,
+        &lock_path,
+        identity,
+        target,
+        text,
+        delivery_class,
+    )
 }
 
 pub(crate) fn read_live_registry() -> io::Result<Vec<PonyRegistryEntry>> {
@@ -237,6 +285,18 @@ pub(crate) fn read_new_messages(identity: &PonyIdentity) -> io::Result<Vec<PonyC
     let chat_path = pony_chat_log_path();
     let lock_path = pony_chat_lock_path();
     read_new_messages_at(&chat_path, &lock_path, identity)
+}
+
+pub(crate) fn receipt_recorded(identity: &PonyIdentity, id: &str) -> io::Result<bool> {
+    Ok(
+        read_jsonl::<String>(&receipt_ledger_path(&identity.pony_name))?
+            .iter()
+            .any(|seen| seen == id),
+    )
+}
+
+pub(crate) fn record_receipt(identity: &PonyIdentity, id: &str) -> io::Result<()> {
+    append_json_line(&receipt_ledger_path(&identity.pony_name), &id.to_string())
 }
 
 pub(crate) fn append_incoming_message_to_mailbox(
@@ -280,7 +340,7 @@ fn resolve_target_agent_with_roster(
 }
 
 fn pony_usage() -> &'static str {
-    "Usage: /tell list | /tell <pony-name|all> <message>"
+    "Usage: /tell list | /tell [durable] <pony-name|all> <message>"
 }
 
 fn non_empty_path(value: &str) -> Option<PathBuf> {

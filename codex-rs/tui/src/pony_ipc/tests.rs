@@ -93,6 +93,7 @@ fn parse_send_command_supports_list_direct_and_broadcast() {
         PonySendCommand::Send {
             target: "PINKIE_PIE".to_string(),
             text: "hello there".to_string(),
+            delivery_class: DeliveryClass::Ephemeral,
         }
     );
     assert_eq!(
@@ -100,6 +101,15 @@ fn parse_send_command_supports_list_direct_and_broadcast() {
         PonySendCommand::Send {
             target: "*".to_string(),
             text: "status check".to_string(),
+            delivery_class: DeliveryClass::Ephemeral,
+        }
+    );
+    assert_eq!(
+        parse_send_command_with_roster("durable PINKIE_PIE keep this", /*roster*/ None).unwrap(),
+        PonySendCommand::Send {
+            target: "PINKIE_PIE".to_string(),
+            text: "keep this".to_string(),
+            delivery_class: DeliveryClass::Durable,
         }
     );
 }
@@ -162,6 +172,7 @@ fn read_new_messages_keeps_only_latest_message_per_sender() {
         subject: "older waiting note".to_string(),
         body: String::new(),
         created_at: Utc::now() - ChronoDuration::seconds(5),
+        delivery_class: DeliveryClass::Ephemeral,
     };
     let fresh_from_pinkie = PonyChatEntry {
         id: "msg-2".to_string(),
@@ -172,6 +183,7 @@ fn read_new_messages_keeps_only_latest_message_per_sender() {
         subject: "latest waiting note".to_string(),
         body: String::new(),
         created_at: Utc::now(),
+        delivery_class: DeliveryClass::Ephemeral,
     };
     let stale = PonyChatEntry {
         id: "msg-3".to_string(),
@@ -182,6 +194,7 @@ fn read_new_messages_keeps_only_latest_message_per_sender() {
         subject: "old message".to_string(),
         body: String::new(),
         created_at: Utc::now() - ChronoDuration::hours(2),
+        delivery_class: DeliveryClass::Ephemeral,
     };
     let own = PonyChatEntry {
         id: "msg-4".to_string(),
@@ -192,6 +205,7 @@ fn read_new_messages_keeps_only_latest_message_per_sender() {
         subject: "self".to_string(),
         body: String::new(),
         created_at: Utc::now(),
+        delivery_class: DeliveryClass::Ephemeral,
     };
     let fresh_from_dash = PonyChatEntry {
         id: "msg-5".to_string(),
@@ -202,6 +216,7 @@ fn read_new_messages_keeps_only_latest_message_per_sender() {
         subject: "dash status".to_string(),
         body: String::new(),
         created_at: Utc::now() - ChronoDuration::seconds(1),
+        delivery_class: DeliveryClass::Ephemeral,
     };
     append_json_line(&chat_path, &older_from_pinkie).unwrap();
     append_json_line(&chat_path, &fresh_from_pinkie).unwrap();
@@ -220,6 +235,31 @@ fn read_new_messages_keeps_only_latest_message_per_sender() {
 }
 
 #[test]
+fn read_new_messages_keeps_stale_durable_messages() {
+    let temp = tempdir().unwrap();
+    let chat_path = temp.path().join("chat.jsonl");
+    let lock_path = temp.path().join("chat.lock");
+    let identity = sample_identity();
+    let durable = PonyChatEntry {
+        id: "msg-durable".to_string(),
+        from_instance_id: "uuid-6".to_string(),
+        from_pony_name: "PINKIE_PIE".to_string(),
+        from_symbol: "🎈".to_string(),
+        to: "TWILIGHT_SPARKLE".to_string(),
+        subject: "durable note".to_string(),
+        body: String::new(),
+        created_at: Utc::now() - ChronoDuration::hours(2),
+        delivery_class: DeliveryClass::Durable,
+    };
+    append_json_line(&chat_path, &durable).unwrap();
+
+    assert_eq!(
+        read_new_messages_at(&chat_path, &lock_path, &identity).unwrap(),
+        vec![durable]
+    );
+}
+
+#[test]
 fn parse_send_command_splits_subject_and_body() {
     let entry = append_chat_message_at(
         Path::new("/tmp/chat.jsonl"),
@@ -227,6 +267,7 @@ fn parse_send_command_splits_subject_and_body() {
         &sample_identity(),
         "TWILIGHT_SPARKLE",
         "databases should use RDS. Please update the schema tonight.",
+        DeliveryClass::Ephemeral,
     )
     .unwrap();
     assert_eq!(entry.subject, "databases should use RDS");
@@ -245,6 +286,7 @@ fn mailbox_markdown_uses_sender_symbol() {
         subject: "databases should use RDS".to_string(),
         body: " Please update the schema tonight.".to_string(),
         created_at: Utc::now(),
+        delivery_class: DeliveryClass::Ephemeral,
     };
     let rendered = entry.mailbox_markdown();
     assert!(rendered.contains("FROM: 🍎 Applejack"));

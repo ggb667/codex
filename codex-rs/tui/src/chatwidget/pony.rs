@@ -18,7 +18,6 @@ impl ChatWidget {
 
     fn spawn_pony_ipc_task(app_event_tx: AppEventSender, identity: PonyIdentity) -> JoinHandle<()> {
         tokio::spawn(async move {
-            let mut seen_ids = HashSet::new();
             loop {
                 if let Err(err) = pony_ipc::append_registry_heartbeat(&identity) {
                     tracing::debug!(error = %err, "failed to refresh pony IPC heartbeat");
@@ -26,14 +25,17 @@ impl ChatWidget {
                 match pony_ipc::read_new_messages(&identity) {
                     Ok(messages) => {
                         for message in messages {
-                            if !seen_ids.insert(message.id.clone()) {
+                            if pony_ipc::receipt_recorded(&identity, &message.id).unwrap_or(false) {
                                 continue;
                             }
                             if let Err(err) =
                                 pony_ipc::append_incoming_message_to_mailbox(&identity, &message)
                             {
                                 tracing::debug!(error = %err, from = %message.from_pony_name, "failed to append pony letter to mailbox");
-                                seen_ids.remove(&message.id);
+                                continue;
+                            }
+                            if let Err(err) = pony_ipc::record_receipt(&identity, &message.id) {
+                                tracing::debug!(error = %err, "failed to record pony IPC receipt");
                                 continue;
                             }
                             app_event_tx.send(AppEvent::PonyMessageReceived(message));
@@ -59,7 +61,12 @@ impl ChatWidget {
         }
     }
 
-    pub(crate) fn handle_pony_send(&mut self, target: String, text: String) {
+    pub(crate) fn handle_pony_send(
+        &mut self,
+        target: String,
+        text: String,
+        delivery_class: pony_ipc::DeliveryClass,
+    ) {
         let Some(identity) = self.pony_ipc_identity.as_ref() else {
             self.add_error_message(
                 "Pony IPC is unavailable because this Codex session has no pony identity."
@@ -67,7 +74,7 @@ impl ChatWidget {
             );
             return;
         };
-        match pony_ipc::append_chat_message(identity, &target, &text) {
+        match pony_ipc::append_chat_message(identity, &target, &text, delivery_class) {
             Ok(_entry) => {
                 let recipient = if target == "*" {
                     "all ponies".to_string()
