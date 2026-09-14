@@ -5387,8 +5387,16 @@ impl ChatWidget {
                         self.app_event_tx.send(AppEvent::PonyListActive);
                         self.bottom_pane.drain_pending_submission_state();
                     }
-                    Ok(PonySendCommand::Send { target, text }) => {
-                        self.app_event_tx.send(AppEvent::PonySend { target, text });
+                    Ok(PonySendCommand::Send {
+                        target,
+                        text,
+                        delivery_class,
+                    }) => {
+                        self.app_event_tx.send(AppEvent::PonySend {
+                            target,
+                            text,
+                            delivery_class,
+                        });
                         self.bottom_pane.drain_pending_submission_state();
                     }
                     Err(err) => {

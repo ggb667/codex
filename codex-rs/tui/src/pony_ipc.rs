@@ -24,7 +24,24 @@ const UNKNOWN_BRANCH: &str = "unknown";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PonySendCommand {
     List,
-    Send { target: String, text: String },
+    Send {
+        target: String,
+        text: String,
+        delivery_class: DeliveryClass,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum DeliveryClass {
+    Ephemeral,
+    Durable,
+}
+
+impl Default for DeliveryClass {
+    fn default() -> Self {
+        Self::Ephemeral
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -56,6 +73,8 @@ pub(crate) struct PonyChatEntry {
     pub(crate) subject: String,
     pub(crate) body: String,
     pub(crate) created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub(crate) delivery_class: DeliveryClass,
 }
 
 impl PonyChatEntry {
@@ -150,15 +169,36 @@ pub(crate) fn parse_send_command(args: &str) -> Result<PonySendCommand, String> 
         return Err(pony_usage().to_string());
     }
 
-    let target = if target.eq_ignore_ascii_case("all") {
+    let (delivery_class, target) = if target.eq_ignore_ascii_case("durable") {
+        let Some((target, text)) = text.split_once(char::is_whitespace) else {
+            return Err(pony_usage().to_string());
+        };
+        (
+            DeliveryClass::Durable,
+            (target.to_string(), text.trim().to_string()),
+        )
+    } else if target.eq_ignore_ascii_case("all") {
+        (
+            DeliveryClass::Ephemeral,
+            (BROADCAST_TARGET.to_string(), text.to_string()),
+        )
+    } else {
+        (
+            DeliveryClass::Ephemeral,
+            (canonicalize_target_pony_name(target)?, text.to_string()),
+        )
+    };
+    let (target_name, message_text) = target;
+    let target = if target_name == BROADCAST_TARGET {
         BROADCAST_TARGET.to_string()
     } else {
-        canonicalize_target_pony_name(target)?
+        canonicalize_target_pony_name(&target_name)?
     };
 
     Ok(PonySendCommand::Send {
         target,
-        text: text.to_string(),
+        text: message_text,
+        delivery_class,
     })
 }
 
@@ -172,10 +212,43 @@ pub(crate) fn append_chat_message(
     identity: &PonyIdentity,
     target: &str,
     text: &str,
+    delivery_class: DeliveryClass,
 ) -> io::Result<PonyChatEntry> {
-    let chat_path = pony_chat_log_path();
+    let chat_path = if delivery_class == DeliveryClass::Durable {
+        configured_message_log_path(target).unwrap_or_else(pony_chat_log_path)
+    } else {
+        pony_chat_log_path()
+    };
     let lock_path = pony_chat_lock_path();
-    append_chat_message_at(&chat_path, &lock_path, identity, target, text)
+    append_chat_message_at(
+        &chat_path,
+        &lock_path,
+        identity,
+        target,
+        text,
+        delivery_class,
+    )
+}
+
+fn configured_message_log_path(target: &str) -> Option<PathBuf> {
+    let config = std::env::var_os("CODEX_AGENT_CONFIG")?;
+    let value: serde_json::Value = serde_json::from_reader(File::open(config).ok()?).ok()?;
+    let agents = value.get("agents")?.as_array()?;
+    let wanted = canonicalize_pony_name(target);
+    agents.iter().find_map(|agent| {
+        let aliases = agent.get("aliases")?.as_array()?;
+        let matches = aliases
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(|alias| {
+                canonicalize_pony_name(alias.split(':').next_back().unwrap_or(alias)) == wanted
+            });
+        if matches {
+            Some(PathBuf::from(agent.get("messageLogPath")?.as_str()?))
+        } else {
+            None
+        }
+    })
 }
 
 pub(crate) fn read_live_registry() -> io::Result<Vec<PonyRegistryEntry>> {
@@ -188,6 +261,18 @@ pub(crate) fn read_new_messages(identity: &PonyIdentity) -> io::Result<Vec<PonyC
     let chat_path = pony_chat_log_path();
     let lock_path = pony_chat_lock_path();
     read_new_messages_at(&chat_path, &lock_path, identity)
+}
+
+pub(crate) fn receipt_recorded(identity: &PonyIdentity, id: &str) -> io::Result<bool> {
+    Ok(
+        read_jsonl::<String>(&receipt_ledger_path(&identity.pony_name))?
+            .iter()
+            .any(|seen| seen == id),
+    )
+}
+
+pub(crate) fn record_receipt(identity: &PonyIdentity, id: &str) -> io::Result<()> {
+    append_json_line(&receipt_ledger_path(&identity.pony_name), &id.to_string())
 }
 
 pub(crate) fn append_incoming_message_to_mailbox(
@@ -265,8 +350,11 @@ fn append_chat_message_at(
     identity: &PonyIdentity,
     target: &str,
     text: &str,
+    delivery_class: DeliveryClass,
 ) -> io::Result<PonyChatEntry> {
-    maybe_reset_stale_chat_log(chat_path, lock_path)?;
+    if delivery_class == DeliveryClass::Ephemeral {
+        maybe_reset_stale_chat_log(chat_path, lock_path)?;
+    }
     let trimmed = text.trim();
     let (subject, body) = split_subject_and_body(trimmed);
     let entry = PonyChatEntry {
@@ -280,6 +368,7 @@ fn append_chat_message_at(
         subject,
         body,
         created_at: Utc::now(),
+        delivery_class,
     };
     append_json_line(chat_path, &entry)?;
     Ok(entry)
@@ -314,7 +403,7 @@ fn read_new_messages_at(
     maybe_reset_stale_chat_log(chat_path, lock_path)?;
     let mut messages = Vec::new();
     for entry in read_jsonl::<PonyChatEntry>(chat_path)? {
-        if is_stale(entry.created_at) {
+        if entry.delivery_class == DeliveryClass::Ephemeral && is_stale(entry.created_at) {
             continue;
         }
         if entry.from_instance_id == identity.instance_id {
@@ -448,6 +537,13 @@ fn pony_chat_log_path() -> PathBuf {
 
 fn pony_chat_lock_path() -> PathBuf {
     std::env::temp_dir().join("codex-pony-chat.cleanup.lock")
+}
+
+fn receipt_ledger_path(pony_name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "codex-pony-receipts-{}.jsonl",
+        canonicalize_pony_name(pony_name)
+    ))
 }
 
 fn split_subject_and_body(text: &str) -> (String, String) {
@@ -595,6 +691,7 @@ mod tests {
             PonySendCommand::Send {
                 target: "PINKIE_PIE".to_string(),
                 text: "hello there".to_string(),
+                delivery_class: DeliveryClass::Ephemeral,
             }
         );
         assert_eq!(
@@ -602,6 +699,7 @@ mod tests {
             PonySendCommand::Send {
                 target: "*".to_string(),
                 text: "status check".to_string(),
+                delivery_class: DeliveryClass::Ephemeral,
             }
         );
         assert_eq!(
@@ -609,6 +707,7 @@ mod tests {
             PonySendCommand::Send {
                 target: "PRINCESS_CELESTIA_SOL_INVICTUS".to_string(),
                 text: "status report".to_string(),
+                delivery_class: DeliveryClass::Ephemeral,
             }
         );
         assert_eq!(
@@ -616,6 +715,7 @@ mod tests {
             PonySendCommand::Send {
                 target: "RAINBOW_DASH".to_string(),
                 text: "clear the sky".to_string(),
+                delivery_class: DeliveryClass::Ephemeral,
             }
         );
     }
@@ -641,6 +741,7 @@ mod tests {
             subject: "check in".to_string(),
             body: String::new(),
             created_at: Utc::now(),
+            delivery_class: DeliveryClass::Ephemeral,
         };
         let stale = PonyChatEntry {
             id: "msg-2".to_string(),
@@ -651,6 +752,7 @@ mod tests {
             subject: "old message".to_string(),
             body: String::new(),
             created_at: Utc::now() - ChronoDuration::hours(2),
+            delivery_class: DeliveryClass::Ephemeral,
         };
         let own = PonyChatEntry {
             id: "msg-3".to_string(),
@@ -661,6 +763,7 @@ mod tests {
             subject: "self".to_string(),
             body: String::new(),
             created_at: Utc::now(),
+            delivery_class: DeliveryClass::Ephemeral,
         };
         append_json_line(&chat_path, &fresh).unwrap();
         append_json_line(&chat_path, &stale).unwrap();
@@ -681,6 +784,7 @@ mod tests {
             &sample_identity(),
             "TWILIGHT_SPARKLE",
             "databases should use RDS. Please update the schema tonight.",
+            DeliveryClass::Ephemeral,
         )
         .unwrap();
         assert_eq!(entry.subject, "databases should use RDS");
@@ -699,6 +803,7 @@ mod tests {
             subject: "databases should use RDS".to_string(),
             body: " Please update the schema tonight.".to_string(),
             created_at: Utc::now(),
+            delivery_class: DeliveryClass::Ephemeral,
         };
         let rendered = entry.mailbox_markdown();
         assert!(rendered.contains("FROM: 🍎 Applejack"));

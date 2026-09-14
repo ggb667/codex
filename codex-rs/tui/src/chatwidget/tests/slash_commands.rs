@@ -57,7 +57,7 @@ async fn slash_pony_send_clears_composer_and_emits_event() {
 
     assert_matches!(
         rx.try_recv(),
-        Ok(AppEvent::PonySend { target, text })
+        Ok(AppEvent::PonySend { target, text, .. })
             if target == "RAINBOW_DASH" && text == "do a ls -la"
     );
     assert_eq!(chat.bottom_pane.composer_text(), "");

@@ -512,6 +512,7 @@ pub(crate) enum AppEvent {
     PonySend {
         target: String,
         text: String,
+        delivery_class: crate::pony_ipc::DeliveryClass,
     },
 
     PonyListActive,

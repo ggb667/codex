@@ -136,7 +136,6 @@ use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
@@ -1100,7 +1099,6 @@ impl App {
 
     fn spawn_pony_ipc_task(app_event_tx: AppEventSender, identity: PonyIdentity) -> JoinHandle<()> {
         tokio::spawn(async move {
-            let mut seen_ids = HashSet::new();
             loop {
                 if let Err(err) = pony_ipc::append_registry_heartbeat(&identity) {
                     tracing::debug!(error = %err, "failed to refresh pony IPC heartbeat");
@@ -1108,14 +1106,17 @@ impl App {
                 match pony_ipc::read_new_messages(&identity) {
                     Ok(messages) => {
                         for message in messages {
-                            if !seen_ids.insert(message.id.clone()) {
+                            if pony_ipc::receipt_recorded(&identity, &message.id).unwrap_or(false) {
                                 continue;
                             }
                             if let Err(err) =
                                 pony_ipc::append_incoming_message_to_mailbox(&identity, &message)
                             {
                                 tracing::debug!(error = %err, from = %message.from_pony_name, "failed to append pony letter to mailbox");
-                                seen_ids.remove(&message.id);
+                                continue;
+                            }
+                            if let Err(err) = pony_ipc::record_receipt(&identity, &message.id) {
+                                tracing::debug!(error = %err, "failed to record pony IPC receipt");
                                 continue;
                             }
                             app_event_tx.send(AppEvent::PonyMessageReceived(message));
@@ -1151,7 +1152,12 @@ impl App {
             .push_back(PendingPonyMessage { message });
     }
 
-    fn handle_pony_send(&mut self, target: String, text: String) {
+    fn handle_pony_send(
+        &mut self,
+        target: String,
+        text: String,
+        delivery_class: pony_ipc::DeliveryClass,
+    ) {
         let Some(identity) = self.pony_ipc_identity.as_ref() else {
             self.chat_widget.add_error_message(
                 "Pony IPC is unavailable because this Codex session has no pony identity."
@@ -1159,7 +1165,7 @@ impl App {
             );
             return;
         };
-        match pony_ipc::append_chat_message(identity, &target, &text) {
+        match pony_ipc::append_chat_message(identity, &target, &text, delivery_class) {
             Ok(_entry) => {
                 let recipient = if target == "*" {
                     "all ponies".to_string()
@@ -5505,8 +5511,12 @@ impl App {
                 self.chat_widget
                     .submit_user_message_with_mode(text, collaboration_mode);
             }
-            AppEvent::PonySend { target, text } => {
-                self.handle_pony_send(target, text);
+            AppEvent::PonySend {
+                target,
+                text,
+                delivery_class,
+            } => {
+                self.handle_pony_send(target, text, delivery_class);
             }
             AppEvent::PonyListActive => {
                 self.handle_pony_list_active();
