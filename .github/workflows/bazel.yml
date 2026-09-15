@@ -142,9 +142,7 @@ jobs:
           - 2
           - 3
           - 4
-    runs-on:
-      group: ${{ github.event.repository.name }}-runners
-      labels: ${{ github.event.repository.name }}-windows-x64
+    runs-on: windows-latest
     name: Bazel test on windows-latest for x86_64-pc-windows-gnullvm shard ${{ matrix.shard }}/4
     environment:
       name: bazel
@@ -259,9 +257,7 @@ jobs:
     # it a larger timeout.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     timeout-minutes: 40
-    runs-on:
-      group: ${{ github.event.repository.name }}-runners
-      labels: ${{ github.event.repository.name }}-windows-x64
+    runs-on: windows-latest
     name: Bazel test on windows-latest for x86_64-pc-windows-msvc (native main)
     environment:
       name: bazel
@@ -350,9 +346,7 @@ jobs:
             target: aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-gnullvm
-            runs_on:
-              group: ${{ github.event.repository.name }}-runners
-              labels: ${{ github.event.repository.name }}-windows-x64
+            runs_on: windows-latest
     runs-on: ${{ matrix.runs_on || matrix.os }}
     name: Bazel clippy on ${{ matrix.os }} for ${{ matrix.target }}
     environment:
@@ -449,9 +443,7 @@ jobs:
             target: aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-gnullvm
-            runs_on:
-              group: ${{ github.event.repository.name }}-runners
-              labels: ${{ github.event.repository.name }}-windows-x64
+            runs_on: windows-latest
     runs-on: ${{ matrix.runs_on || matrix.os }}
     name: Verify release build on ${{ matrix.os }} for ${{ matrix.target }}
     environment:
