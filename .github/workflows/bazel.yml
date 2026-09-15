@@ -287,6 +287,8 @@ jobs:
             # transitively through `//...`.
             -//third_party/v8:all
             -//codex-rs/v8-poc:v8-poc-unit-tests
+            # Voice requires separately provisioned native Windows build tools.
+            -//codex-rs/voice-host/...
           )
 
           bazel_test_args=(
