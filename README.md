@@ -19,11 +19,11 @@ Conceptually:
 
 ```text
 Multi-agent orchestration runtime
-        │
-        ▼
+        |
+        v
 Customized Codex TUI integration
-        │
-        ▼
+        |
+        v
 Upstream OpenAI Codex
 ```
 
