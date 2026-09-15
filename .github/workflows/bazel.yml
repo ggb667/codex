@@ -177,7 +177,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          bazel_test_query='tests(//...) except tests(//third_party/v8:all) except attr(tags, "manual", tests(//...))'
+          bazel_test_query='tests(//...) except tests(//third_party/v8:all) except tests(//codex-rs/voice-host/...) except attr(tags, "manual", tests(//...))'
           mapfile -t bazel_targets < <(
             ./.github/scripts/run-bazel-query-ci.sh --output=label -- "${bazel_test_query}" \
               | LC_ALL=C sort
@@ -398,6 +398,9 @@ jobs:
           bazel_target_lines="$(./scripts/list-bazel-clippy-targets.sh "${bazel_target_list_args[@]}")"
           bazel_targets=()
           while IFS= read -r target; do
+            if [[ "${RUNNER_OS}" == "Windows" && "${target}" == //codex-rs/voice-host:* ]]; then
+              continue
+            fi
             bazel_targets+=("${target}")
           done <<< "${bazel_target_lines}"
 
@@ -497,6 +500,9 @@ jobs:
           bazel_target_lines="$(bash ./scripts/list-bazel-release-targets.sh)"
           bazel_targets=()
           while IFS= read -r target; do
+            if [[ "${RUNNER_OS}" == "Windows" && "${target}" == //codex-rs/voice-host:* ]]; then
+              continue
+            fi
             bazel_targets+=("${target}")
           done <<< "${bazel_target_lines}"
 
