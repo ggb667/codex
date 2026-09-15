@@ -13,6 +13,9 @@ concurrency:
   group: concurrency-group::${{ github.workflow }}::${{ github.event.pull_request.number > 0 && format('pr-{0}', github.event.pull_request.number) || github.ref_name }}${{ github.ref_name == 'main' && format('::{0}', github.run_id) || ''}}
   cancel-in-progress: ${{ github.ref_name != 'main' }}
 
+env:
+  BAZEL_MSVC_RUNTIME_VISUAL_STUDIO_EULA: "1"
+
 jobs:
   test:
     # PRs use the sharded Windows cross-compiled test jobs below. Post-merge
