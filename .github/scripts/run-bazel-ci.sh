@@ -364,6 +364,11 @@ if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
     post_config_bazel_args+=(
       "--action_env=PATH=${CODEX_BAZEL_WINDOWS_PATH}"
       "--host_action_env=PATH=${CODEX_BAZEL_WINDOWS_PATH}"
+      "--repo_env=BAZEL_MSVC_RUNTIME_VISUAL_STUDIO_EULA=1"
+      "--action_env=SystemRoot=C:/Windows"
+      "--host_action_env=SystemRoot=C:/Windows"
+      "--action_env=PROCESSOR_ARCHITECTURE=AMD64"
+      "--host_action_env=PROCESSOR_ARCHITECTURE=AMD64"
     )
   elif [[ $windows_cross_compile -eq 1 ]]; then
     # Remote build actions run on Linux RBE workers. Give their shell snippets
