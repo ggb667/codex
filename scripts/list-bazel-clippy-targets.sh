@@ -45,6 +45,10 @@ printf '%s\n' \
   "//codex-rs/..." \
   "-//codex-rs/v8-poc:all"
 
+if [[ "${RUNNER_OS:-}" == "Windows" && $windows_cross_compile -eq 1 ]]; then
+  printf '%s\n' "-//codex-rs/voice-host/..."
+fi
+
 # `--config=clippy` on the `workspace_root_test` wrappers does not lint the
 # underlying `rust_test` binaries. Add the internal manual `*-unit-tests-bin`
 # targets explicitly so inline `#[cfg(test)]` code is linted like
