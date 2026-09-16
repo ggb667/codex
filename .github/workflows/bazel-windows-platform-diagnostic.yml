@@ -1,9 +1,7 @@
 name: Bazel Windows platform diagnostic
 
 on:
-  workflow_dispatch:
-  push:
-    branches: [main]
+  workflow_call:
 
 jobs:
   rustls-provider-platform:
@@ -36,5 +34,4 @@ jobs:
             --skip_incompatible_explicit_targets \
             --output=label \
             -- \
-            //codex-rs/utils/rustls-provider:rustls-provider-preinstalled-test \
-            //codex-rs/utils/rustls-provider:rustls-provider-preinstalled-test-windows-cross
+            'set(//codex-rs/utils/rustls-provider:rustls-provider-preinstalled-test //codex-rs/utils/rustls-provider:rustls-provider-preinstalled-test-windows-cross)'
