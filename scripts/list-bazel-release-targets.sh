@@ -16,4 +16,5 @@ cd "${repo_root}"
 printf '%s\n' \
   "//codex-rs/..." \
   "-//codex-rs/core/tests/remote_env_windows:smoke-test" \
-  "-//codex-rs/v8-poc:all"
+  "-//codex-rs/v8-poc:all" \
+  "-//codex-rs/voice-host/..."
