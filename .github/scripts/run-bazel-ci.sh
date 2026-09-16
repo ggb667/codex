@@ -365,6 +365,8 @@ if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
       "--action_env=PATH=${CODEX_BAZEL_WINDOWS_PATH}"
       "--host_action_env=PATH=${CODEX_BAZEL_WINDOWS_PATH}"
       "--repo_env=BAZEL_MSVC_RUNTIME_VISUAL_STUDIO_EULA=1"
+      "--repo_env=BAZEL_VC=${VCINSTALLDIR}"
+      "--repo_env=BAZEL_WINSDK_FULL_VERSION=${WindowsSDKVersion%\\}"
       "--action_env=SystemRoot=C:/Windows"
       "--host_action_env=SystemRoot=C:/Windows"
       "--action_env=PROCESSOR_ARCHITECTURE=AMD64"
