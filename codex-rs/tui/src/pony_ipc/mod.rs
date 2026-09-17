@@ -51,17 +51,12 @@ pub(crate) enum PonySendCommand {
     },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum DeliveryClass {
+    #[default]
     Ephemeral,
     Durable,
-}
-
-impl Default for DeliveryClass {
-    fn default() -> Self {
-        Self::Ephemeral
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
