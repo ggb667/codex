@@ -15,11 +15,6 @@ jobs:
     uses: ./.github/workflows/bazel.yml
     secrets: inherit
 
-  bazel-windows-platform-diagnostic:
-    name: Bazel Windows platform diagnostic
-    uses: ./.github/workflows/bazel-windows-platform-diagnostic.yml
-    secrets: inherit
-
   blob-size-policy:
     name: Blob size policy
     uses: ./.github/workflows/blob-size-policy.yml
