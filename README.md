@@ -9,6 +9,41 @@ If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="http
 
 ---
 
+## Codex-side integration for multi-agent Codex orchestration
+
+This fork is a customized **Codex TUI** that provides integration points for local multi-agent orchestration runtimes.
+
+Those runtimes are responsible for defining agents, launchers, team configuration, shared coordination state, generated rosters, routing policy, personalities, and cross-project behavior. They can depend on this Codex fork for the Codex-side hooks they need, but this fork does not inherently contain or launch a complete orchestration system by itself.
+
+Conceptually:
+
+```text
+Multi-agent orchestration runtime
+        |
+        v
+Customized Codex TUI integration
+        |
+        v
+Upstream OpenAI Codex
+```
+
+The goal of the combined stack is to make several specialized agents behave more like a software team than a collection of isolated chat sessions.
+
+### What this fork adds
+
+- **Codex-side IPC hooks** for inter-agent messaging, including `/tell` for direct agent-to-agent communication.
+- **Generated roster routing support** so the TUI can address the current agent team without hard-coded recipient lists.
+- **Agent-specific TUI prompt styling** with configurable prompt glyphs and backgrounds, making parallel sessions easy to distinguish visually.
+- **Terminal input recovery** so TUI input can restart after an underlying terminal event stream closes unexpectedly.
+
+The separate **Agenic Pony System** is one orchestration runtime that uses these integration points. It supplies its own persistent named agents, launcher scripts, generated session configuration, shared coordination files, and personalities.
+
+For details on the current IPC implementation, see [Pony IPC](./docs/pony-ipc.md).
+
+> **Status:** This is an experimental fork of OpenAI Codex. The Pony extensions are maintained separately from upstream Codex and are periodically rebased/ported onto newer Codex releases.
+
+---
+
 ## Quickstart
 
 ### Installing and running Codex CLI
