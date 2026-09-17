@@ -46,7 +46,7 @@ use crate::key_hint;
 use crate::key_hint::KeyBinding;
 use crate::key_hint::KeyBindingListExt;
 use crate::key_hint::has_ctrl_or_alt;
-use crate::ui_consts::FOOTER_INDENT_COLS;
+use crate::ui_consts::footer_indent_cols;
 
 /// Active composer-owned state for one Ctrl+R search interaction.
 ///
@@ -488,7 +488,7 @@ impl ChatComposer {
             return None;
         }
 
-        let indent = (FOOTER_INDENT_COLS as u16).min(hint_rect.width.saturating_sub(1));
+        let indent = (footer_indent_cols() as u16).min(hint_rect.width.saturating_sub(1));
         self.history_search_query_cursor_pos(Rect {
             x: hint_rect.x.saturating_add(indent),
             width: hint_rect.width.saturating_sub(indent),

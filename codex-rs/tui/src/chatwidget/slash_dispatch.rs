@@ -413,6 +413,11 @@ impl ChatWidget {
                     "Usage: /sandbox-add-read-dir <absolute-directory-path>".to_string(),
                 );
             }
+            SlashCommand::Tell => {
+                self.add_error_message(
+                    "Usage: /tell list | /tell <pony-name|all> <message>".to_string(),
+                );
+            }
             SlashCommand::Experimental => {
                 self.open_experimental_popup();
             }
@@ -747,6 +752,17 @@ impl ChatWidget {
             SlashCommand::Pwd => {
                 self.add_error_message("Usage: /pwd".to_string());
             }
+            SlashCommand::Tell => match crate::pony_ipc::parse_send_command(trimmed) {
+                Ok(crate::pony_ipc::PonySendCommand::List) => self.handle_pony_list_active(),
+                Ok(crate::pony_ipc::PonySendCommand::Send {
+                    target,
+                    text,
+                    delivery_class,
+                }) => {
+                    self.handle_pony_send(target, text, delivery_class);
+                }
+                Err(err) => self.add_error_message(err),
+            },
             SlashCommand::Usage => {
                 if self.ensure_usage_command_available() {
                     match tokens::TokenActivityView::parse(trimmed) {
@@ -1184,6 +1200,7 @@ impl ChatWidget {
             | SlashCommand::App
             | SlashCommand::Rename
             | SlashCommand::Recap
+            | SlashCommand::Tell
             | SlashCommand::TestApproval => QueueDrain::Continue,
             SlashCommand::Cd => match self.thread_id {
                 Some(thread_id) if self.can_change_working_directory(thread_id) => QueueDrain::Stop,

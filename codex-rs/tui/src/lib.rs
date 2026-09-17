@@ -180,6 +180,7 @@ mod npm_registry;
 pub(crate) mod onboarding;
 mod oss_selection;
 mod pager_overlay;
+mod pony_ipc;
 pub(crate) mod public_widgets;
 mod render;
 mod resize_reflow_cap;
@@ -1668,6 +1669,13 @@ async fn run_ratatui_app(
         local_settings.tui.theme.clone(),
         find_codex_home().ok().map(AbsolutePathBuf::into_path_buf),
     ) {
+        config.startup_warnings.push(w);
+    }
+
+    crate::ui_consts::set_prompt_glyph(config.tui_prompt_glyph.clone());
+    if let Some(w) =
+        crate::style::set_user_message_bg_override(config.tui_prompt_background.clone())
+    {
         config.startup_warnings.push(w);
     }
 
