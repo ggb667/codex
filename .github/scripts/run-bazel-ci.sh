@@ -89,16 +89,9 @@ print_bazel_test_log_tails() {
 
   local -a bazel_info_args=(info)
   if [[ -n "${BUILDBUDDY_API_KEY:-}" ]]; then
-    # `bazel info` needs the same CI config as the failed test invocation so
-    # platform-specific output roots match. On Windows, omitting `ci-windows`
-    # would point at `local_windows-fastbuild` even when the test ran with the
-    # MSVC host platform under `local_windows_msvc-fastbuild`.
     bazel_info_args+=("--config=${ci_config}")
   fi
 
-  # Only pass flags that affect Bazel's output-root selection or repository
-  # lookup. Test/build-only flags such as execution logs or remote download
-  # mode can make `bazel info` fail, which would hide the real test log path.
   for arg in "${post_config_bazel_args[@]}"; do
     case "$arg" in
       --host_platform=* | --repo_contents_cache=* | --repository_cache=*)
@@ -273,43 +266,29 @@ if [[ "${RUNNER_OS:-}" == "Windows" && $windows_msvc_host_platform -eq 1 ]]; the
   done
 
   if [[ $has_host_platform_override -eq 0 ]]; then
-    # Use the MSVC Windows platform for jobs that need helper binaries like
-    # Rust test wrappers and V8 generators to resolve a compatible toolchain.
-    # Callers that need a different Windows target platform should pass an
-    # explicit `--platforms=...` flag.
     post_config_bazel_args+=("--host_platform=//:local_windows_msvc")
   fi
 fi
 
 if [[ $remote_download_toplevel -eq 1 ]]; then
-  # Override the CI config's remote_download_minimal setting when callers need
-  # the built artifact to exist on disk after the command completes.
   post_config_bazel_args+=(--remote_download_toplevel)
 fi
 
 if [[ "${RUNNER_OS:-}" == "Windows" && $windows_cross_compile -eq 1 && -n "${BUILDBUDDY_API_KEY:-}" ]]; then
-  # `--enable_platform_specific_config` expands `common:windows` on Windows
-  # hosts after ordinary rc configs, which can override `ci-windows-cross`'s
-  # RBE host platform. Repeat the host platform on the command line so V8 and
-  # other genrules execute on Linux RBE workers instead of Git Bash locally.
-  #
-  # Bazel also derives the default genrule shell from the client host. Without
-  # an explicit shell executable, remote Linux actions can be asked to run
-  # `C:\Program Files\Git\usr\bin\bash.exe`.
   post_config_bazel_args+=(--host_platform=//:rbe --shell_executable=/bin/bash)
 fi
 
 if [[ "${RUNNER_OS:-}" == "Windows" && $windows_cross_compile -eq 1 && -z "${BUILDBUDDY_API_KEY:-}" ]]; then
-  # The Windows cross-compile config depends on authenticated remote
-  # execution. When credentials are unavailable, keep the local build shape
-  # and its lower concurrency cap.
-  post_config_bazel_args+=(--jobs=8)
+  # Cross compilation requires authenticated Linux RBE. In a fork without
+  # BuildBuddy credentials, run the same selected test labels as native MSVC
+  # Windows targets. Cross-only labels become incompatible and are skipped by
+  # callers using --skip_incompatible_explicit_targets, while native labels use
+  # a consistent MSVC Rust/C++ ABI instead of mixing gnullvm inputs into an
+  # MSVC link.
+  post_config_bazel_args+=(--platforms=//:windows_x86_64_msvc --jobs=8)
 fi
 
 if [[ -n "${BAZEL_REPO_CONTENTS_CACHE:-}" ]]; then
-  # Windows self-hosted runners can run multiple Bazel jobs concurrently. Give
-  # each job its own repo contents cache so they do not fight over the shared
-  # path configured in `ci-windows`.
   post_config_bazel_args+=("--repo_contents_cache=${BAZEL_REPO_CONTENTS_CACHE}")
 fi
 
@@ -326,9 +305,6 @@ fi
 if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
   pass_windows_build_env=1
   if [[ $windows_cross_compile -eq 1 && -n "${BUILDBUDDY_API_KEY:-}" ]]; then
-    # Remote build actions execute on Linux RBE workers. Passing the Windows
-    # runner's build environment there makes Bazel genrules try to execute
-    # C:\Program Files\Git\usr\bin\bash.exe on Linux.
     pass_windows_build_env=0
   fi
 
@@ -373,9 +349,6 @@ if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
       "--host_action_env=PROCESSOR_ARCHITECTURE=AMD64"
     )
   elif [[ $windows_cross_compile -eq 1 ]]; then
-    # Remote build actions run on Linux RBE workers. Give their shell snippets
-    # a Linux PATH while preserving CODEX_BAZEL_WINDOWS_PATH below for local
-    # Windows test execution.
     post_config_bazel_args+=(
       "--action_env=PATH=/usr/bin:/bin"
       "--host_action_env=PATH=/usr/bin:/bin"
@@ -400,10 +373,6 @@ if (( ${#post_config_bazel_args[@]} > 0 )); then
   bazel_run_args+=("${post_config_bazel_args[@]}")
 fi
 set +e
-# Work around Bazel 9 remote repo contents cache / overlay materialization
-# failures seen in CI (for example "is not a symlink" or permission errors
-# while materializing external repos such as rules_perl). This only disables
-# the startup-level repo contents cache; keyed runs still use BuildBuddy.
 run_bazel_with_startup_args \
   --noexperimental_remote_repo_contents_cache \
   "${bazel_run_args[@]}" \
