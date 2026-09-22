@@ -1,21 +1,21 @@
 use super::roster::AgentConfig;
 use super::roster::AgentConfigAgent;
+use super::storage::agent_ipc_log_path_for;
 use super::storage::append_chat_message_at;
 use super::storage::append_json_line;
 use super::storage::append_registry_heartbeat_at;
-use super::storage::pony_ipc_log_path_for;
 use super::storage::read_jsonl;
 use super::storage::read_new_messages_at;
 use super::*;
 use chrono::Duration as ChronoDuration;
 use tempfile::tempdir;
 
-fn sample_identity() -> PonyIdentity {
-    PonyIdentity {
+fn sample_identity() -> AgentIdentity {
+    AgentIdentity {
         instance_id: "uuid-1".to_string(),
-        pony_name: "TWILIGHT_SPARKLE".to_string(),
-        pony_symbol: "✶".to_string(),
-        pony_aliases: vec![
+        agent_name: "TWILIGHT_SPARKLE".to_string(),
+        agent_symbol: "✶".to_string(),
+        agent_aliases: vec![
             "TWILIGHT_SPARKLE".to_string(),
             "Twilight Sparkle".to_string(),
             "Twilight".to_string(),
@@ -86,11 +86,11 @@ fn sample_roster() -> AgentConfig {
 fn parse_send_command_supports_list_direct_and_broadcast() {
     assert_eq!(
         parse_send_command_with_roster("list", /*roster*/ None).unwrap(),
-        PonySendCommand::List
+        AgentSendCommand::List
     );
     assert_eq!(
         parse_send_command_with_roster("PINKIE_PIE hello there", /*roster*/ None).unwrap(),
-        PonySendCommand::Send {
+        AgentSendCommand::Send {
             target: "PINKIE_PIE".to_string(),
             text: "hello there".to_string(),
             delivery_class: DeliveryClass::Ephemeral,
@@ -98,7 +98,7 @@ fn parse_send_command_supports_list_direct_and_broadcast() {
     );
     assert_eq!(
         parse_send_command_with_roster("all status check", /*roster*/ None).unwrap(),
-        PonySendCommand::Send {
+        AgentSendCommand::Send {
             target: "*".to_string(),
             text: "status check".to_string(),
             delivery_class: DeliveryClass::Ephemeral,
@@ -106,7 +106,7 @@ fn parse_send_command_supports_list_direct_and_broadcast() {
     );
     assert_eq!(
         parse_send_command_with_roster("durable PINKIE_PIE keep this", /*roster*/ None).unwrap(),
-        PonySendCommand::Send {
+        AgentSendCommand::Send {
             target: "PINKIE_PIE".to_string(),
             text: "keep this".to_string(),
             delivery_class: DeliveryClass::Durable,
@@ -163,10 +163,10 @@ fn read_new_messages_keeps_only_latest_message_per_sender() {
     let chat_path = temp.path().join("chat.jsonl");
     let lock_path = temp.path().join("chat.lock");
     let identity = sample_identity();
-    let older_from_pinkie = PonyChatEntry {
+    let older_from_pinkie = AgentMessage {
         id: "msg-1".to_string(),
         from_instance_id: "uuid-2".to_string(),
-        from_pony_name: "PINKIE_PIE".to_string(),
+        from_agent_name: "PINKIE_PIE".to_string(),
         from_symbol: "🎈".to_string(),
         to: "TWILIGHT_SPARKLE".to_string(),
         subject: "older waiting note".to_string(),
@@ -174,10 +174,10 @@ fn read_new_messages_keeps_only_latest_message_per_sender() {
         created_at: Utc::now() - ChronoDuration::seconds(5),
         delivery_class: DeliveryClass::Ephemeral,
     };
-    let fresh_from_pinkie = PonyChatEntry {
+    let fresh_from_pinkie = AgentMessage {
         id: "msg-2".to_string(),
         from_instance_id: "uuid-2".to_string(),
-        from_pony_name: "PINKIE_PIE".to_string(),
+        from_agent_name: "PINKIE_PIE".to_string(),
         from_symbol: "🎈".to_string(),
         to: "TWILIGHT_SPARKLE".to_string(),
         subject: "latest waiting note".to_string(),
@@ -185,10 +185,10 @@ fn read_new_messages_keeps_only_latest_message_per_sender() {
         created_at: Utc::now(),
         delivery_class: DeliveryClass::Ephemeral,
     };
-    let stale = PonyChatEntry {
+    let stale = AgentMessage {
         id: "msg-3".to_string(),
         from_instance_id: "uuid-3".to_string(),
-        from_pony_name: "APPLEJACK".to_string(),
+        from_agent_name: "APPLEJACK".to_string(),
         from_symbol: "🍎".to_string(),
         to: "TWILIGHT_SPARKLE".to_string(),
         subject: "old message".to_string(),
@@ -196,10 +196,10 @@ fn read_new_messages_keeps_only_latest_message_per_sender() {
         created_at: Utc::now() - ChronoDuration::hours(2),
         delivery_class: DeliveryClass::Ephemeral,
     };
-    let own = PonyChatEntry {
+    let own = AgentMessage {
         id: "msg-4".to_string(),
         from_instance_id: identity.instance_id.clone(),
-        from_pony_name: identity.pony_name.clone(),
+        from_agent_name: identity.agent_name.clone(),
         from_symbol: "✶".to_string(),
         to: "TWILIGHT_SPARKLE".to_string(),
         subject: "self".to_string(),
@@ -207,10 +207,10 @@ fn read_new_messages_keeps_only_latest_message_per_sender() {
         created_at: Utc::now(),
         delivery_class: DeliveryClass::Ephemeral,
     };
-    let fresh_from_dash = PonyChatEntry {
+    let fresh_from_dash = AgentMessage {
         id: "msg-5".to_string(),
         from_instance_id: "uuid-5".to_string(),
-        from_pony_name: "RAINBOW_DASH".to_string(),
+        from_agent_name: "RAINBOW_DASH".to_string(),
         from_symbol: "⚡".to_string(),
         to: "TWILIGHT_SPARKLE".to_string(),
         subject: "dash status".to_string(),
@@ -240,10 +240,10 @@ fn read_new_messages_keeps_stale_durable_messages() {
     let chat_path = temp.path().join("chat.jsonl");
     let lock_path = temp.path().join("chat.lock");
     let identity = sample_identity();
-    let durable = PonyChatEntry {
+    let durable = AgentMessage {
         id: "msg-durable".to_string(),
         from_instance_id: "uuid-6".to_string(),
-        from_pony_name: "PINKIE_PIE".to_string(),
+        from_agent_name: "PINKIE_PIE".to_string(),
         from_symbol: "🎈".to_string(),
         to: "TWILIGHT_SPARKLE".to_string(),
         subject: "durable note".to_string(),
@@ -277,10 +277,10 @@ fn parse_send_command_splits_subject_and_body() {
 
 #[test]
 fn mailbox_markdown_uses_sender_symbol() {
-    let entry = PonyChatEntry {
+    let entry = AgentMessage {
         id: "msg-4".to_string(),
         from_instance_id: "uuid-4".to_string(),
-        from_pony_name: "APPLEJACK".to_string(),
+        from_agent_name: "APPLEJACK".to_string(),
         from_symbol: "🍎".to_string(),
         to: "TWILIGHT_SPARKLE".to_string(),
         subject: "databases should use RDS".to_string(),
@@ -299,9 +299,9 @@ fn stale_registry_log_is_removed_before_next_heartbeat() {
     let temp = tempdir().unwrap();
     let registry_path = temp.path().join("registry.jsonl");
     let lock_path = temp.path().join("registry.lock");
-    let stale_entry = PonyRegistryEntry {
+    let stale_entry = AgentRegistryEntry {
         uuid: "old".to_string(),
-        pony_name: "PINKIE_PIE".to_string(),
+        agent_name: "PINKIE_PIE".to_string(),
         path: "/tmp/old".to_string(),
         git_branch: "old-branch".to_string(),
         pid: 9,
@@ -310,14 +310,14 @@ fn stale_registry_log_is_removed_before_next_heartbeat() {
     append_json_line(&registry_path, &stale_entry).unwrap();
 
     append_registry_heartbeat_at(&registry_path, &lock_path, &sample_identity()).unwrap();
-    let entries = read_jsonl::<PonyRegistryEntry>(&registry_path).unwrap();
+    let entries = read_jsonl::<AgentRegistryEntry>(&registry_path).unwrap();
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].pony_name, "TWILIGHT_SPARKLE");
+    assert_eq!(entries[0].agent_name, "TWILIGHT_SPARKLE");
 }
 #[test]
 fn ipc_log_path_defaults_to_project_runtime_when_project_root_is_set() {
     assert_eq!(
-        pony_ipc_log_path_for(
+        agent_ipc_log_path_for(
             /*explicit_path*/ None,
             /*config_path*/ None,
             Some("/tmp/project"),
@@ -332,7 +332,7 @@ fn ipc_log_path_defaults_to_project_runtime_when_project_root_is_set() {
 #[test]
 fn ipc_log_path_ignores_explicit_path_from_another_project() {
     assert_eq!(
-        pony_ipc_log_path_for(
+        agent_ipc_log_path_for(
             Some("/tmp/source/pony/runtime/pony.chat.jsonl"),
             /*config_path*/ None,
             Some("/tmp/codex"),
@@ -347,7 +347,7 @@ fn ipc_log_path_ignores_explicit_path_from_another_project() {
 #[test]
 fn ipc_log_path_accepts_explicit_path_under_project_root() {
     assert_eq!(
-        pony_ipc_log_path_for(
+        agent_ipc_log_path_for(
             Some("/tmp/codex/pony/runtime/custom.chat.jsonl"),
             /*config_path*/ None,
             Some("/tmp/codex"),
@@ -362,7 +362,7 @@ fn ipc_log_path_accepts_explicit_path_under_project_root() {
 #[test]
 fn ipc_log_path_uses_current_dir_before_legacy_tmp_fallback() {
     assert_eq!(
-        pony_ipc_log_path_for(
+        agent_ipc_log_path_for(
             /*explicit_path*/ None,
             /*config_path*/ None,
             /*project_root*/ None,
@@ -377,7 +377,7 @@ fn ipc_log_path_uses_current_dir_before_legacy_tmp_fallback() {
 #[test]
 fn ipc_log_path_uses_config_path_under_project_root() {
     assert_eq!(
-        pony_ipc_log_path_for(
+        agent_ipc_log_path_for(
             /*explicit_path*/ None,
             Some(Path::new("/tmp/project/pony/runtime/config.chat.jsonl")),
             Some("/tmp/project"),

@@ -107,11 +107,11 @@ impl AgentConfig {
             .map(|agent| agent.label.clone())
     }
 
-    pub(super) fn target_matches_agent(&self, target: &str, pony_name: &str) -> bool {
+    pub(super) fn target_matches_agent(&self, target: &str, agent_name: &str) -> bool {
         let Ok(target_route) = self.resolve_route(target) else {
             return false;
         };
-        let matches = self.matching_agents(pony_name);
+        let matches = self.matching_agents(agent_name);
         unique_agents_by_route(matches)
             .iter()
             .any(|agent| normalize_alias(&agent.route()) == normalize_alias(&target_route))

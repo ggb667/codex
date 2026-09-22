@@ -5,9 +5,9 @@ use super::*;
 impl ChatWidget {
     pub(super) fn notify(&mut self, notification: Notification) {
         if notification.requires_attention()
-            && let Some(identity) = self.pony_ipc_identity.as_ref()
+            && let Some(identity) = self.agent_ipc_identity.as_ref()
         {
-            crate::pony_notification::notify_attention(&identity.pony_name);
+            crate::pony_notification::notify_attention(&identity.agent_name);
         }
         if !notification.allowed_for(&self.local_settings.tui.notification_settings.notifications) {
             return;
