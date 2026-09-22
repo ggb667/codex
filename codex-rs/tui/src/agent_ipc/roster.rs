@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use std::fs;
 
 use super::AGENT_CONFIG_ENV;
+use super::agent_usage;
 use super::non_empty_path;
-use super::pony_usage;
 use super::same_project;
 use super::title_case_word;
 
@@ -18,6 +18,7 @@ pub(super) struct AgentConfig {
     #[serde(default)]
     pub(super) aliases: Vec<String>,
     pub(super) project_root: String,
+    pub(super) branch_label: String,
     #[serde(default)]
     pub(super) mailbox_path: String,
     #[serde(default)]
@@ -51,15 +52,19 @@ pub(super) struct AgentConfigAgent {
 }
 
 impl AgentConfig {
-    pub(super) fn current_agent(
-        &self,
-        raw_name: &str,
-        project_path: &str,
-    ) -> Option<AgentConfigAgent> {
-        let normalized_project = normalize_alias(project_path);
-        self.candidates().into_iter().find(|agent| {
-            agent.matches(raw_name) && normalize_alias(&agent.project_root) == normalized_project
-        })
+    pub(super) fn current_agent(&self) -> AgentConfigAgent {
+        AgentConfigAgent {
+            agent_id: self.agent_id.clone(),
+            route_id: self.route_id.clone(),
+            label: self.label.clone(),
+            icon: self.icon.clone(),
+            aliases: self.aliases.clone(),
+            project_root: self.project_root.clone(),
+            mailbox_path: self.mailbox_path.clone(),
+            message_log_path: self.message_log_path.clone(),
+            registry_path: self.registry_path.clone(),
+            global_singleton: self.global_singleton,
+        }
     }
 
     pub(super) fn resolve_route(&self, name: &str) -> Result<String, String> {
@@ -70,7 +75,7 @@ impl AgentConfig {
         let raw = name.trim();
         let matches = self.matching_agents(raw);
         if matches.is_empty() {
-            return Err(format!("Unknown pony '{}'. {}", raw, pony_usage()));
+            return Err(format!("Unknown agent '{}'. {}", raw, agent_usage()));
         }
 
         let unique = unique_agents_by_route(matches);
@@ -92,7 +97,7 @@ impl AgentConfig {
         }
 
         Err(format!(
-            "Ambiguous pony '{raw}'. Use a disambiguated alias such as <project>:<name>."
+            "Ambiguous agent '{raw}'. Use a disambiguated alias such as <project>:<name>."
         ))
     }
 
@@ -107,11 +112,11 @@ impl AgentConfig {
             .map(|agent| agent.label.clone())
     }
 
-    pub(super) fn target_matches_agent(&self, target: &str, pony_name: &str) -> bool {
+    pub(super) fn target_matches_agent(&self, target: &str, agent_name: &str) -> bool {
         let Ok(target_route) = self.resolve_route(target) else {
             return false;
         };
-        let matches = self.matching_agents(pony_name);
+        let matches = self.matching_agents(agent_name);
         unique_agents_by_route(matches)
             .iter()
             .any(|agent| normalize_alias(&agent.route()) == normalize_alias(&target_route))
@@ -126,18 +131,7 @@ impl AgentConfig {
 
     fn candidates(&self) -> Vec<AgentConfigAgent> {
         let mut agents = Vec::with_capacity(self.agents.len() + 1);
-        agents.push(AgentConfigAgent {
-            agent_id: self.agent_id.clone(),
-            route_id: self.route_id.clone(),
-            label: self.label.clone(),
-            icon: self.icon.clone(),
-            aliases: self.aliases.clone(),
-            project_root: self.project_root.clone(),
-            mailbox_path: self.mailbox_path.clone(),
-            message_log_path: self.message_log_path.clone(),
-            registry_path: self.registry_path.clone(),
-            global_singleton: self.global_singleton,
-        });
+        agents.push(self.current_agent());
         agents.extend(self.agents.clone());
         agents
     }
@@ -167,8 +161,6 @@ impl AgentConfigAgent {
 
     fn is_global_singleton(&self) -> bool {
         self.global_singleton
-            || self.agent_id == "PRINCESS_CELESTIA_SOL_INVICTUS"
-            || self.route_id == "PRINCESS_CELESTIA_SOL_INVICTUS"
     }
 }
 
@@ -205,7 +197,7 @@ fn unique_agent_or_ambiguous(
         Ok(agents[0].clone())
     } else {
         Err(format!(
-            "Ambiguous pony '{raw}'. Use a disambiguated alias such as <project>:<name>."
+            "Ambiguous agent '{raw}'. Use a disambiguated alias such as <project>:<name>."
         ))
     }
 }

@@ -42,6 +42,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::agent_ipc::AgentIdentity;
+use crate::agent_ipc::AgentMessage;
 use crate::app::app_server_requests::ResolvedAppServerRequest;
 use crate::app_command::AppCommand;
 use crate::app_event::HistoryLookupResponse;
@@ -63,8 +65,6 @@ use crate::mention_codec::encode_history_mentions_at_elements;
 use crate::model_catalog::ModelCatalog;
 use crate::multi_agents;
 use crate::multi_agents::AgentMetadata;
-use crate::pony_ipc::PonyChatEntry;
-use crate::pony_ipc::PonyIdentity;
 use crate::session_state::SessionNetworkProxyRuntime;
 use crate::session_state::ThreadSessionState;
 use crate::status::RateLimitWindowDisplay;
@@ -629,9 +629,9 @@ pub(crate) struct ChatWidget {
     running_commands: HashMap<String, RunningCommand>,
     collab_agent_metadata: HashMap<ThreadId, AgentMetadata>,
     pending_collab_spawn_requests: HashMap<String, multi_agents::SpawnRequestSummary>,
-    pony_ipc_task: Option<JoinHandle<()>>,
-    pony_ipc_identity: Option<PonyIdentity>,
-    pending_pony_messages: VecDeque<PonyChatEntry>,
+    agent_ipc_task: Option<JoinHandle<()>>,
+    agent_ipc_identity: Option<AgentIdentity>,
+    pending_agent_messages: VecDeque<AgentMessage>,
     suppressed_exec_calls: HashSet<String>,
     skills_all: Vec<SkillMetadata>,
     skills_initial_state: Option<HashMap<AbsolutePathBuf, bool>>,

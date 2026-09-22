@@ -35,6 +35,7 @@ The goal of the combined stack is to make several specialized agents behave more
 - **Generated roster routing support** so the TUI can address the current agent team without hard-coded recipient lists.
 - **Agent-specific TUI prompt styling** with configurable prompt glyphs and backgrounds, making parallel sessions easy to distinguish visually.
 - **Terminal input recovery** so TUI input can restart after an underlying terminal event stream closes unexpectedly.
+- **Pony attention alerts** that select an active-identity WAV from `$AGENIC_PROJECT_PONY_ASSETS_DIR/voices/askingForHelp` for approval and prompt requests. On WSL the alert uses Windows PowerShell `System.Media.SoundPlayer`; missing assets, unsupported platforms, or failed playback fall back to the terminal bell without delaying the TUI.
 
 The separate **Agenic Pony System** is one orchestration runtime that uses these integration points. It supplies its own persistent named agents, launcher scripts, generated session configuration, shared coordination files, and personalities.
 

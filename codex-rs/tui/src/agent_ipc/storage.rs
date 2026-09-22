@@ -13,21 +13,16 @@ use std::io::BufReader;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
 use uuid::Uuid;
 
+use super::AgentIdentity;
+use super::AgentMessage;
+use super::AgentRegistryEntry;
 use super::BROADCAST_TARGET;
 use super::DeliveryClass;
-use super::PONY_CHAT_LOG_PATH_ENV;
-use super::PONY_REGISTRY_LOG_PATH_ENV;
-use super::PROJECT_ROOT_ENV;
-use super::PonyChatEntry;
-use super::PonyIdentity;
-use super::PonyRegistryEntry;
 use super::STALE_AFTER_SECS;
-use super::UNKNOWN_BRANCH;
 use super::agent_config_from_env;
-use super::canonicalize_pony_name;
+use super::canonicalize_agent_name;
 use super::non_empty_path;
 use super::resolve_target_agent;
 use super::roster::normalize_agent_name;
@@ -37,7 +32,7 @@ use super::same_project;
 pub(super) fn append_registry_heartbeat_at(
     registry_path: &Path,
     lock_path: &Path,
-    identity: &PonyIdentity,
+    identity: &AgentIdentity,
 ) -> io::Result<()> {
     maybe_reset_stale_registry_log(registry_path, lock_path)?;
     append_json_line(registry_path, &identity.registry_entry())
@@ -46,21 +41,21 @@ pub(super) fn append_registry_heartbeat_at(
 pub(super) fn append_chat_message_at(
     chat_path: &Path,
     lock_path: &Path,
-    identity: &PonyIdentity,
+    identity: &AgentIdentity,
     target: &str,
     text: &str,
     delivery_class: DeliveryClass,
-) -> io::Result<PonyChatEntry> {
+) -> io::Result<AgentMessage> {
     if delivery_class == DeliveryClass::Ephemeral {
         maybe_reset_stale_chat_log(chat_path, lock_path)?;
     }
     let trimmed = text.trim();
     let (subject, body) = split_subject_and_body(trimmed);
-    let entry = PonyChatEntry {
+    let entry = AgentMessage {
         id: Uuid::new_v4().to_string(),
         from_instance_id: identity.instance_id.clone(),
-        from_pony_name: identity.pony_name.clone(),
-        from_symbol: identity.pony_symbol.clone(),
+        from_agent_name: identity.agent_name.clone(),
+        from_symbol: identity.agent_symbol.clone(),
         to: normalize_target(target),
         subject,
         body,
@@ -74,10 +69,10 @@ pub(super) fn append_chat_message_at(
 pub(super) fn read_live_registry_at(
     registry_path: &Path,
     lock_path: &Path,
-) -> io::Result<Vec<PonyRegistryEntry>> {
+) -> io::Result<Vec<AgentRegistryEntry>> {
     maybe_reset_stale_registry_log(registry_path, lock_path)?;
     let mut latest_by_uuid = HashMap::new();
-    for entry in read_jsonl::<PonyRegistryEntry>(registry_path)? {
+    for entry in read_jsonl::<AgentRegistryEntry>(registry_path)? {
         if is_stale(entry.last_seen_at) {
             continue;
         }
@@ -85,8 +80,8 @@ pub(super) fn read_live_registry_at(
     }
     let mut entries = latest_by_uuid.into_values().collect::<Vec<_>>();
     entries.sort_by(|left, right| {
-        left.pony_name
-            .cmp(&right.pony_name)
+        left.agent_name
+            .cmp(&right.agent_name)
             .then_with(|| left.path.cmp(&right.path))
     });
     Ok(entries)
@@ -95,11 +90,11 @@ pub(super) fn read_live_registry_at(
 pub(super) fn read_new_messages_at(
     chat_path: &Path,
     lock_path: &Path,
-    identity: &PonyIdentity,
-) -> io::Result<Vec<PonyChatEntry>> {
+    identity: &AgentIdentity,
+) -> io::Result<Vec<AgentMessage>> {
     maybe_reset_stale_chat_log(chat_path, lock_path)?;
-    let mut latest_by_sender: HashMap<String, PonyChatEntry> = HashMap::new();
-    for entry in read_jsonl::<PonyChatEntry>(chat_path)? {
+    let mut latest_by_sender: HashMap<String, AgentMessage> = HashMap::new();
+    for entry in read_jsonl::<AgentMessage>(chat_path)? {
         if entry.delivery_class == DeliveryClass::Ephemeral && is_stale(entry.created_at) {
             continue;
         }
@@ -109,7 +104,7 @@ pub(super) fn read_new_messages_at(
         if !target_matches(&entry.to, identity) {
             continue;
         }
-        let sender = canonicalize_pony_name(&entry.from_pony_name);
+        let sender = canonicalize_agent_name(&entry.from_agent_name);
         match latest_by_sender.get(&sender) {
             Some(existing) if existing.created_at >= entry.created_at => {}
             _ => {
@@ -157,7 +152,7 @@ where
 }
 
 fn latest_registry_timestamp(path: &Path) -> io::Result<Option<DateTime<Utc>>> {
-    Ok(read_jsonl::<PonyRegistryEntry>(path)?
+    Ok(read_jsonl::<AgentRegistryEntry>(path)?
         .into_iter()
         .map(|entry| entry.last_seen_at)
         .max())
@@ -165,7 +160,7 @@ fn latest_registry_timestamp(path: &Path) -> io::Result<Option<DateTime<Utc>>> {
 
 fn latest_chat_timestamp(path: &Path) -> io::Result<Option<DateTime<Utc>>> {
     let mut latest = None;
-    for entry in read_jsonl::<PonyChatEntry>(path)? {
+    for entry in read_jsonl::<AgentMessage>(path)? {
         if entry.delivery_class == DeliveryClass::Durable {
             return Ok(None);
         }
@@ -177,7 +172,7 @@ fn latest_chat_timestamp(path: &Path) -> io::Result<Option<DateTime<Utc>>> {
 pub(super) fn append_json_line<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     let Some(parent) = path.parent() else {
         return Err(io::Error::other(
-            "missing parent directory for pony IPC log",
+            "missing parent directory for agent IPC log",
         ));
     };
     fs::create_dir_all(parent)?;
@@ -210,54 +205,31 @@ where
     Ok(values)
 }
 
-pub(super) fn git_branch_for_path(path: &Path) -> String {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .arg("rev-parse")
-        .arg("--abbrev-ref")
-        .arg("HEAD")
-        .output();
-    match output {
-        Ok(output) if output.status.success() => {
-            let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if branch.is_empty() {
-                UNKNOWN_BRANCH.to_string()
-            } else {
-                branch
-            }
-        }
-        _ => UNKNOWN_BRANCH.to_string(),
-    }
-}
-
-pub(super) fn pony_registry_log_path() -> PathBuf {
+pub(super) fn agent_registry_log_path() -> PathBuf {
     let config_path =
         agent_config_from_env().and_then(|config| non_empty_path(&config.registry_path));
-    pony_ipc_log_path_with_config(
-        PONY_REGISTRY_LOG_PATH_ENV,
+    agent_ipc_log_path_with_config(
         config_path.as_deref(),
-        "pony.registry.jsonl",
-        "codex-pony-registry.jsonl",
+        "agent.registry.jsonl",
+        "codex-agent-registry.jsonl",
     )
 }
 
-pub(super) fn pony_registry_lock_path() -> PathBuf {
-    cleanup_lock_path_for(&pony_registry_log_path(), "pony.registry.cleanup.lock")
+pub(super) fn agent_registry_lock_path() -> PathBuf {
+    cleanup_lock_path_for(&agent_registry_log_path(), "agent.registry.cleanup.lock")
 }
 
-pub(super) fn pony_chat_log_path() -> PathBuf {
+pub(super) fn agent_chat_log_path() -> PathBuf {
     let config_path =
         agent_config_from_env().and_then(|config| non_empty_path(&config.message_log_path));
-    pony_ipc_log_path_with_config(
-        PONY_CHAT_LOG_PATH_ENV,
+    agent_ipc_log_path_with_config(
         config_path.as_deref(),
-        "pony.chat.jsonl",
-        "codex-pony-chat.jsonl",
+        "agent.chat.jsonl",
+        "codex-agent-chat.jsonl",
     )
 }
 
-pub(super) fn pony_chat_log_path_for_target(target: &str) -> PathBuf {
+pub(super) fn agent_chat_log_path_for_target(target: &str) -> PathBuf {
     if target != BROADCAST_TARGET
         && !target.eq_ignore_ascii_case("all")
         && let Some(path) = agent_config_from_env()
@@ -267,78 +239,52 @@ pub(super) fn pony_chat_log_path_for_target(target: &str) -> PathBuf {
         return path;
     }
 
-    pony_chat_log_path()
+    agent_chat_log_path()
 }
 
-pub(super) fn pony_chat_lock_path() -> PathBuf {
-    cleanup_lock_path_for(&pony_chat_log_path(), "pony.chat.cleanup.lock")
+pub(super) fn agent_chat_lock_path() -> PathBuf {
+    cleanup_lock_path_for(&agent_chat_log_path(), "agent.chat.cleanup.lock")
 }
 
-pub(super) fn receipt_ledger_path(pony_name: &str) -> PathBuf {
+pub(super) fn receipt_ledger_path(agent_name: &str) -> PathBuf {
     let file_name = format!(
-        "pony.receipts-{}.jsonl",
-        normalize_agent_name(pony_name).to_ascii_lowercase()
+        "agent.receipts-{}.jsonl",
+        normalize_agent_name(agent_name).to_ascii_lowercase()
     );
-    pony_chat_log_path().with_file_name(file_name)
+    agent_chat_log_path().with_file_name(file_name)
 }
 
-fn pony_ipc_log_path_with_config(
-    env_name: &str,
+fn agent_ipc_log_path_with_config(
     config_path: Option<&Path>,
     project_file_name: &str,
     legacy_file_name: &str,
 ) -> PathBuf {
-    let explicit_path = std::env::var(env_name).ok();
-    let project_root = std::env::var(PROJECT_ROOT_ENV).ok();
     let current_dir = std::env::current_dir().ok();
-    pony_ipc_log_path_for(
-        explicit_path.as_deref(),
+    agent_ipc_log_path_for(
         config_path,
-        project_root.as_deref(),
         current_dir.as_deref(),
         project_file_name,
         legacy_file_name,
     )
 }
 
-pub(super) fn pony_ipc_log_path_for(
-    explicit_path: Option<&str>,
+pub(super) fn agent_ipc_log_path_for(
     config_path: Option<&Path>,
-    project_root: Option<&str>,
     current_dir: Option<&Path>,
     project_file_name: &str,
     legacy_file_name: &str,
 ) -> PathBuf {
-    let project_root = project_root.and_then(non_empty_path);
-    if let Some(path) = explicit_path.and_then(non_empty_path)
-        && project_root
-            .as_ref()
-            .is_none_or(|root| path.starts_with(root))
-    {
-        return path;
-    }
-
-    if let Some(path) = config_path
-        && project_root
-            .as_ref()
-            .is_none_or(|root| path.starts_with(root))
-    {
+    if let Some(path) = config_path {
         return path.to_path_buf();
     }
-
-    if let Some(root) = project_root {
-        return project_runtime_path(&root, project_file_name);
-    }
-
     if let Some(cwd) = current_dir {
         return project_runtime_path(cwd, project_file_name);
     }
-
     std::env::temp_dir().join(legacy_file_name)
 }
 
 fn project_runtime_path(project_root: &Path, file_name: &str) -> PathBuf {
-    project_root.join("pony/runtime").join(file_name)
+    project_root.join(".codex/agent-ipc").join(file_name)
 }
 
 pub(super) fn cleanup_lock_path_for(log_path: &Path, lock_file_name: &str) -> PathBuf {
@@ -364,24 +310,23 @@ fn split_subject_and_body(text: &str) -> (String, String) {
     (subject, body)
 }
 
-pub(super) fn pony_mailbox_path(project_root: &Path, pony_name: &str) -> PathBuf {
-    if let Some(roster) = agent_config_from_env()
-        && let Some(path) = roster
-            .matching_agents(pony_name)
+pub(super) fn agent_mailbox_path(project_root: &Path, agent_name: &str) -> io::Result<PathBuf> {
+    if let Some(roster) = agent_config_from_env() {
+        return roster
+            .matching_agents(agent_name)
             .into_iter()
             .find(|agent| same_project(&agent.project_root, &roster.project_root))
             .and_then(|agent| non_empty_path(&agent.mailbox_path))
-    {
-        return path;
+            .ok_or_else(|| io::Error::other("managed agent has no configured mailbox path"));
     }
 
-    project_root
-        .join("pony/team.coordination")
-        .join(format!("{}.mailbox.md", pony_mailbox_stem(pony_name)))
+    Ok(project_root
+        .join(".codex/agent-ipc")
+        .join(format!("{}.mailbox.md", agent_mailbox_stem(agent_name))))
 }
 
-fn pony_mailbox_stem(pony_name: &str) -> String {
-    normalize_agent_name(pony_name)
+fn agent_mailbox_stem(agent_name: &str) -> String {
+    normalize_agent_name(agent_name)
         .to_ascii_lowercase()
         .chars()
         .map(|ch| {
@@ -411,15 +356,15 @@ fn normalize_target(target: &str) -> String {
     }
 }
 
-fn target_matches(target: &str, identity: &PonyIdentity) -> bool {
+fn target_matches(target: &str, identity: &AgentIdentity) -> bool {
     target == BROADCAST_TARGET
-        || normalize_alias(target) == normalize_alias(&identity.pony_name)
+        || normalize_alias(target) == normalize_alias(&identity.agent_name)
         || identity
-            .pony_aliases
+            .agent_aliases
             .iter()
             .any(|alias| normalize_alias(target) == normalize_alias(alias))
         || agent_config_from_env()
-            .is_some_and(|roster| roster.target_matches_agent(target, &identity.pony_name))
+            .is_some_and(|roster| roster.target_matches_agent(target, &identity.agent_name))
 }
 
 fn is_stale(timestamp: DateTime<Utc>) -> bool {

@@ -171,9 +171,9 @@ impl ChatWidget {
             running_commands: HashMap::new(),
             collab_agent_metadata: HashMap::new(),
             pending_collab_spawn_requests: HashMap::new(),
-            pony_ipc_task: None,
-            pony_ipc_identity: None,
-            pending_pony_messages: VecDeque::new(),
+            agent_ipc_task: None,
+            agent_ipc_identity: None,
+            pending_agent_messages: VecDeque::new(),
             suppressed_exec_calls: HashSet::new(),
             last_unified_wait: None,
             unified_exec_wait_streak: None,
@@ -294,7 +294,7 @@ impl ChatWidget {
         widget.sync_worktrees_enabled();
         widget.sync_plugins_command_enabled();
         widget.sync_goal_command_enabled();
-        widget.maybe_start_pony_ipc();
+        widget.maybe_start_agent_ipc();
         widget.sync_mentions_v2_enabled();
         widget
             .bottom_pane
