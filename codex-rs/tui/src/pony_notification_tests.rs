@@ -18,7 +18,7 @@ fn finds_only_active_pony_wavs_in_installed_assets() {
     let sounds = resolve_sound_paths(
         "Twilight Sparkle",
         Some(temp.path().as_os_str().to_owned()),
-        None,
+        /*project_root*/ None,
     )
     .expect("resolve sounds");
 
@@ -51,7 +51,7 @@ fn missing_or_unmatched_assets_return_not_found() {
     assert_eq!(
         resolve_sound_paths(
             "Twilight Sparkle",
-            None,
+            /*assets_dir*/ None,
             Some(temp.path().as_os_str().to_owned()),
         )
         .expect_err("missing assets should fail")
