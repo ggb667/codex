@@ -22,7 +22,7 @@ fn sample_identity() -> AgentIdentity {
         ],
         mailbox_path: None,
         project_path: "/tmp/project".to_string(),
-        git_branch: "pony/twi/main".to_string(),
+        git_branch: "agent/twi/main".to_string(),
         pid: 42,
     }
 }
@@ -39,9 +39,10 @@ fn sample_roster() -> AgentConfig {
             "CODEX:Twilight Sparkle".to_string(),
         ],
         project_root: "/tmp/codex".to_string(),
-        mailbox_path: "/tmp/codex/pony/team.coordination/twi.mailbox.md".to_string(),
-        message_log_path: "/tmp/codex/pony/runtime/pony.chat.jsonl".to_string(),
-        registry_path: "/tmp/codex/pony/runtime/pony.registry.jsonl".to_string(),
+        branch_label: "main".to_string(),
+        mailbox_path: "/tmp/codex/agent/team.coordination/twi.mailbox.md".to_string(),
+        message_log_path: "/tmp/codex/agent/runtime/agent.chat.jsonl".to_string(),
+        registry_path: "/tmp/codex/agent/runtime/agent.registry.jsonl".to_string(),
         global_singleton: false,
         agents: vec![
             AgentConfigAgent {
@@ -55,9 +56,9 @@ fn sample_roster() -> AgentConfig {
                     "EVH:Twilight Sparkle".to_string(),
                 ],
                 project_root: "/tmp/evh".to_string(),
-                mailbox_path: "/tmp/evh/pony/team.coordination/twi.mailbox.md".to_string(),
-                message_log_path: "/tmp/evh/pony/runtime/pony.chat.jsonl".to_string(),
-                registry_path: "/tmp/evh/pony/runtime/pony.registry.jsonl".to_string(),
+                mailbox_path: "/tmp/evh/agent/team.coordination/twi.mailbox.md".to_string(),
+                message_log_path: "/tmp/evh/agent/runtime/agent.chat.jsonl".to_string(),
+                registry_path: "/tmp/evh/agent/runtime/agent.registry.jsonl".to_string(),
                 global_singleton: false,
             },
             AgentConfigAgent {
@@ -66,12 +67,13 @@ fn sample_roster() -> AgentConfig {
                 label: "Global Coordinator".to_string(),
                 icon: "☀︎".to_string(),
                 aliases: vec!["Global Coordinator".to_string(), "Coordinator".to_string()],
-                project_root: "/tmp/agenic-pony-system".to_string(),
-                mailbox_path: "/tmp/agenic-pony-system/pony/team.coordination/celestia.mailbox.md"
+                project_root: "/tmp/foreign-agent-system".to_string(),
+                mailbox_path:
+                    "/tmp/foreign-agent-system/agent/team.coordination/global-coordinator.mailbox.md"
+                        .to_string(),
+                message_log_path: "/tmp/foreign-agent-system/agent/runtime/agent.chat.jsonl"
                     .to_string(),
-                message_log_path: "/tmp/agenic-pony-system/pony/runtime/pony.chat.jsonl"
-                    .to_string(),
-                registry_path: "/tmp/agenic-pony-system/pony/runtime/pony.registry.jsonl"
+                registry_path: "/tmp/foreign-agent-system/agent/runtime/agent.registry.jsonl"
                     .to_string(),
                 global_singleton: true,
             },
@@ -136,7 +138,7 @@ fn roster_selects_target_message_log_for_qualified_cross_repo_target() {
         .unwrap();
     assert_eq!(
         non_empty_path(&target.message_log_path).unwrap(),
-        PathBuf::from("/tmp/evh/pony/runtime/pony.chat.jsonl")
+        PathBuf::from("/tmp/evh/agent/runtime/agent.chat.jsonl")
     );
 }
 
@@ -301,6 +303,34 @@ fn mailbox_markdown_uses_sender_symbol() {
 }
 
 #[test]
+fn agent_wire_format_writes_generic_keys_and_reads_legacy_keys() {
+    let message = AgentMessage {
+        id: "msg-wire".to_string(),
+        from_instance_id: "uuid-wire".to_string(),
+        from_agent_name: "AGENT_ONE".to_string(),
+        from_symbol: "A".to_string(),
+        to: "AGENT_TWO".to_string(),
+        subject: "status".to_string(),
+        body: String::new(),
+        created_at: Utc::now(),
+        delivery_class: DeliveryClass::Ephemeral,
+    };
+    let serialized = serde_json::to_value(&message).unwrap();
+    assert_eq!(serialized["from_agent_name"], "AGENT_ONE");
+    assert!(serialized.get("from_pony_name").is_none());
+
+    let mut legacy = serialized;
+    let legacy_name = legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("from_agent_name")
+        .unwrap();
+    legacy["from_pony_name"] = legacy_name;
+    let parsed: AgentMessage = serde_json::from_value(legacy).unwrap();
+    assert_eq!(parsed.from_agent_name, "AGENT_ONE");
+}
+
+#[test]
 fn stale_registry_log_is_removed_before_next_heartbeat() {
     let temp = tempdir().unwrap();
     let registry_path = temp.path().join("registry.jsonl");
@@ -324,44 +354,38 @@ fn stale_registry_log_is_removed_before_next_heartbeat() {
 fn ipc_log_path_defaults_to_project_runtime_when_project_root_is_set() {
     assert_eq!(
         agent_ipc_log_path_for(
-            /*explicit_path*/ None,
             /*config_path*/ None,
-            Some("/tmp/project"),
-            Some(Path::new("/tmp/other")),
-            "pony.chat.jsonl",
-            "codex-pony-chat.jsonl",
+            Some(Path::new("/tmp/project")),
+            "agent.chat.jsonl",
+            "codex-agent-chat.jsonl",
         ),
-        PathBuf::from("/tmp/project/pony/runtime/pony.chat.jsonl")
+        PathBuf::from("/tmp/project/.codex/agent-ipc/agent.chat.jsonl")
     );
 }
 
 #[test]
-fn ipc_log_path_ignores_explicit_path_from_another_project() {
+fn ipc_log_path_uses_neutral_current_directory_fallback() {
     assert_eq!(
         agent_ipc_log_path_for(
-            Some("/tmp/source/pony/runtime/pony.chat.jsonl"),
             /*config_path*/ None,
-            Some("/tmp/codex"),
             Some(Path::new("/tmp/other")),
-            "pony.chat.jsonl",
-            "codex-pony-chat.jsonl",
+            "agent.chat.jsonl",
+            "codex-agent-chat.jsonl",
         ),
-        PathBuf::from("/tmp/codex/pony/runtime/pony.chat.jsonl")
+        PathBuf::from("/tmp/other/.codex/agent-ipc/agent.chat.jsonl")
     );
 }
 
 #[test]
-fn ipc_log_path_accepts_explicit_path_under_project_root() {
+fn ipc_log_path_uses_config_path() {
     assert_eq!(
         agent_ipc_log_path_for(
-            Some("/tmp/codex/pony/runtime/custom.chat.jsonl"),
-            /*config_path*/ None,
-            Some("/tmp/codex"),
+            Some(Path::new("/tmp/config/agent.chat.jsonl")),
             Some(Path::new("/tmp/other")),
-            "pony.chat.jsonl",
-            "codex-pony-chat.jsonl",
+            "agent.chat.jsonl",
+            "codex-agent-chat.jsonl",
         ),
-        PathBuf::from("/tmp/codex/pony/runtime/custom.chat.jsonl")
+        PathBuf::from("/tmp/config/agent.chat.jsonl")
     );
 }
 
@@ -369,14 +393,12 @@ fn ipc_log_path_accepts_explicit_path_under_project_root() {
 fn ipc_log_path_uses_current_dir_before_legacy_tmp_fallback() {
     assert_eq!(
         agent_ipc_log_path_for(
-            /*explicit_path*/ None,
             /*config_path*/ None,
-            /*project_root*/ None,
             Some(Path::new("/tmp/cwd")),
-            "pony.chat.jsonl",
-            "codex-pony-chat.jsonl",
+            "agent.chat.jsonl",
+            "codex-agent-chat.jsonl",
         ),
-        PathBuf::from("/tmp/cwd/pony/runtime/pony.chat.jsonl")
+        PathBuf::from("/tmp/cwd/.codex/agent-ipc/agent.chat.jsonl")
     );
 }
 
@@ -384,13 +406,11 @@ fn ipc_log_path_uses_current_dir_before_legacy_tmp_fallback() {
 fn ipc_log_path_uses_config_path_under_project_root() {
     assert_eq!(
         agent_ipc_log_path_for(
-            /*explicit_path*/ None,
-            Some(Path::new("/tmp/project/pony/runtime/config.chat.jsonl")),
-            Some("/tmp/project"),
+            Some(Path::new("/tmp/project/.config/agent.chat.jsonl")),
             Some(Path::new("/tmp/other")),
-            "pony.chat.jsonl",
-            "codex-pony-chat.jsonl",
+            "agent.chat.jsonl",
+            "codex-agent-chat.jsonl",
         ),
-        PathBuf::from("/tmp/project/pony/runtime/config.chat.jsonl")
+        PathBuf::from("/tmp/project/.config/agent.chat.jsonl")
     );
 }

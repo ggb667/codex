@@ -18,6 +18,7 @@ pub(super) struct AgentConfig {
     #[serde(default)]
     pub(super) aliases: Vec<String>,
     pub(super) project_root: String,
+    pub(super) branch_label: String,
     #[serde(default)]
     pub(super) mailbox_path: String,
     #[serde(default)]
@@ -51,15 +52,19 @@ pub(super) struct AgentConfigAgent {
 }
 
 impl AgentConfig {
-    pub(super) fn current_agent(
-        &self,
-        raw_name: &str,
-        project_path: &str,
-    ) -> Option<AgentConfigAgent> {
-        let normalized_project = normalize_alias(project_path);
-        self.candidates().into_iter().find(|agent| {
-            agent.matches(raw_name) && normalize_alias(&agent.project_root) == normalized_project
-        })
+    pub(super) fn current_agent(&self) -> AgentConfigAgent {
+        AgentConfigAgent {
+            agent_id: self.agent_id.clone(),
+            route_id: self.route_id.clone(),
+            label: self.label.clone(),
+            icon: self.icon.clone(),
+            aliases: self.aliases.clone(),
+            project_root: self.project_root.clone(),
+            mailbox_path: self.mailbox_path.clone(),
+            message_log_path: self.message_log_path.clone(),
+            registry_path: self.registry_path.clone(),
+            global_singleton: self.global_singleton,
+        }
     }
 
     pub(super) fn resolve_route(&self, name: &str) -> Result<String, String> {
@@ -126,18 +131,7 @@ impl AgentConfig {
 
     fn candidates(&self) -> Vec<AgentConfigAgent> {
         let mut agents = Vec::with_capacity(self.agents.len() + 1);
-        agents.push(AgentConfigAgent {
-            agent_id: self.agent_id.clone(),
-            route_id: self.route_id.clone(),
-            label: self.label.clone(),
-            icon: self.icon.clone(),
-            aliases: self.aliases.clone(),
-            project_root: self.project_root.clone(),
-            mailbox_path: self.mailbox_path.clone(),
-            message_log_path: self.message_log_path.clone(),
-            registry_path: self.registry_path.clone(),
-            global_singleton: self.global_singleton,
-        });
+        agents.push(self.current_agent());
         agents.extend(self.agents.clone());
         agents
     }

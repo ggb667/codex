@@ -13,7 +13,6 @@ use std::io::BufReader;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
 use uuid::Uuid;
 
 use super::AgentIdentity;
@@ -21,11 +20,7 @@ use super::AgentMessage;
 use super::AgentRegistryEntry;
 use super::BROADCAST_TARGET;
 use super::DeliveryClass;
-use super::PONY_CHAT_LOG_PATH_ENV;
-use super::PONY_REGISTRY_LOG_PATH_ENV;
-use super::PROJECT_ROOT_ENV;
 use super::STALE_AFTER_SECS;
-use super::UNKNOWN_BRANCH;
 use super::agent_config_from_env;
 use super::canonicalize_agent_name;
 use super::non_empty_path;
@@ -210,50 +205,27 @@ where
     Ok(values)
 }
 
-pub(super) fn git_branch_for_path(path: &Path) -> String {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .arg("rev-parse")
-        .arg("--abbrev-ref")
-        .arg("HEAD")
-        .output();
-    match output {
-        Ok(output) if output.status.success() => {
-            let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if branch.is_empty() {
-                UNKNOWN_BRANCH.to_string()
-            } else {
-                branch
-            }
-        }
-        _ => UNKNOWN_BRANCH.to_string(),
-    }
-}
-
 pub(super) fn agent_registry_log_path() -> PathBuf {
     let config_path =
         agent_config_from_env().and_then(|config| non_empty_path(&config.registry_path));
     agent_ipc_log_path_with_config(
-        PONY_REGISTRY_LOG_PATH_ENV,
         config_path.as_deref(),
-        "pony.registry.jsonl",
-        "codex-pony-registry.jsonl",
+        "agent.registry.jsonl",
+        "codex-agent-registry.jsonl",
     )
 }
 
 pub(super) fn agent_registry_lock_path() -> PathBuf {
-    cleanup_lock_path_for(&agent_registry_log_path(), "pony.registry.cleanup.lock")
+    cleanup_lock_path_for(&agent_registry_log_path(), "agent.registry.cleanup.lock")
 }
 
 pub(super) fn agent_chat_log_path() -> PathBuf {
     let config_path =
         agent_config_from_env().and_then(|config| non_empty_path(&config.message_log_path));
     agent_ipc_log_path_with_config(
-        PONY_CHAT_LOG_PATH_ENV,
         config_path.as_deref(),
-        "pony.chat.jsonl",
-        "codex-pony-chat.jsonl",
+        "agent.chat.jsonl",
+        "codex-agent-chat.jsonl",
     )
 }
 
@@ -271,30 +243,25 @@ pub(super) fn agent_chat_log_path_for_target(target: &str) -> PathBuf {
 }
 
 pub(super) fn agent_chat_lock_path() -> PathBuf {
-    cleanup_lock_path_for(&agent_chat_log_path(), "pony.chat.cleanup.lock")
+    cleanup_lock_path_for(&agent_chat_log_path(), "agent.chat.cleanup.lock")
 }
 
 pub(super) fn receipt_ledger_path(agent_name: &str) -> PathBuf {
     let file_name = format!(
-        "pony.receipts-{}.jsonl",
+        "agent.receipts-{}.jsonl",
         normalize_agent_name(agent_name).to_ascii_lowercase()
     );
     agent_chat_log_path().with_file_name(file_name)
 }
 
 fn agent_ipc_log_path_with_config(
-    env_name: &str,
     config_path: Option<&Path>,
     project_file_name: &str,
     legacy_file_name: &str,
 ) -> PathBuf {
-    let explicit_path = std::env::var(env_name).ok();
-    let project_root = std::env::var(PROJECT_ROOT_ENV).ok();
     let current_dir = std::env::current_dir().ok();
     agent_ipc_log_path_for(
-        explicit_path.as_deref(),
         config_path,
-        project_root.as_deref(),
         current_dir.as_deref(),
         project_file_name,
         legacy_file_name,
@@ -302,43 +269,22 @@ fn agent_ipc_log_path_with_config(
 }
 
 pub(super) fn agent_ipc_log_path_for(
-    explicit_path: Option<&str>,
     config_path: Option<&Path>,
-    project_root: Option<&str>,
     current_dir: Option<&Path>,
     project_file_name: &str,
     legacy_file_name: &str,
 ) -> PathBuf {
-    let project_root = project_root.and_then(non_empty_path);
-    if let Some(path) = explicit_path.and_then(non_empty_path)
-        && project_root
-            .as_ref()
-            .is_none_or(|root| path.starts_with(root))
-    {
-        return path;
-    }
-
-    if let Some(path) = config_path
-        && project_root
-            .as_ref()
-            .is_none_or(|root| path.starts_with(root))
-    {
+    if let Some(path) = config_path {
         return path.to_path_buf();
     }
-
-    if let Some(root) = project_root {
-        return project_runtime_path(&root, project_file_name);
-    }
-
     if let Some(cwd) = current_dir {
         return project_runtime_path(cwd, project_file_name);
     }
-
     std::env::temp_dir().join(legacy_file_name)
 }
 
 fn project_runtime_path(project_root: &Path, file_name: &str) -> PathBuf {
-    project_root.join("pony/runtime").join(file_name)
+    project_root.join(".codex/agent-ipc").join(file_name)
 }
 
 pub(super) fn cleanup_lock_path_for(log_path: &Path, lock_file_name: &str) -> PathBuf {
@@ -375,7 +321,7 @@ pub(super) fn agent_mailbox_path(project_root: &Path, agent_name: &str) -> io::R
     }
 
     Ok(project_root
-        .join("pony/team.coordination")
+        .join(".codex/agent-ipc")
         .join(format!("{}.mailbox.md", agent_mailbox_stem(agent_name))))
 }
 

@@ -11,7 +11,6 @@ mod roster;
 mod storage;
 
 use roster::AgentConfig;
-use roster::AgentConfigAgent;
 use roster::agent_config_from_env;
 use roster::display_agent_name as fallback_display_agent_name;
 use roster::normalize_agent_name;
@@ -26,7 +25,6 @@ use storage::append_json_line;
 use storage::append_registry_heartbeat_at;
 use storage::append_text_block;
 use storage::cleanup_lock_path_for;
-use storage::git_branch_for_path;
 use storage::read_jsonl;
 use storage::read_live_registry_at;
 use storage::read_new_messages_at;
@@ -35,10 +33,6 @@ use storage::receipt_ledger_path;
 pub(crate) const AGENT_IPC_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6);
 pub(super) const STALE_AFTER_SECS: i64 = 60 * 60;
 pub(super) const BROADCAST_TARGET: &str = "*";
-const UNKNOWN_BRANCH: &str = "unknown";
-pub(super) const PONY_CHAT_LOG_PATH_ENV: &str = "AGENIC_PONY_CHAT_LOG_PATH";
-pub(super) const PONY_REGISTRY_LOG_PATH_ENV: &str = "AGENIC_PONY_REGISTRY_LOG_PATH";
-pub(super) const PROJECT_ROOT_ENV: &str = "AGENIC_PROJECT_ROOT";
 pub(super) const AGENT_CONFIG_ENV: &str = "CODEX_AGENT_CONFIG";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,11 +56,11 @@ pub(crate) enum DeliveryClass {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct AgentIdentity {
     pub(crate) instance_id: String,
-    #[serde(rename = "pony_name")]
+    #[serde(rename = "agent_name", alias = "pony_name")]
     pub(crate) agent_name: String,
-    #[serde(rename = "pony_symbol")]
+    #[serde(rename = "agent_symbol", alias = "pony_symbol")]
     pub(crate) agent_symbol: String,
-    #[serde(rename = "pony_aliases")]
+    #[serde(rename = "agent_aliases", alias = "pony_aliases")]
     pub(crate) agent_aliases: Vec<String>,
     pub(crate) mailbox_path: Option<PathBuf>,
     pub(crate) project_path: String,
@@ -77,7 +71,7 @@ pub(crate) struct AgentIdentity {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct AgentRegistryEntry {
     pub(crate) uuid: String,
-    #[serde(rename = "pony_name")]
+    #[serde(rename = "agent_name", alias = "pony_name")]
     pub(crate) agent_name: String,
     pub(crate) path: String,
     pub(crate) git_branch: String,
@@ -89,7 +83,7 @@ pub(crate) struct AgentRegistryEntry {
 pub(crate) struct AgentMessage {
     pub(crate) id: String,
     pub(crate) from_instance_id: String,
-    #[serde(rename = "from_pony_name")]
+    #[serde(rename = "from_agent_name", alias = "from_pony_name")]
     pub(crate) from_agent_name: String,
     pub(crate) from_symbol: String,
     pub(crate) to: String,
@@ -130,11 +124,11 @@ impl AgentMessage {
     }
 
     fn display_sender(&self) -> String {
-        let pony = display_agent_name(&self.from_agent_name);
+        let agent = display_agent_name(&self.from_agent_name);
         if self.from_symbol.is_empty() {
-            pony
+            agent
         } else {
-            format!("{} {}", self.from_symbol, pony)
+            format!("{} {}", self.from_symbol, agent)
         }
     }
 }
@@ -152,46 +146,26 @@ impl AgentIdentity {
     }
 }
 
-pub(crate) fn agent_identity_from_env(cwd: &Path) -> Option<AgentIdentity> {
-    let raw_name = std::env::var("AGENIC_LAUNCH_PERSONALITY")
-        .ok()
-        .or_else(|| std::env::var("PERSONALITY").ok())?;
-    let project_path = std::env::var("AGENIC_PROJECT_ROOT")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| cwd.display().to_string());
-    let git_branch = std::env::var("AGENIC_PROJECT_BRANCH")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| git_branch_for_path(Path::new(&project_path)));
-    let roster = agent_config_from_env();
-    let agent = roster
-        .as_ref()
-        .and_then(|roster| roster.current_agent(&raw_name, &project_path));
-    let agent_name = agent
-        .as_ref()
-        .map(AgentConfigAgent::route)
-        .unwrap_or_else(|| normalize_agent_name(&raw_name));
-    let agent_symbol = agent
-        .as_ref()
-        .map(|agent| agent.icon.clone())
-        .unwrap_or_default();
-    let agent_aliases = agent
-        .as_ref()
-        .map(AgentConfigAgent::match_names)
-        .unwrap_or_else(|| vec![agent_name.clone(), raw_name]);
-    let mailbox_path = agent
-        .as_ref()
-        .and_then(|agent| non_empty_path(&agent.mailbox_path));
+pub(crate) fn agent_identity_from_env(_cwd: &Path) -> Option<AgentIdentity> {
+    let roster = agent_config_from_env()?;
+    let agent_name = if roster.route_id.trim().is_empty() {
+        roster.agent_id.clone()
+    } else {
+        roster.route_id.clone()
+    };
+    let mut agent_aliases = roster.aliases.clone();
+    agent_aliases.push(roster.agent_id.clone());
+    agent_aliases.push(agent_name.clone());
+    let mailbox_path = non_empty_path(&roster.mailbox_path);
 
     Some(AgentIdentity {
         instance_id: Uuid::new_v4().to_string(),
         agent_name,
-        agent_symbol,
+        agent_symbol: roster.icon,
         agent_aliases,
         mailbox_path,
-        project_path,
-        git_branch,
+        project_path: roster.project_root,
+        git_branch: roster.branch_label,
         pid: std::process::id(),
     })
 }
@@ -264,7 +238,7 @@ pub(crate) fn append_chat_message(
     } else {
         agent_chat_log_path()
     };
-    let lock_path = cleanup_lock_path_for(&chat_path, "pony.chat.cleanup.lock");
+    let lock_path = cleanup_lock_path_for(&chat_path, "agent.chat.cleanup.lock");
     append_chat_message_at(
         &chat_path,
         &lock_path,
