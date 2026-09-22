@@ -4,6 +4,11 @@ use super::*;
 
 impl ChatWidget {
     pub(super) fn notify(&mut self, notification: Notification) {
+        if notification.requires_attention()
+            && let Some(identity) = self.pony_ipc_identity.as_ref()
+        {
+            crate::pony_notification::notify_attention(&identity.pony_name);
+        }
         if !notification.allowed_for(&self.local_settings.tui.notification_settings.notifications) {
             return;
         }
@@ -33,6 +38,10 @@ pub(super) enum Notification {
 }
 
 impl Notification {
+    pub(super) fn requires_attention(&self) -> bool {
+        !matches!(self, Notification::AgentTurnComplete { .. })
+    }
+
     pub(super) fn display(&self) -> String {
         match self {
             Notification::AgentTurnComplete { response } => {
