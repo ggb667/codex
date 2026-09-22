@@ -61,14 +61,11 @@ fn sample_roster() -> AgentConfig {
                 global_singleton: false,
             },
             AgentConfigAgent {
-                agent_id: "PRINCESS_CELESTIA_SOL_INVICTUS".to_string(),
-                route_id: "PRINCESS_CELESTIA_SOL_INVICTUS".to_string(),
-                label: "Princess Celestia Sol Invictus".to_string(),
+                agent_id: "GLOBAL_COORDINATOR".to_string(),
+                route_id: "GLOBAL_COORDINATOR".to_string(),
+                label: "Global Coordinator".to_string(),
                 icon: "☀︎".to_string(),
-                aliases: vec![
-                    "Princess Celestia Sol Invictus".to_string(),
-                    "Celestia".to_string(),
-                ],
+                aliases: vec!["Global Coordinator".to_string(), "Coordinator".to_string()],
                 project_root: "/tmp/agenic-pony-system".to_string(),
                 mailbox_path: "/tmp/agenic-pony-system/pony/team.coordination/celestia.mailbox.md"
                     .to_string(),
@@ -144,11 +141,20 @@ fn roster_selects_target_message_log_for_qualified_cross_repo_target() {
 }
 
 #[test]
-fn roster_preserves_celestia_as_singleton() {
+fn roster_uses_configured_global_singleton() {
     assert_eq!(
-        sample_roster().resolve_route("Celestia").unwrap(),
-        "PRINCESS_CELESTIA_SOL_INVICTUS"
+        sample_roster().resolve_route("Coordinator").unwrap(),
+        "GLOBAL_COORDINATOR"
     );
+}
+
+#[test]
+fn roster_does_not_treat_non_singleton_as_global() {
+    let mut roster = sample_roster();
+    roster.agents[1].global_singleton = false;
+
+    let err = roster.resolve_route("Coordinator").unwrap_err();
+    assert!(err.contains("Ambiguous pony 'Coordinator'"));
 }
 
 #[test]

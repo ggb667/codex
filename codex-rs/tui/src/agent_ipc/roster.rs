@@ -167,8 +167,6 @@ impl AgentConfigAgent {
 
     fn is_global_singleton(&self) -> bool {
         self.global_singleton
-            || self.agent_id == "PRINCESS_CELESTIA_SOL_INVICTUS"
-            || self.route_id == "PRINCESS_CELESTIA_SOL_INVICTUS"
     }
 }
 
