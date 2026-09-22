@@ -15,18 +15,18 @@ use roster::AgentConfigAgent;
 use roster::agent_config_from_env;
 use roster::display_agent_name as fallback_display_agent_name;
 use roster::normalize_agent_name;
+use storage::agent_chat_lock_path;
+use storage::agent_chat_log_path;
+use storage::agent_chat_log_path_for_target;
 use storage::agent_mailbox_path;
+use storage::agent_registry_lock_path;
+use storage::agent_registry_log_path;
 use storage::append_chat_message_at;
 use storage::append_json_line;
 use storage::append_registry_heartbeat_at;
 use storage::append_text_block;
 use storage::cleanup_lock_path_for;
 use storage::git_branch_for_path;
-use storage::pony_chat_lock_path;
-use storage::pony_chat_log_path;
-use storage::pony_chat_log_path_for_target;
-use storage::pony_registry_lock_path;
-use storage::pony_registry_log_path;
 use storage::read_jsonl;
 use storage::read_live_registry_at;
 use storage::read_new_messages_at;
@@ -248,8 +248,8 @@ fn parse_send_command_with_roster(
 }
 
 pub(crate) fn append_registry_heartbeat(identity: &AgentIdentity) -> io::Result<()> {
-    let registry_path = pony_registry_log_path();
-    let lock_path = pony_registry_lock_path();
+    let registry_path = agent_registry_log_path();
+    let lock_path = agent_registry_lock_path();
     append_registry_heartbeat_at(&registry_path, &lock_path, identity)
 }
 
@@ -260,9 +260,9 @@ pub(crate) fn append_chat_message(
     delivery_class: DeliveryClass,
 ) -> io::Result<AgentMessage> {
     let chat_path = if delivery_class == DeliveryClass::Durable {
-        pony_chat_log_path_for_target(target)
+        agent_chat_log_path_for_target(target)
     } else {
-        pony_chat_log_path()
+        agent_chat_log_path()
     };
     let lock_path = cleanup_lock_path_for(&chat_path, "pony.chat.cleanup.lock");
     append_chat_message_at(
@@ -276,14 +276,14 @@ pub(crate) fn append_chat_message(
 }
 
 pub(crate) fn read_live_registry() -> io::Result<Vec<AgentRegistryEntry>> {
-    let registry_path = pony_registry_log_path();
-    let lock_path = pony_registry_lock_path();
+    let registry_path = agent_registry_log_path();
+    let lock_path = agent_registry_lock_path();
     read_live_registry_at(&registry_path, &lock_path)
 }
 
 pub(crate) fn read_new_messages(identity: &AgentIdentity) -> io::Result<Vec<AgentMessage>> {
-    let chat_path = pony_chat_log_path();
-    let lock_path = pony_chat_lock_path();
+    let chat_path = agent_chat_log_path();
+    let lock_path = agent_chat_lock_path();
     read_new_messages_at(&chat_path, &lock_path, identity)
 }
 

@@ -177,7 +177,7 @@ fn latest_chat_timestamp(path: &Path) -> io::Result<Option<DateTime<Utc>>> {
 pub(super) fn append_json_line<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     let Some(parent) = path.parent() else {
         return Err(io::Error::other(
-            "missing parent directory for pony IPC log",
+            "missing parent directory for agent IPC log",
         ));
     };
     fs::create_dir_all(parent)?;
@@ -231,7 +231,7 @@ pub(super) fn git_branch_for_path(path: &Path) -> String {
     }
 }
 
-pub(super) fn pony_registry_log_path() -> PathBuf {
+pub(super) fn agent_registry_log_path() -> PathBuf {
     let config_path =
         agent_config_from_env().and_then(|config| non_empty_path(&config.registry_path));
     agent_ipc_log_path_with_config(
@@ -242,11 +242,11 @@ pub(super) fn pony_registry_log_path() -> PathBuf {
     )
 }
 
-pub(super) fn pony_registry_lock_path() -> PathBuf {
-    cleanup_lock_path_for(&pony_registry_log_path(), "pony.registry.cleanup.lock")
+pub(super) fn agent_registry_lock_path() -> PathBuf {
+    cleanup_lock_path_for(&agent_registry_log_path(), "pony.registry.cleanup.lock")
 }
 
-pub(super) fn pony_chat_log_path() -> PathBuf {
+pub(super) fn agent_chat_log_path() -> PathBuf {
     let config_path =
         agent_config_from_env().and_then(|config| non_empty_path(&config.message_log_path));
     agent_ipc_log_path_with_config(
@@ -257,7 +257,7 @@ pub(super) fn pony_chat_log_path() -> PathBuf {
     )
 }
 
-pub(super) fn pony_chat_log_path_for_target(target: &str) -> PathBuf {
+pub(super) fn agent_chat_log_path_for_target(target: &str) -> PathBuf {
     if target != BROADCAST_TARGET
         && !target.eq_ignore_ascii_case("all")
         && let Some(path) = agent_config_from_env()
@@ -267,11 +267,11 @@ pub(super) fn pony_chat_log_path_for_target(target: &str) -> PathBuf {
         return path;
     }
 
-    pony_chat_log_path()
+    agent_chat_log_path()
 }
 
-pub(super) fn pony_chat_lock_path() -> PathBuf {
-    cleanup_lock_path_for(&pony_chat_log_path(), "pony.chat.cleanup.lock")
+pub(super) fn agent_chat_lock_path() -> PathBuf {
+    cleanup_lock_path_for(&agent_chat_log_path(), "pony.chat.cleanup.lock")
 }
 
 pub(super) fn receipt_ledger_path(agent_name: &str) -> PathBuf {
@@ -279,7 +279,7 @@ pub(super) fn receipt_ledger_path(agent_name: &str) -> PathBuf {
         "pony.receipts-{}.jsonl",
         normalize_agent_name(agent_name).to_ascii_lowercase()
     );
-    pony_chat_log_path().with_file_name(file_name)
+    agent_chat_log_path().with_file_name(file_name)
 }
 
 fn agent_ipc_log_path_with_config(
