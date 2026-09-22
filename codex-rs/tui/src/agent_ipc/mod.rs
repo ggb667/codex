@@ -15,6 +15,7 @@ use roster::AgentConfigAgent;
 use roster::agent_config_from_env;
 use roster::display_agent_name as fallback_display_agent_name;
 use roster::normalize_agent_name;
+use storage::agent_mailbox_path;
 use storage::append_chat_message_at;
 use storage::append_json_line;
 use storage::append_registry_heartbeat_at;
@@ -24,7 +25,6 @@ use storage::git_branch_for_path;
 use storage::pony_chat_lock_path;
 use storage::pony_chat_log_path;
 use storage::pony_chat_log_path_for_target;
-use storage::pony_mailbox_path;
 use storage::pony_registry_lock_path;
 use storage::pony_registry_log_path;
 use storage::read_jsonl;
@@ -207,27 +207,27 @@ fn parse_send_command_with_roster(
 ) -> Result<AgentSendCommand, String> {
     let trimmed = args.trim();
     if trimmed.is_empty() {
-        return Err(pony_usage().to_string());
+        return Err(agent_usage().to_string());
     }
     if trimmed.eq_ignore_ascii_case("list") {
         return Ok(AgentSendCommand::List);
     }
 
     let Some((target, text)) = trimmed.split_once(char::is_whitespace) else {
-        return Err(pony_usage().to_string());
+        return Err(agent_usage().to_string());
     };
     let text = text.trim();
     if text.is_empty() {
-        return Err(pony_usage().to_string());
+        return Err(agent_usage().to_string());
     }
 
     let (delivery_class, target, text) = if target.eq_ignore_ascii_case("durable") {
         let Some((target, text)) = text.split_once(char::is_whitespace) else {
-            return Err(pony_usage().to_string());
+            return Err(agent_usage().to_string());
         };
         let text = text.trim();
         if text.is_empty() {
-            return Err(pony_usage().to_string());
+            return Err(agent_usage().to_string());
         }
         (DeliveryClass::Durable, target, text.to_string())
     } else {
@@ -304,10 +304,10 @@ pub(crate) fn append_incoming_message_to_mailbox(
     message: &AgentMessage,
 ) -> io::Result<()> {
     let project_root = Path::new(&identity.project_path);
-    let mailbox_path = identity
-        .mailbox_path
-        .clone()
-        .unwrap_or_else(|| pony_mailbox_path(project_root, &identity.agent_name));
+    let mailbox_path = identity.mailbox_path.clone().map_or_else(
+        || agent_mailbox_path(project_root, &identity.agent_name),
+        Ok,
+    )?;
     append_text_block(&mailbox_path, &message.mailbox_markdown())
 }
 
@@ -339,8 +339,8 @@ fn resolve_target_agent_with_roster(
     }
 }
 
-fn pony_usage() -> &'static str {
-    "Usage: /tell list | /tell [durable] <pony-name|all> <message>"
+fn agent_usage() -> &'static str {
+    "Usage: /tell list | /tell [durable] <agent-name|all> <message>"
 }
 
 fn non_empty_path(value: &str) -> Option<PathBuf> {

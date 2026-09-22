@@ -154,13 +154,13 @@ fn roster_does_not_treat_non_singleton_as_global() {
     roster.agents[1].global_singleton = false;
 
     let err = roster.resolve_route("Coordinator").unwrap_err();
-    assert!(err.contains("Ambiguous pony 'Coordinator'"));
+    assert!(err.contains("Ambiguous agent 'Coordinator'"));
 }
 
 #[test]
 fn roster_rejects_unknown_target() {
     let err = sample_roster().resolve_route("discord").unwrap_err();
-    assert!(err.contains("Unknown pony 'discord'"));
+    assert!(err.contains("Unknown agent 'discord'"));
 }
 
 #[test]

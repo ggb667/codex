@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use std::fs;
 
 use super::AGENT_CONFIG_ENV;
+use super::agent_usage;
 use super::non_empty_path;
-use super::pony_usage;
 use super::same_project;
 use super::title_case_word;
 
@@ -70,7 +70,7 @@ impl AgentConfig {
         let raw = name.trim();
         let matches = self.matching_agents(raw);
         if matches.is_empty() {
-            return Err(format!("Unknown pony '{}'. {}", raw, pony_usage()));
+            return Err(format!("Unknown agent '{}'. {}", raw, agent_usage()));
         }
 
         let unique = unique_agents_by_route(matches);
@@ -92,7 +92,7 @@ impl AgentConfig {
         }
 
         Err(format!(
-            "Ambiguous pony '{raw}'. Use a disambiguated alias such as <project>:<name>."
+            "Ambiguous agent '{raw}'. Use a disambiguated alias such as <project>:<name>."
         ))
     }
 
@@ -203,7 +203,7 @@ fn unique_agent_or_ambiguous(
         Ok(agents[0].clone())
     } else {
         Err(format!(
-            "Ambiguous pony '{raw}'. Use a disambiguated alias such as <project>:<name>."
+            "Ambiguous agent '{raw}'. Use a disambiguated alias such as <project>:<name>."
         ))
     }
 }

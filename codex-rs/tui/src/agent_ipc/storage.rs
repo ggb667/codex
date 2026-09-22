@@ -364,23 +364,22 @@ fn split_subject_and_body(text: &str) -> (String, String) {
     (subject, body)
 }
 
-pub(super) fn pony_mailbox_path(project_root: &Path, agent_name: &str) -> PathBuf {
-    if let Some(roster) = agent_config_from_env()
-        && let Some(path) = roster
+pub(super) fn agent_mailbox_path(project_root: &Path, agent_name: &str) -> io::Result<PathBuf> {
+    if let Some(roster) = agent_config_from_env() {
+        return roster
             .matching_agents(agent_name)
             .into_iter()
             .find(|agent| same_project(&agent.project_root, &roster.project_root))
             .and_then(|agent| non_empty_path(&agent.mailbox_path))
-    {
-        return path;
+            .ok_or_else(|| io::Error::other("managed agent has no configured mailbox path"));
     }
 
-    project_root
+    Ok(project_root
         .join("pony/team.coordination")
-        .join(format!("{}.mailbox.md", pony_mailbox_stem(agent_name)))
+        .join(format!("{}.mailbox.md", agent_mailbox_stem(agent_name))))
 }
 
-fn pony_mailbox_stem(agent_name: &str) -> String {
+fn agent_mailbox_stem(agent_name: &str) -> String {
     normalize_agent_name(agent_name)
         .to_ascii_lowercase()
         .chars()
