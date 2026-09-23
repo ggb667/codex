@@ -93,7 +93,8 @@ jobs:
             --build_metadata=COMMIT_SHA=${GITHUB_SHA} \
             --build_metadata=TAG_job=sdk \
             -- \
-            //codex-rs/cli:codex
+            //codex-rs/cli:codex \
+            //codex-rs/code-mode-host:codex-code-mode-host
 
           # Resolve the exact output file using the same wrapper/config path as
           # the build instead of guessing which Bazel convenience symlink is
@@ -122,6 +123,30 @@ jobs:
             exit 1
           fi
 
+          host_cquery_output="$(
+            ./.github/scripts/run-bazel-ci.sh \
+              -- \
+              cquery \
+              --output=files \
+              -- \
+              //codex-rs/code-mode-host:codex-code-mode-host \
+              | grep -E '^(/|bazel-out/)' \
+              | tail -n 1
+          )"
+          if [[ "${host_cquery_output}" = /* ]]; then
+            host_bazel_output_path="${host_cquery_output}"
+          else
+            host_bazel_output_path="${GITHUB_WORKSPACE}/${host_cquery_output}"
+          fi
+          if [[ -z "${host_bazel_output_path}" ]]; then
+            echo "Bazel did not report an output path for //codex-rs/code-mode-host:codex-code-mode-host." >&2
+            exit 1
+          fi
+          if [[ ! -e "${host_bazel_output_path}" ]]; then
+            echo "Unable to locate the Bazel-built code-mode host at ${host_bazel_output_path}." >&2
+            exit 1
+          fi
+
           # Stage the binary into the workspace and point the SDK tests at that
           # stable path. The tests spawn `codex` directly many times, so using a
           # normal executable path is more reliable than invoking Bazel for each
@@ -129,6 +154,7 @@ jobs:
           install_dir="${GITHUB_WORKSPACE}/.tmp/sdk-ci"
           mkdir -p "${install_dir}"
           install -m 755 "${codex_bazel_output_path}" "${install_dir}/codex"
+          install -m 755 "${host_bazel_output_path}" "${install_dir}/codex-code-mode-host"
           echo "CODEX_EXEC_PATH=${install_dir}/codex" >> "$GITHUB_ENV"
 
       - name: Warm up Bazel-built codex
