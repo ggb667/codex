@@ -247,11 +247,15 @@ pub(super) fn agent_chat_lock_path() -> PathBuf {
 }
 
 pub(super) fn receipt_ledger_path(agent_name: &str) -> PathBuf {
+    receipt_ledger_path_for(&agent_chat_log_path(), agent_name)
+}
+
+pub(super) fn receipt_ledger_path_for(chat_path: &Path, agent_name: &str) -> PathBuf {
     let file_name = format!(
-        "agent.receipts-{}.jsonl",
+        "pony.receipts-{}.jsonl",
         normalize_agent_name(agent_name).to_ascii_lowercase()
     );
-    agent_chat_log_path().with_file_name(file_name)
+    chat_path.with_file_name(file_name)
 }
 
 fn agent_ipc_log_path_with_config(

@@ -55,7 +55,10 @@ fn resolve_sound_paths(
         }
     }
 
-    let identity_prefix = format!("{}_", normalize_name(pony_name));
+    let pony_identity = pony_name
+        .rsplit_once(':')
+        .map_or(pony_name, |(_, identity)| identity);
+    let identity_prefix = format!("{}_", normalize_name(pony_identity));
     for directory in directories {
         let Ok(entries) = fs::read_dir(directory) else {
             continue;

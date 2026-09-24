@@ -6,6 +6,7 @@ use super::storage::append_json_line;
 use super::storage::append_registry_heartbeat_at;
 use super::storage::read_jsonl;
 use super::storage::read_new_messages_at;
+use super::storage::receipt_ledger_path_for;
 use super::*;
 use chrono::Duration as ChronoDuration;
 use tempfile::tempdir;
@@ -265,6 +266,20 @@ fn read_new_messages_keeps_stale_durable_messages() {
         read_new_messages_at(&chat_path, &lock_path, &identity).unwrap(),
         vec![durable]
     );
+}
+
+#[test]
+fn existing_legacy_receipt_suppresses_replay() {
+    let temp = tempdir().unwrap();
+    let receipt_path =
+        receipt_ledger_path_for(&temp.path().join("agent.chat.jsonl"), "TWILIGHT_SPARKLE");
+    assert_eq!(
+        receipt_path,
+        temp.path().join("pony.receipts-twilight_sparkle.jsonl")
+    );
+    append_json_line(&receipt_path, &"msg-durable".to_string()).unwrap();
+
+    assert!(receipt_recorded_at(&receipt_path, "msg-durable").unwrap());
 }
 
 #[test]

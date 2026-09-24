@@ -262,11 +262,13 @@ pub(crate) fn read_new_messages(identity: &AgentIdentity) -> io::Result<Vec<Agen
 }
 
 pub(crate) fn receipt_recorded(identity: &AgentIdentity, id: &str) -> io::Result<bool> {
-    Ok(
-        read_jsonl::<String>(&receipt_ledger_path(&identity.agent_name))?
-            .iter()
-            .any(|seen| seen == id),
-    )
+    receipt_recorded_at(&receipt_ledger_path(&identity.agent_name), id)
+}
+
+fn receipt_recorded_at(receipt_path: &Path, id: &str) -> io::Result<bool> {
+    Ok(read_jsonl::<String>(receipt_path)?
+        .iter()
+        .any(|seen| seen == id))
 }
 
 pub(crate) fn record_receipt(identity: &AgentIdentity, id: &str) -> io::Result<()> {

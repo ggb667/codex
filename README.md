@@ -39,8 +39,6 @@ The goal of the combined stack is to make several specialized agents behave more
 
 The separate **Agenic Pony System** is one orchestration runtime that uses these integration points. It supplies its own persistent named agents, launcher scripts, generated session configuration, shared coordination files, and personalities.
 
-For details on the current IPC implementation, see [Pony IPC](./docs/pony-ipc.md).
-
 > **Status:** This is an experimental fork of OpenAI Codex. The Pony extensions are maintained separately from upstream Codex and are periodically rebased/ported onto newer Codex releases.
 
 ---

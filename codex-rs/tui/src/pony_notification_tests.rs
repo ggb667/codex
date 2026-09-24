@@ -45,6 +45,25 @@ fn falls_back_to_project_root_assets() {
 }
 
 #[test]
+fn qualified_route_finds_pony_wavs() {
+    let temp = TempDir::new().expect("temporary directory");
+    let voice_dir = temp.path().join("voices/askingForHelp");
+    fs::create_dir_all(&voice_dir).expect("create voice directory");
+    let sound = voice_dir.join("twilight_sparkle_help.wav");
+    fs::write(&sound, b"test wav").expect("write sound");
+
+    assert_eq!(
+        resolve_sound_paths(
+            "CODEX:TWILIGHT_SPARKLE",
+            Some(temp.path().as_os_str().to_owned()),
+            /*project_root*/ None,
+        )
+        .expect("resolve qualified Pony route"),
+        vec![sound]
+    );
+}
+
+#[test]
 fn missing_or_unmatched_assets_return_not_found() {
     let temp = TempDir::new().expect("temporary directory");
 

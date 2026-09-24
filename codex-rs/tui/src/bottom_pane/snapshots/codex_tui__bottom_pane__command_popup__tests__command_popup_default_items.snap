@@ -25,7 +25,6 @@ expression: commands
 /compact - summarize conversation to prevent hitting the context limit
 /recap - summarize the current conversation now
 /agents - view and switch between all active agent sessions
-/tell - send a local letter
 /side - start a side conversation in an ephemeral fork
 /copy - copy the last response or part of it
 /export - export the conversation as markdown
@@ -49,3 +48,4 @@ expression: commands
 /clear - clear the terminal and start a new chat
 /test-approval - test approval request
 /subagents - switch between this session's subagents
+/tell - send a local letter
