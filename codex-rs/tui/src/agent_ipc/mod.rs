@@ -11,38 +11,32 @@ mod roster;
 mod storage;
 
 use roster::AgentConfig;
-use roster::AgentConfigAgent;
 use roster::agent_config_from_env;
-use roster::display_agent_name;
+use roster::display_agent_name as fallback_display_agent_name;
 use roster::normalize_agent_name;
+use storage::agent_chat_lock_path;
+use storage::agent_chat_log_path;
+use storage::agent_chat_log_path_for_target;
+use storage::agent_mailbox_path;
+use storage::agent_registry_lock_path;
+use storage::agent_registry_log_path;
 use storage::append_chat_message_at;
 use storage::append_json_line;
 use storage::append_registry_heartbeat_at;
 use storage::append_text_block;
 use storage::cleanup_lock_path_for;
-use storage::git_branch_for_path;
-use storage::pony_chat_lock_path;
-use storage::pony_chat_log_path;
-use storage::pony_chat_log_path_for_target;
-use storage::pony_mailbox_path;
-use storage::pony_registry_lock_path;
-use storage::pony_registry_log_path;
 use storage::read_jsonl;
 use storage::read_live_registry_at;
 use storage::read_new_messages_at;
 use storage::receipt_ledger_path;
 
-pub(crate) const PONY_IPC_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6);
+pub(crate) const AGENT_IPC_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6);
 pub(super) const STALE_AFTER_SECS: i64 = 60 * 60;
 pub(super) const BROADCAST_TARGET: &str = "*";
-const UNKNOWN_BRANCH: &str = "unknown";
-pub(super) const PONY_CHAT_LOG_PATH_ENV: &str = "AGENIC_PONY_CHAT_LOG_PATH";
-pub(super) const PONY_REGISTRY_LOG_PATH_ENV: &str = "AGENIC_PONY_REGISTRY_LOG_PATH";
-pub(super) const PROJECT_ROOT_ENV: &str = "AGENIC_PROJECT_ROOT";
 pub(super) const AGENT_CONFIG_ENV: &str = "CODEX_AGENT_CONFIG";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PonySendCommand {
+pub(crate) enum AgentSendCommand {
     List,
     Send {
         target: String,
@@ -51,25 +45,23 @@ pub(crate) enum PonySendCommand {
     },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum DeliveryClass {
+    #[default]
     Ephemeral,
     Durable,
 }
 
-impl Default for DeliveryClass {
-    fn default() -> Self {
-        Self::Ephemeral
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct PonyIdentity {
+pub(crate) struct AgentIdentity {
     pub(crate) instance_id: String,
-    pub(crate) pony_name: String,
-    pub(crate) pony_symbol: String,
-    pub(crate) pony_aliases: Vec<String>,
+    #[serde(rename = "agent_name", alias = "pony_name")]
+    pub(crate) agent_name: String,
+    #[serde(rename = "agent_symbol", alias = "pony_symbol")]
+    pub(crate) agent_symbol: String,
+    #[serde(rename = "agent_aliases", alias = "pony_aliases")]
+    pub(crate) agent_aliases: Vec<String>,
     pub(crate) mailbox_path: Option<PathBuf>,
     pub(crate) project_path: String,
     pub(crate) git_branch: String,
@@ -77,9 +69,10 @@ pub(crate) struct PonyIdentity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct PonyRegistryEntry {
+pub(crate) struct AgentRegistryEntry {
     pub(crate) uuid: String,
-    pub(crate) pony_name: String,
+    #[serde(rename = "agent_name", alias = "pony_name")]
+    pub(crate) agent_name: String,
     pub(crate) path: String,
     pub(crate) git_branch: String,
     pub(crate) pid: u32,
@@ -87,10 +80,11 @@ pub(crate) struct PonyRegistryEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct PonyChatEntry {
+pub(crate) struct AgentMessage {
     pub(crate) id: String,
     pub(crate) from_instance_id: String,
-    pub(crate) from_pony_name: String,
+    #[serde(rename = "from_agent_name", alias = "from_pony_name")]
+    pub(crate) from_agent_name: String,
     pub(crate) from_symbol: String,
     pub(crate) to: String,
     pub(crate) subject: String,
@@ -100,7 +94,7 @@ pub(crate) struct PonyChatEntry {
     pub(crate) delivery_class: DeliveryClass,
 }
 
-impl PonyChatEntry {
+impl AgentMessage {
     pub(crate) fn prompt_text(&self) -> String {
         let sender = self.display_sender();
         if self.body.is_empty() {
@@ -123,27 +117,27 @@ impl PonyChatEntry {
             "## {}\n- FROM: {}\n- TO: {}\n- SUBJECT: {}\n- BODY:\n```text\n{}\n```\n\n",
             self.created_at.to_rfc3339(),
             self.display_sender(),
-            display_pony_name(&self.to),
+            display_agent_name(&self.to),
             self.subject,
             body
         )
     }
 
     fn display_sender(&self) -> String {
-        let pony = display_pony_name(&self.from_pony_name);
+        let agent = display_agent_name(&self.from_agent_name);
         if self.from_symbol.is_empty() {
-            pony
+            agent
         } else {
-            format!("{} {}", self.from_symbol, pony)
+            format!("{} {}", self.from_symbol, agent)
         }
     }
 }
 
-impl PonyIdentity {
-    fn registry_entry(&self) -> PonyRegistryEntry {
-        PonyRegistryEntry {
+impl AgentIdentity {
+    fn registry_entry(&self) -> AgentRegistryEntry {
+        AgentRegistryEntry {
             uuid: self.instance_id.clone(),
-            pony_name: self.pony_name.clone(),
+            agent_name: self.agent_name.clone(),
             path: self.project_path.clone(),
             git_branch: self.git_branch.clone(),
             pid: self.pid,
@@ -152,51 +146,31 @@ impl PonyIdentity {
     }
 }
 
-pub(crate) fn pony_identity_from_env(cwd: &Path) -> Option<PonyIdentity> {
-    let raw_name = std::env::var("AGENIC_LAUNCH_PERSONALITY")
-        .ok()
-        .or_else(|| std::env::var("PERSONALITY").ok())?;
-    let project_path = std::env::var("AGENIC_PROJECT_ROOT")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| cwd.display().to_string());
-    let git_branch = std::env::var("AGENIC_PROJECT_BRANCH")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| git_branch_for_path(Path::new(&project_path)));
-    let roster = agent_config_from_env();
-    let agent = roster
-        .as_ref()
-        .and_then(|roster| roster.current_agent(&raw_name, &project_path));
-    let pony_name = agent
-        .as_ref()
-        .map(AgentConfigAgent::route)
-        .unwrap_or_else(|| normalize_agent_name(&raw_name));
-    let pony_symbol = agent
-        .as_ref()
-        .map(|agent| agent.icon.clone())
-        .unwrap_or_default();
-    let pony_aliases = agent
-        .as_ref()
-        .map(AgentConfigAgent::match_names)
-        .unwrap_or_else(|| vec![pony_name.clone(), raw_name]);
-    let mailbox_path = agent
-        .as_ref()
-        .and_then(|agent| non_empty_path(&agent.mailbox_path));
+pub(crate) fn agent_identity_from_env(_cwd: &Path) -> Option<AgentIdentity> {
+    let roster = agent_config_from_env()?;
+    let agent_name = if roster.route_id.trim().is_empty() {
+        roster.agent_id.clone()
+    } else {
+        roster.route_id.clone()
+    };
+    let mut agent_aliases = roster.aliases.clone();
+    agent_aliases.push(roster.agent_id.clone());
+    agent_aliases.push(agent_name.clone());
+    let mailbox_path = non_empty_path(&roster.mailbox_path);
 
-    Some(PonyIdentity {
+    Some(AgentIdentity {
         instance_id: Uuid::new_v4().to_string(),
-        pony_name,
-        pony_symbol,
-        pony_aliases,
+        agent_name,
+        agent_symbol: roster.icon,
+        agent_aliases,
         mailbox_path,
-        project_path,
-        git_branch,
+        project_path: roster.project_root,
+        git_branch: roster.branch_label,
         pid: std::process::id(),
     })
 }
 
-pub(crate) fn parse_send_command(args: &str) -> Result<PonySendCommand, String> {
+pub(crate) fn parse_send_command(args: &str) -> Result<AgentSendCommand, String> {
     let roster = agent_config_from_env();
     parse_send_command_with_roster(args, roster.as_ref())
 }
@@ -204,30 +178,30 @@ pub(crate) fn parse_send_command(args: &str) -> Result<PonySendCommand, String> 
 fn parse_send_command_with_roster(
     args: &str,
     roster: Option<&AgentConfig>,
-) -> Result<PonySendCommand, String> {
+) -> Result<AgentSendCommand, String> {
     let trimmed = args.trim();
     if trimmed.is_empty() {
-        return Err(pony_usage().to_string());
+        return Err(agent_usage().to_string());
     }
     if trimmed.eq_ignore_ascii_case("list") {
-        return Ok(PonySendCommand::List);
+        return Ok(AgentSendCommand::List);
     }
 
     let Some((target, text)) = trimmed.split_once(char::is_whitespace) else {
-        return Err(pony_usage().to_string());
+        return Err(agent_usage().to_string());
     };
     let text = text.trim();
     if text.is_empty() {
-        return Err(pony_usage().to_string());
+        return Err(agent_usage().to_string());
     }
 
     let (delivery_class, target, text) = if target.eq_ignore_ascii_case("durable") {
         let Some((target, text)) = text.split_once(char::is_whitespace) else {
-            return Err(pony_usage().to_string());
+            return Err(agent_usage().to_string());
         };
         let text = text.trim();
         if text.is_empty() {
-            return Err(pony_usage().to_string());
+            return Err(agent_usage().to_string());
         }
         (DeliveryClass::Durable, target, text.to_string())
     } else {
@@ -240,31 +214,31 @@ fn parse_send_command_with_roster(
         resolve_target_agent_with_roster(target, roster)?
     };
 
-    Ok(PonySendCommand::Send {
+    Ok(AgentSendCommand::Send {
         target,
         text,
         delivery_class,
     })
 }
 
-pub(crate) fn append_registry_heartbeat(identity: &PonyIdentity) -> io::Result<()> {
-    let registry_path = pony_registry_log_path();
-    let lock_path = pony_registry_lock_path();
+pub(crate) fn append_registry_heartbeat(identity: &AgentIdentity) -> io::Result<()> {
+    let registry_path = agent_registry_log_path();
+    let lock_path = agent_registry_lock_path();
     append_registry_heartbeat_at(&registry_path, &lock_path, identity)
 }
 
 pub(crate) fn append_chat_message(
-    identity: &PonyIdentity,
+    identity: &AgentIdentity,
     target: &str,
     text: &str,
     delivery_class: DeliveryClass,
-) -> io::Result<PonyChatEntry> {
+) -> io::Result<AgentMessage> {
     let chat_path = if delivery_class == DeliveryClass::Durable {
-        pony_chat_log_path_for_target(target)
+        agent_chat_log_path_for_target(target)
     } else {
-        pony_chat_log_path()
+        agent_chat_log_path()
     };
-    let lock_path = cleanup_lock_path_for(&chat_path, "pony.chat.cleanup.lock");
+    let lock_path = cleanup_lock_path_for(&chat_path, "agent.chat.cleanup.lock");
     append_chat_message_at(
         &chat_path,
         &lock_path,
@@ -275,49 +249,51 @@ pub(crate) fn append_chat_message(
     )
 }
 
-pub(crate) fn read_live_registry() -> io::Result<Vec<PonyRegistryEntry>> {
-    let registry_path = pony_registry_log_path();
-    let lock_path = pony_registry_lock_path();
+pub(crate) fn read_live_registry() -> io::Result<Vec<AgentRegistryEntry>> {
+    let registry_path = agent_registry_log_path();
+    let lock_path = agent_registry_lock_path();
     read_live_registry_at(&registry_path, &lock_path)
 }
 
-pub(crate) fn read_new_messages(identity: &PonyIdentity) -> io::Result<Vec<PonyChatEntry>> {
-    let chat_path = pony_chat_log_path();
-    let lock_path = pony_chat_lock_path();
+pub(crate) fn read_new_messages(identity: &AgentIdentity) -> io::Result<Vec<AgentMessage>> {
+    let chat_path = agent_chat_log_path();
+    let lock_path = agent_chat_lock_path();
     read_new_messages_at(&chat_path, &lock_path, identity)
 }
 
-pub(crate) fn receipt_recorded(identity: &PonyIdentity, id: &str) -> io::Result<bool> {
-    Ok(
-        read_jsonl::<String>(&receipt_ledger_path(&identity.pony_name))?
-            .iter()
-            .any(|seen| seen == id),
-    )
+pub(crate) fn receipt_recorded(identity: &AgentIdentity, id: &str) -> io::Result<bool> {
+    receipt_recorded_at(&receipt_ledger_path(&identity.agent_name), id)
 }
 
-pub(crate) fn record_receipt(identity: &PonyIdentity, id: &str) -> io::Result<()> {
-    append_json_line(&receipt_ledger_path(&identity.pony_name), &id.to_string())
+fn receipt_recorded_at(receipt_path: &Path, id: &str) -> io::Result<bool> {
+    Ok(read_jsonl::<String>(receipt_path)?
+        .iter()
+        .any(|seen| seen == id))
+}
+
+pub(crate) fn record_receipt(identity: &AgentIdentity, id: &str) -> io::Result<()> {
+    append_json_line(&receipt_ledger_path(&identity.agent_name), &id.to_string())
 }
 
 pub(crate) fn append_incoming_message_to_mailbox(
-    identity: &PonyIdentity,
-    message: &PonyChatEntry,
+    identity: &AgentIdentity,
+    message: &AgentMessage,
 ) -> io::Result<()> {
     let project_root = Path::new(&identity.project_path);
-    let mailbox_path = identity
-        .mailbox_path
-        .clone()
-        .unwrap_or_else(|| pony_mailbox_path(project_root, &identity.pony_name));
+    let mailbox_path = identity.mailbox_path.clone().map_or_else(
+        || agent_mailbox_path(project_root, &identity.agent_name),
+        Ok,
+    )?;
     append_text_block(&mailbox_path, &message.mailbox_markdown())
 }
 
-pub(crate) fn display_pony_name(name: &str) -> String {
+pub(crate) fn display_agent_name(name: &str) -> String {
     agent_config_from_env()
         .and_then(|roster| roster.resolve_display_name(name))
-        .unwrap_or_else(|| display_agent_name(name))
+        .unwrap_or_else(|| fallback_display_agent_name(name))
 }
 
-pub(crate) fn canonicalize_pony_name(name: &str) -> String {
+pub(crate) fn canonicalize_agent_name(name: &str) -> String {
     agent_config_from_env()
         .and_then(|roster| roster.resolve_route(name).ok())
         .unwrap_or_else(|| normalize_agent_name(name))
@@ -339,8 +315,8 @@ fn resolve_target_agent_with_roster(
     }
 }
 
-fn pony_usage() -> &'static str {
-    "Usage: /tell list | /tell [durable] <pony-name|all> <message>"
+fn agent_usage() -> &'static str {
+    "Usage: /tell list | /tell [durable] <agent-name|all> <message>"
 }
 
 fn non_empty_path(value: &str) -> Option<PathBuf> {

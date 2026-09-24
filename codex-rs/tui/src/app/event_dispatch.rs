@@ -755,8 +755,8 @@ impl App {
             AppEvent::FatalExitRequest(message) => {
                 return Ok(AppRunControl::Exit(ExitReason::Fatal(message)));
             }
-            AppEvent::PonyMessageReceived(message) => {
-                self.chat_widget.queue_or_buffer_pony_message(message);
+            AppEvent::AgentMessageReceived(message) => {
+                self.chat_widget.queue_or_buffer_agent_message(message);
             }
             AppEvent::CodexOp(mut op) => {
                 if let AppCommand::OverrideTurnContext {

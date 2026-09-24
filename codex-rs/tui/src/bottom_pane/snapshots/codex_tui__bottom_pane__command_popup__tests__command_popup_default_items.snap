@@ -48,3 +48,4 @@ expression: commands
 /clear - clear the terminal and start a new chat
 /test-approval - test approval request
 /subagents - switch between this session's subagents
+/tell - send a local letter

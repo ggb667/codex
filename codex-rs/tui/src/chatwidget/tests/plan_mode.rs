@@ -546,6 +546,33 @@ fn plan_mode_prompt_notification_uses_dedicated_type_name() {
     );
 }
 
+#[test]
+fn only_attention_required_notifications_trigger_pony_audio() {
+    let notifications = [
+        Notification::ExecApprovalRequested {
+            command: "echo test".to_string(),
+        },
+        Notification::EditApprovalRequested {
+            cwd: PathBuf::from("/tmp"),
+            changes: vec![PathBuf::from("test.txt")],
+        },
+        Notification::ElicitationRequested {
+            server_name: "test".to_string(),
+        },
+        Notification::PlanModePrompt {
+            title: "Choose an option".to_string(),
+        },
+    ];
+
+    assert!(notifications.iter().all(Notification::requires_attention));
+    assert!(
+        !Notification::AgentTurnComplete {
+            response: "done".to_string(),
+        }
+        .requires_attention()
+    );
+}
+
 #[tokio::test]
 async fn open_plan_implementation_prompt_sets_pending_notification() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
