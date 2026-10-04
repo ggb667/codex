@@ -9,6 +9,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use codex_build_info::BuildInfo;
 use codex_core::config::Config;
 use codex_http_client::ClientRouteClass;
 use codex_http_client::RouteAwareClientPool;
@@ -58,7 +59,17 @@ pub(super) async fn updates_check(config: &Config) -> DoctorCheck {
             "check for update on startup: {}",
             config.check_for_update_on_startup
         ),
-        format!("update action: {}", update_action_label(&install_context)),
+        format!(
+            "update action: {}",
+            update_action_label(
+                &install_context,
+                if BuildInfo::get().is_source_build() {
+                    UpdateBuildKind::Source
+                } else {
+                    UpdateBuildKind::Packaged
+                },
+            )
+        ),
     ];
     let version_file = config.codex_home.join(VERSION_FILE_NAME);
     push_cached_version_details(&mut details, &version_file);
@@ -387,7 +398,16 @@ fn push_cached_version_details(details: &mut Vec<String>, version_file: &Path) {
     }
 }
 
-fn update_action_label(context: &InstallContext) -> &'static str {
+enum UpdateBuildKind {
+    Packaged,
+    Source,
+}
+
+fn update_action_label(context: &InstallContext, build_kind: UpdateBuildKind) -> &'static str {
+    if matches!(build_kind, UpdateBuildKind::Source) {
+        return "update the custom Codex source branch and rebuild";
+    }
+
     match &context.method {
         InstallMethod::Npm => "npm install -g @openai/codex",
         InstallMethod::Bun => "bun install -g @openai/codex",
@@ -687,25 +707,48 @@ mod tests {
     #[test]
     fn update_action_labels_install_contexts() {
         assert_eq!(
-            update_action_label(&InstallContext {
-                method: InstallMethod::Npm,
-                package_layout: None,
-            }),
+            update_action_label(
+                &InstallContext {
+                    method: InstallMethod::Npm,
+                    package_layout: None,
+                },
+                UpdateBuildKind::Packaged
+            ),
             "npm install -g @openai/codex"
         );
         assert_eq!(
-            update_action_label(&InstallContext {
-                method: InstallMethod::Pnpm,
-                package_layout: None,
-            }),
+            update_action_label(
+                &InstallContext {
+                    method: InstallMethod::Pnpm,
+                    package_layout: None,
+                },
+                UpdateBuildKind::Packaged
+            ),
             "pnpm add -g @openai/codex"
         );
         assert_eq!(
-            update_action_label(&InstallContext {
-                method: InstallMethod::Other,
-                package_layout: None,
-            }),
+            update_action_label(
+                &InstallContext {
+                    method: InstallMethod::Other,
+                    package_layout: None,
+                },
+                UpdateBuildKind::Packaged
+            ),
             "manual or unknown"
+        );
+    }
+
+    #[test]
+    fn update_action_label_for_source_builds() {
+        assert_eq!(
+            update_action_label(
+                &InstallContext {
+                    method: InstallMethod::Npm,
+                    package_layout: None,
+                },
+                UpdateBuildKind::Source,
+            ),
+            "update the custom Codex source branch and rebuild"
         );
     }
 }
