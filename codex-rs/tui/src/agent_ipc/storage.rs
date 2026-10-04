@@ -193,7 +193,7 @@ pub(super) fn canonical_state_path(agent_id: &str) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("agent-state")
-        .join(format!("{}.json", agent_id.to_ascii_lowercase()))
+        .join(format!("{}.json", agent_mailbox_stem(agent_id)))
 }
 
 pub(super) fn agent_chat_log_path() -> PathBuf {

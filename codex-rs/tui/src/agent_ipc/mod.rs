@@ -236,14 +236,17 @@ pub(crate) fn append_registry_heartbeat(identity: &AgentIdentity) -> io::Result<
     append_registry_heartbeat_at(&registry_path, &lock_path, identity)
 }
 
-pub(crate) fn agent_state_path(identity: &AgentIdentity) -> PathBuf {
-    canonical_state_path(&identity.agent_name)
-}
-
 pub(crate) fn read_startup_state(
     identity: &AgentIdentity,
 ) -> io::Result<Option<startup_state::CanonicalAgentState>> {
-    startup_state::read_for_startup(&agent_state_path(identity))
+    let agent_id = state_agent_id(identity);
+    startup_state::read_for_startup(&canonical_state_path(&agent_id), &agent_id)
+}
+
+fn state_agent_id(identity: &AgentIdentity) -> String {
+    agent_config_from_env()
+        .map(|config| config.agent_id)
+        .unwrap_or_else(|| identity.agent_name.clone())
 }
 
 pub(crate) fn append_chat_message(
