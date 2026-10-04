@@ -332,7 +332,10 @@ impl ChatWidget {
                 AgentMessageContent::Text { text } => message.push_str(text),
             }
         }
-        let parsed = parse_assistant_markdown(&message, self.config.cwd.as_path());
+        let mut parsed = parse_assistant_markdown(&message, self.config.cwd.as_path());
+        if !from_replay && matches!(item.phase, Some(MessagePhase::FinalAnswer) | None) {
+            self.drain_agent_messages_before_idle(&mut parsed.visible_markdown);
+        }
         if from_replay && self.stream_controller.is_none() && !parsed.visible_markdown.is_empty() {
             self.prepare_assistant_message();
             self.mark_safety_buffering_agent_message_started();

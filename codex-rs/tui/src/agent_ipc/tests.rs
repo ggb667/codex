@@ -5,8 +5,6 @@ use super::storage::append_chat_message_at;
 use super::storage::append_json_line;
 use super::storage::append_registry_heartbeat_at;
 use super::storage::read_jsonl;
-use super::storage::read_new_messages_at;
-use super::storage::receipt_ledger_path_for;
 use super::*;
 use chrono::Duration as ChronoDuration;
 use tempfile::tempdir;
@@ -164,122 +162,6 @@ fn roster_does_not_treat_non_singleton_as_global() {
 fn roster_rejects_unknown_target() {
     let err = sample_roster().resolve_route("discord").unwrap_err();
     assert!(err.contains("Unknown agent 'discord'"));
-}
-
-#[test]
-fn read_new_messages_keeps_only_latest_message_per_sender() {
-    let temp = tempdir().unwrap();
-    let chat_path = temp.path().join("chat.jsonl");
-    let lock_path = temp.path().join("chat.lock");
-    let identity = sample_identity();
-    let older_from_pinkie = AgentMessage {
-        id: "msg-1".to_string(),
-        from_instance_id: "uuid-2".to_string(),
-        from_agent_name: "PINKIE_PIE".to_string(),
-        from_symbol: "🎈".to_string(),
-        to: "TWILIGHT_SPARKLE".to_string(),
-        subject: "older waiting note".to_string(),
-        body: String::new(),
-        created_at: Utc::now() - ChronoDuration::seconds(5),
-        delivery_class: DeliveryClass::Ephemeral,
-    };
-    let fresh_from_pinkie = AgentMessage {
-        id: "msg-2".to_string(),
-        from_instance_id: "uuid-2".to_string(),
-        from_agent_name: "PINKIE_PIE".to_string(),
-        from_symbol: "🎈".to_string(),
-        to: "TWILIGHT_SPARKLE".to_string(),
-        subject: "latest waiting note".to_string(),
-        body: String::new(),
-        created_at: Utc::now(),
-        delivery_class: DeliveryClass::Ephemeral,
-    };
-    let stale = AgentMessage {
-        id: "msg-3".to_string(),
-        from_instance_id: "uuid-3".to_string(),
-        from_agent_name: "APPLEJACK".to_string(),
-        from_symbol: "🍎".to_string(),
-        to: "TWILIGHT_SPARKLE".to_string(),
-        subject: "old message".to_string(),
-        body: String::new(),
-        created_at: Utc::now() - ChronoDuration::hours(2),
-        delivery_class: DeliveryClass::Ephemeral,
-    };
-    let own = AgentMessage {
-        id: "msg-4".to_string(),
-        from_instance_id: identity.instance_id.clone(),
-        from_agent_name: identity.agent_name.clone(),
-        from_symbol: "✶".to_string(),
-        to: "TWILIGHT_SPARKLE".to_string(),
-        subject: "self".to_string(),
-        body: String::new(),
-        created_at: Utc::now(),
-        delivery_class: DeliveryClass::Ephemeral,
-    };
-    let fresh_from_dash = AgentMessage {
-        id: "msg-5".to_string(),
-        from_instance_id: "uuid-5".to_string(),
-        from_agent_name: "RAINBOW_DASH".to_string(),
-        from_symbol: "⚡".to_string(),
-        to: "TWILIGHT_SPARKLE".to_string(),
-        subject: "dash status".to_string(),
-        body: String::new(),
-        created_at: Utc::now() - ChronoDuration::seconds(1),
-        delivery_class: DeliveryClass::Ephemeral,
-    };
-    append_json_line(&chat_path, &older_from_pinkie).unwrap();
-    append_json_line(&chat_path, &fresh_from_pinkie).unwrap();
-    append_json_line(&chat_path, &stale).unwrap();
-    append_json_line(&chat_path, &own).unwrap();
-    append_json_line(&chat_path, &fresh_from_dash).unwrap();
-
-    let first = read_new_messages_at(&chat_path, &lock_path, &identity).unwrap();
-    assert_eq!(
-        first,
-        vec![fresh_from_dash.clone(), fresh_from_pinkie.clone()]
-    );
-
-    let second = read_new_messages_at(&chat_path, &lock_path, &identity).unwrap();
-    assert_eq!(second, vec![fresh_from_dash, fresh_from_pinkie]);
-}
-
-#[test]
-fn read_new_messages_keeps_stale_durable_messages() {
-    let temp = tempdir().unwrap();
-    let chat_path = temp.path().join("chat.jsonl");
-    let lock_path = temp.path().join("chat.lock");
-    let identity = sample_identity();
-    let durable = AgentMessage {
-        id: "msg-durable".to_string(),
-        from_instance_id: "uuid-6".to_string(),
-        from_agent_name: "PINKIE_PIE".to_string(),
-        from_symbol: "🎈".to_string(),
-        to: "TWILIGHT_SPARKLE".to_string(),
-        subject: "durable note".to_string(),
-        body: String::new(),
-        created_at: Utc::now() - ChronoDuration::hours(2),
-        delivery_class: DeliveryClass::Durable,
-    };
-    append_json_line(&chat_path, &durable).unwrap();
-
-    assert_eq!(
-        read_new_messages_at(&chat_path, &lock_path, &identity).unwrap(),
-        vec![durable]
-    );
-}
-
-#[test]
-fn existing_legacy_receipt_suppresses_replay() {
-    let temp = tempdir().unwrap();
-    let receipt_path =
-        receipt_ledger_path_for(&temp.path().join("agent.chat.jsonl"), "TWILIGHT_SPARKLE");
-    assert_eq!(
-        receipt_path,
-        temp.path().join("pony.receipts-twilight_sparkle.jsonl")
-    );
-    append_json_line(&receipt_path, &"msg-durable".to_string()).unwrap();
-
-    assert!(receipt_recorded_at(&receipt_path, "msg-durable").unwrap());
 }
 
 #[test]

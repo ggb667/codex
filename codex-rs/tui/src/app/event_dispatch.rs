@@ -755,8 +755,10 @@ impl App {
             AppEvent::FatalExitRequest(message) => {
                 return Ok(AppRunControl::Exit(ExitReason::Fatal(message)));
             }
-            AppEvent::AgentMessageReceived(message) => {
-                self.chat_widget.queue_or_buffer_agent_message(message);
+            AppEvent::DrainAgentMessages => {
+                if let Err(err) = self.chat_widget.drain_agent_messages() {
+                    tracing::debug!(error = %err, "failed to drain agent IPC messages");
+                }
             }
             AppEvent::CodexOp(mut op) => {
                 if let AppCommand::OverrideTurnContext {

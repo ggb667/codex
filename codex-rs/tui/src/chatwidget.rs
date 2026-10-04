@@ -44,6 +44,7 @@ use std::time::Instant;
 
 use crate::agent_ipc::AgentIdentity;
 use crate::agent_ipc::AgentMessage;
+use crate::agent_ipc::InboundMessageDrain;
 use crate::app::app_server_requests::ResolvedAppServerRequest;
 use crate::app_command::AppCommand;
 use crate::app_event::HistoryLookupResponse;
@@ -631,6 +632,8 @@ pub(crate) struct ChatWidget {
     pending_collab_spawn_requests: HashMap<String, multi_agents::SpawnRequestSummary>,
     agent_ipc_task: Option<JoinHandle<()>>,
     agent_ipc_identity: Option<AgentIdentity>,
+    agent_ipc_drain: Option<InboundMessageDrain>,
+    agent_ipc_idle_deferred: bool,
     pending_agent_messages: VecDeque<AgentMessage>,
     suppressed_exec_calls: HashSet<String>,
     skills_all: Vec<SkillMetadata>,

@@ -2765,6 +2765,34 @@ async fn queued_follow_up_suppresses_agent_turn_complete_notification() {
 }
 
 #[tokio::test]
+async fn pending_steer_suppresses_agent_turn_complete_notification() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    handle_turn_started(&mut chat, "turn-1");
+    chat.submit_user_message("Inbound agent message".into());
+
+    assert_eq!(chat.input_queue.pending_steers.len(), 1);
+    assert_matches!(next_submit_op(&mut op_rx), Op::UserTurn { .. });
+
+    complete_turn_with_message(&mut chat, "turn-1", Some("Still working"));
+
+    assert_matches!(chat.pending_notification, None);
+}
+
+#[tokio::test]
+async fn deferred_agent_ipc_idle_suppresses_agent_turn_complete_notification() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    handle_turn_started(&mut chat, "turn-1");
+    chat.agent_ipc_idle_deferred = true;
+
+    complete_turn_with_message(&mut chat, "turn-1", Some("Still working"));
+
+    assert_matches!(chat.pending_notification, None);
+    assert!(!chat.agent_ipc_idle_deferred);
+}
+
+#[tokio::test]
 async fn queued_menu_slash_keeps_agent_turn_complete_notification() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
     chat.thread_id = Some(ThreadId::new());

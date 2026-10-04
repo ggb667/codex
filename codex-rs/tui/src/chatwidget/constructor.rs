@@ -173,6 +173,8 @@ impl ChatWidget {
             pending_collab_spawn_requests: HashMap::new(),
             agent_ipc_task: None,
             agent_ipc_identity: None,
+            agent_ipc_drain: None,
+            agent_ipc_idle_deferred: false,
             pending_agent_messages: VecDeque::new(),
             suppressed_exec_calls: HashSet::new(),
             last_unified_wait: None,

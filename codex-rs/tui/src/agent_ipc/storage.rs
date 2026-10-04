@@ -22,7 +22,6 @@ use super::BROADCAST_TARGET;
 use super::DeliveryClass;
 use super::STALE_AFTER_SECS;
 use super::agent_config_from_env;
-use super::canonicalize_agent_name;
 use super::non_empty_path;
 use super::resolve_target_agent;
 use super::roster::normalize_agent_name;
@@ -85,36 +84,6 @@ pub(super) fn read_live_registry_at(
             .then_with(|| left.path.cmp(&right.path))
     });
     Ok(entries)
-}
-
-pub(super) fn read_new_messages_at(
-    chat_path: &Path,
-    lock_path: &Path,
-    identity: &AgentIdentity,
-) -> io::Result<Vec<AgentMessage>> {
-    maybe_reset_stale_chat_log(chat_path, lock_path)?;
-    let mut latest_by_sender: HashMap<String, AgentMessage> = HashMap::new();
-    for entry in read_jsonl::<AgentMessage>(chat_path)? {
-        if entry.delivery_class == DeliveryClass::Ephemeral && is_stale(entry.created_at) {
-            continue;
-        }
-        if entry.from_instance_id == identity.instance_id {
-            continue;
-        }
-        if !target_matches(&entry.to, identity) {
-            continue;
-        }
-        let sender = canonicalize_agent_name(&entry.from_agent_name);
-        match latest_by_sender.get(&sender) {
-            Some(existing) if existing.created_at >= entry.created_at => {}
-            _ => {
-                latest_by_sender.insert(sender, entry);
-            }
-        }
-    }
-    let mut messages = latest_by_sender.into_values().collect::<Vec<_>>();
-    messages.sort_by_key(|left| left.created_at);
-    Ok(messages)
 }
 
 fn maybe_reset_stale_registry_log(registry_path: &Path, lock_path: &Path) -> io::Result<()> {
@@ -242,10 +211,6 @@ pub(super) fn agent_chat_log_path_for_target(target: &str) -> PathBuf {
     agent_chat_log_path()
 }
 
-pub(super) fn agent_chat_lock_path() -> PathBuf {
-    cleanup_lock_path_for(&agent_chat_log_path(), "agent.chat.cleanup.lock")
-}
-
 pub(super) fn receipt_ledger_path(agent_name: &str) -> PathBuf {
     receipt_ledger_path_for(&agent_chat_log_path(), agent_name)
 }
@@ -360,7 +325,7 @@ fn normalize_target(target: &str) -> String {
     }
 }
 
-fn target_matches(target: &str, identity: &AgentIdentity) -> bool {
+pub(super) fn target_matches(target: &str, identity: &AgentIdentity) -> bool {
     target == BROADCAST_TARGET
         || normalize_alias(target) == normalize_alias(&identity.agent_name)
         || identity

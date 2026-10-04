@@ -7,27 +7,29 @@ use std::path::Path;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+mod drain;
 mod roster;
 mod storage;
+
+pub(crate) use drain::DrainReport;
+pub(crate) use drain::InboundMessageDrain;
+pub(crate) use drain::requests_idle_transition;
+pub(crate) use drain::suppress_idle_transition;
 
 use roster::AgentConfig;
 use roster::agent_config_from_env;
 use roster::display_agent_name as fallback_display_agent_name;
 use roster::normalize_agent_name;
-use storage::agent_chat_lock_path;
 use storage::agent_chat_log_path;
 use storage::agent_chat_log_path_for_target;
 use storage::agent_mailbox_path;
 use storage::agent_registry_lock_path;
 use storage::agent_registry_log_path;
 use storage::append_chat_message_at;
-use storage::append_json_line;
 use storage::append_registry_heartbeat_at;
 use storage::append_text_block;
 use storage::cleanup_lock_path_for;
-use storage::read_jsonl;
 use storage::read_live_registry_at;
-use storage::read_new_messages_at;
 use storage::receipt_ledger_path;
 
 pub(crate) const AGENT_IPC_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6);
@@ -255,24 +257,23 @@ pub(crate) fn read_live_registry() -> io::Result<Vec<AgentRegistryEntry>> {
     read_live_registry_at(&registry_path, &lock_path)
 }
 
-pub(crate) fn read_new_messages(identity: &AgentIdentity) -> io::Result<Vec<AgentMessage>> {
-    let chat_path = agent_chat_log_path();
-    let lock_path = agent_chat_lock_path();
-    read_new_messages_at(&chat_path, &lock_path, identity)
-}
-
-pub(crate) fn receipt_recorded(identity: &AgentIdentity, id: &str) -> io::Result<bool> {
-    receipt_recorded_at(&receipt_ledger_path(&identity.agent_name), id)
-}
-
-fn receipt_recorded_at(receipt_path: &Path, id: &str) -> io::Result<bool> {
-    Ok(read_jsonl::<String>(receipt_path)?
-        .iter()
-        .any(|seen| seen == id))
-}
-
-pub(crate) fn record_receipt(identity: &AgentIdentity, id: &str) -> io::Result<()> {
-    append_json_line(&receipt_ledger_path(&identity.agent_name), &id.to_string())
+pub(crate) fn drain_new_messages<P, D>(
+    drain: &mut InboundMessageDrain,
+    identity: &AgentIdentity,
+    prepare: P,
+    deliver: D,
+) -> io::Result<DrainReport>
+where
+    P: FnMut(&AgentMessage) -> io::Result<()>,
+    D: FnMut(AgentMessage),
+{
+    drain.drain(
+        &agent_chat_log_path(),
+        &receipt_ledger_path(&identity.agent_name),
+        identity,
+        prepare,
+        deliver,
+    )
 }
 
 pub(crate) fn append_incoming_message_to_mailbox(
@@ -291,12 +292,6 @@ pub(crate) fn display_agent_name(name: &str) -> String {
     agent_config_from_env()
         .and_then(|roster| roster.resolve_display_name(name))
         .unwrap_or_else(|| fallback_display_agent_name(name))
-}
-
-pub(crate) fn canonicalize_agent_name(name: &str) -> String {
-    agent_config_from_env()
-        .and_then(|roster| roster.resolve_route(name).ok())
-        .unwrap_or_else(|| normalize_agent_name(name))
 }
 
 fn resolve_target_agent(name: &str) -> Result<String, String> {

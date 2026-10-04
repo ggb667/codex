@@ -64,7 +64,6 @@ use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::Personality;
 use codex_protocol::models::ActivePermissionProfile;
 
-use crate::agent_ipc::AgentMessage;
 use crate::history_cell::HistoryCell;
 
 /// Whether a managed checkout starts fresh or preserves the current conversation.
@@ -542,8 +541,8 @@ pub(crate) enum AppEvent {
     #[allow(dead_code)]
     FatalExitRequest(String),
 
-    /// Deliver a letter received from another live Pony Codex session.
-    AgentMessageReceived(AgentMessage),
+    /// Check the configured agent message log and deliver newly appended letters.
+    DrainAgentMessages,
 
     /// Forward a command to the Agent. Using an `AppEvent` for this avoids
     /// bubbling channels through layers of widgets.

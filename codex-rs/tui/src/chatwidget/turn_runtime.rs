@@ -74,6 +74,7 @@ impl ChatWidget {
     // Raw reasoning uses the same flow as summarized reasoning
 
     pub(super) fn on_task_started(&mut self) {
+        self.agent_ipc_idle_deferred = false;
         self.clear_context_compaction();
         self.input_queue.user_turn_pending_start = false;
         self.reset_safety_buffering_for_turn_start();
@@ -196,7 +197,7 @@ impl ChatWidget {
         self.suppressed_exec_calls.clear();
         self.last_unified_wait = None;
         self.unified_exec_wait_streak = None;
-        if !from_replay {
+        if !from_replay && !self.agent_ipc_idle_deferred {
             let body = Notification::agent_turn_preview(&notification_response);
             self.set_ambient_pet_notification(crate::pets::PetNotificationKind::Review, body);
         }
@@ -219,11 +220,16 @@ impl ChatWidget {
             .current_goal_status
             .as_ref()
             .is_some_and(GoalStatusState::is_active);
+        let agent_ipc_idle_deferred = std::mem::take(&mut self.agent_ipc_idle_deferred);
         // Emit a notification when the agent is truly waiting for the user.
-        // Queued follow-up input and active goal continuation both start the
-        // next turn immediately, so notifying at that boundary would feel like
+        // Queued follow-up input, pending steers, and active goal continuation
+        // all keep work moving, so notifying at that boundary would feel like
         // a false "needs attention".
-        if !follow_up_started && !active_goal_continuing {
+        if !follow_up_started
+            && !had_pending_steers
+            && !active_goal_continuing
+            && !agent_ipc_idle_deferred
+        {
             self.notify(Notification::AgentTurnComplete {
                 response: notification_response,
             });

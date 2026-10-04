@@ -1,6 +1,10 @@
 use super::*;
 use crate::agent_ipc;
 
+fn idle_drain_error_message(err: &std::io::Error) -> String {
+    format!("Idle deferred because inbound agent messages could not be checked: {err}")
+}
+
 impl ChatWidget {
     pub(super) fn maybe_start_agent_ipc(&mut self) {
         let Some(identity) = agent_ipc::agent_identity_from_env(self.config.cwd.as_ref()) else {
@@ -14,6 +18,7 @@ impl ChatWidget {
             identity.clone(),
         ));
         self.agent_ipc_identity = Some(identity);
+        self.agent_ipc_drain = Some(agent_ipc::InboundMessageDrain::default());
     }
 
     fn spawn_agent_ipc_task(
@@ -25,33 +30,45 @@ impl ChatWidget {
                 if let Err(err) = agent_ipc::append_registry_heartbeat(&identity) {
                     tracing::debug!(error = %err, "failed to refresh pony IPC heartbeat");
                 }
-                match agent_ipc::read_new_messages(&identity) {
-                    Ok(messages) => {
-                        for message in messages {
-                            if agent_ipc::receipt_recorded(&identity, &message.id).unwrap_or(false)
-                            {
-                                continue;
-                            }
-                            if let Err(err) =
-                                agent_ipc::append_incoming_message_to_mailbox(&identity, &message)
-                            {
-                                tracing::debug!(error = %err, from = %message.from_agent_name, "failed to append pony letter to mailbox");
-                                continue;
-                            }
-                            if let Err(err) = agent_ipc::record_receipt(&identity, &message.id) {
-                                tracing::debug!(error = %err, "failed to record pony IPC receipt");
-                                continue;
-                            }
-                            app_event_tx.send(AppEvent::AgentMessageReceived(message));
-                        }
-                    }
-                    Err(err) => {
-                        tracing::debug!(error = %err, "failed to read pony IPC messages");
-                    }
-                }
+                app_event_tx.send(AppEvent::DrainAgentMessages);
                 tokio::time::sleep(agent_ipc::AGENT_IPC_POLL_INTERVAL).await;
             }
         })
+    }
+
+    pub(crate) fn drain_agent_messages(&mut self) -> std::io::Result<agent_ipc::DrainReport> {
+        let Some(identity) = self.agent_ipc_identity.clone() else {
+            return Ok(agent_ipc::DrainReport::default());
+        };
+        let Some(mut drain) = self.agent_ipc_drain.take() else {
+            return Ok(agent_ipc::DrainReport::default());
+        };
+        let result = agent_ipc::drain_new_messages(
+            &mut drain,
+            &identity,
+            |message| agent_ipc::append_incoming_message_to_mailbox(&identity, message),
+            |message| self.queue_or_buffer_agent_message(message),
+        );
+        self.agent_ipc_drain = Some(drain);
+        result
+    }
+
+    pub(super) fn drain_agent_messages_before_idle(&mut self, message: &mut String) {
+        if !agent_ipc::requests_idle_transition(message) {
+            return;
+        }
+        match self.drain_agent_messages() {
+            Ok(report) if report.delivered > 0 => {
+                agent_ipc::suppress_idle_transition(message);
+                self.agent_ipc_idle_deferred = true;
+            }
+            Ok(_) => {}
+            Err(err) => {
+                agent_ipc::suppress_idle_transition(message);
+                self.agent_ipc_idle_deferred = true;
+                self.add_error_message(idle_drain_error_message(&err));
+            }
+        }
     }
 
     pub(crate) fn queue_or_buffer_agent_message(&mut self, message: AgentMessage) {
@@ -122,3 +139,7 @@ impl ChatWidget {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "pony_tests.rs"]
+mod tests;
