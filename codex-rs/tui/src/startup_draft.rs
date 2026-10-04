@@ -174,7 +174,11 @@ impl StartupDraft {
 impl StartupDraftPump {
     async fn wait_for_launch_gate(&mut self, tui: &mut Tui) -> io::Result<()> {
         self.flush_pending_events(tui).await?;
-        self.draw_launch_gate(tui, tui.terminal.last_known_screen_size)?;
+        // The host can resize its pane while startup configuration is loading. Sampling the
+        // backend here avoids painting once at stale geometry and again when the queued resize
+        // event arrives, which leaves two inline gates visible in terminals that reflow rows.
+        let screen_size = tui.terminal.size()?;
+        self.draw_launch_gate(tui, screen_size)?;
         loop {
             let Some(event) = self.events.next().await else {
                 return Err(io::Error::new(

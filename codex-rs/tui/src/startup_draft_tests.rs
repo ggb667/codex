@@ -5,8 +5,10 @@ use crossterm::event::KeyModifiers;
 use pretty_assertions::assert_eq;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::layout::Size;
 use std::sync::Arc;
 use tokio::sync::mpsc::unbounded_channel;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use super::StartupDraftInitialScreen;
 use super::StartupDraftPump;
@@ -46,6 +48,33 @@ pub(crate) fn quiet_startup_test_pump() -> StartupDraftPump {
     let mut pump = startup_test_pump(std::iter::empty());
     pump.events = Box::pin(futures::stream::pending());
     pump
+}
+
+#[tokio::test]
+async fn launch_gate_refreshes_stale_screen_size_before_first_draw() {
+    let mut tui = crate::tui::test_support::make_test_tui().expect("test tui");
+    let actual_size = tui.terminal.size().expect("backend size");
+    tui.terminal.last_known_screen_size = Size::new(/*width*/ 120, /*height*/ 40);
+
+    let (event_tx, event_rx) = unbounded_channel();
+    let mut pump = startup_test_pump(std::iter::empty());
+    pump.initial_screen = StartupDraftInitialScreen::Onboarding;
+    pump.events = Box::pin(UnboundedReceiverStream::new(event_rx));
+    tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        event_tx
+            .send(TuiEvent::Key(KeyEvent::new(
+                KeyCode::Char(' '),
+                KeyModifiers::NONE,
+            )))
+            .expect("send launch key");
+    });
+
+    pump.wait_for_launch_gate(&mut tui)
+        .await
+        .expect("resume launch");
+
+    assert_eq!(tui.terminal.last_known_screen_size, actual_size);
 }
 
 #[test]
