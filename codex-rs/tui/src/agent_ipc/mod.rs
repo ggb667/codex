@@ -19,6 +19,7 @@ pub(crate) use drain::suppress_idle_transition;
 use roster::AgentConfig;
 use roster::agent_config_from_env;
 use roster::display_agent_name as fallback_display_agent_name;
+use roster::launch_gate_required as roster_launch_gate_required;
 use roster::normalize_agent_name;
 use storage::agent_chat_log_path;
 use storage::agent_chat_log_path_for_target;
@@ -36,6 +37,10 @@ pub(crate) const AGENT_IPC_POLL_INTERVAL: std::time::Duration = std::time::Durat
 pub(super) const STALE_AFTER_SECS: i64 = 60 * 60;
 pub(super) const BROADCAST_TARGET: &str = "*";
 pub(super) const AGENT_CONFIG_ENV: &str = "CODEX_AGENT_CONFIG";
+
+pub(crate) fn launch_gate_required() -> bool {
+    roster_launch_gate_required()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AgentSendCommand {

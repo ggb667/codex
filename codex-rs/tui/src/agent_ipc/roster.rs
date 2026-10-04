@@ -29,6 +29,30 @@ pub(super) struct AgentConfig {
     pub(super) global_singleton: bool,
     #[serde(default)]
     pub(super) agents: Vec<AgentConfigAgent>,
+    #[serde(default)]
+    pub(super) launch_policy: Option<LaunchPolicy>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct LaunchPolicy {
+    schema_version: u32,
+    role: LaunchRole,
+    start_mode: LaunchStartMode,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum LaunchRole {
+    Coordinator,
+    Worker,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum LaunchStartMode {
+    Active,
+    Paused,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -52,6 +76,17 @@ pub(super) struct AgentConfigAgent {
 }
 
 impl AgentConfig {
+    pub(super) fn starts_paused(&self) -> bool {
+        matches!(
+            self.launch_policy,
+            Some(LaunchPolicy {
+                schema_version: 1,
+                role: LaunchRole::Worker,
+                start_mode: LaunchStartMode::Paused,
+            })
+        )
+    }
+
     pub(super) fn current_agent(&self) -> AgentConfigAgent {
         AgentConfigAgent {
             agent_id: self.agent_id.clone(),
@@ -171,6 +206,10 @@ pub(super) fn agent_config_from_env() -> Option<AgentConfig> {
     serde_json::from_str(&text).ok()
 }
 
+pub(super) fn launch_gate_required() -> bool {
+    agent_config_from_env().is_some_and(|config| config.starts_paused())
+}
+
 pub(super) fn normalize_alias(name: &str) -> String {
     name.trim().to_lowercase()
 }
@@ -209,3 +248,7 @@ fn unique_agents_by_route(agents: Vec<AgentConfigAgent>) -> Vec<AgentConfigAgent
     }
     unique.into_values().collect()
 }
+
+#[cfg(test)]
+#[path = "roster_tests.rs"]
+mod tests;

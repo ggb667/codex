@@ -189,6 +189,9 @@ pub(super) async fn run_main_inner(
         startup_draft::StartupDraftSessionAction::New
     };
     let mut startup_draft = startup_draft::StartupDraft::new(initial_screen, session_action)?;
+    if agent_ipc::launch_gate_required() {
+        startup_draft.wait_for_launch_gate().await?;
+    }
 
     let default_daemon = if explicit_remote_endpoint.is_none() && reuse_implicit_local_daemon {
         startup_draft

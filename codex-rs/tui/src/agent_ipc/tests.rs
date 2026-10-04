@@ -43,6 +43,7 @@ fn sample_roster() -> AgentConfig {
         message_log_path: "/tmp/codex/agent/runtime/agent.chat.jsonl".to_string(),
         registry_path: "/tmp/codex/agent/runtime/agent.registry.jsonl".to_string(),
         global_singleton: false,
+        launch_policy: None,
         agents: vec![
             AgentConfigAgent {
                 agent_id: "TWILIGHT_SPARKLE".to_string(),

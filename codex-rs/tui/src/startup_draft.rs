@@ -33,6 +33,8 @@ use crate::history_cell;
 use crate::history_cell::HistoryCell;
 use crate::key_hint;
 use crate::keymap::RuntimeKeymap;
+use crate::launch_gate;
+use crate::launch_gate::LaunchGateAction;
 use crate::legacy_core::config::Config;
 use crate::render::Insets;
 use crate::render::renderable::FlexRenderable;
@@ -153,6 +155,11 @@ impl StartupDraft {
         self.pump.apply_config(config);
     }
 
+    /// Stop before agent startup until the operator intentionally resumes this launch.
+    pub(crate) async fn wait_for_launch_gate(&mut self) -> io::Result<()> {
+        self.pump.wait_for_launch_gate(&mut self.tui).await
+    }
+
     /// Lend the original terminal to an existing interactive startup screen.
     pub(crate) fn tui_mut(&mut self) -> &mut Tui {
         &mut self.tui
@@ -165,6 +172,40 @@ impl StartupDraft {
 }
 
 impl StartupDraftPump {
+    async fn wait_for_launch_gate(&mut self, tui: &mut Tui) -> io::Result<()> {
+        self.flush_pending_events(tui).await?;
+        self.draw_launch_gate(tui, tui.terminal.last_known_screen_size)?;
+        loop {
+            let Some(event) = self.events.next().await else {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "terminal input stream closed while launch was paused",
+                ));
+            };
+            let screen_size = tui.screen_size_for_event(&event)?;
+            match launch_gate::action_for_event(&event) {
+                LaunchGateAction::Continue => {
+                    if self.initial_screen == StartupDraftInitialScreen::Composer {
+                        self.draw(tui, screen_size)?;
+                    }
+                    return Ok(());
+                }
+                LaunchGateAction::Cancel => {
+                    tui.terminal.clear()?;
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, StartupCancelled));
+                }
+                LaunchGateAction::Redraw => self.draw_launch_gate(tui, screen_size)?,
+                LaunchGateAction::Ignore => {}
+            }
+        }
+    }
+
+    fn draw_launch_gate(&mut self, tui: &mut Tui, screen_size: Size) -> io::Result<()> {
+        tui.draw_with_resize_reflow(launch_gate::LAUNCH_GATE_HEIGHT, screen_size, |frame| {
+            launch_gate::render(frame.area(), frame.buffer)
+        })
+    }
+
     /// Refresh the session header and safe editor shortcuts without enabling modal editing.
     pub(crate) fn apply_config(&mut self, config: &Config) {
         let local_settings = crate::local_settings::LocalSettings::from(config);
