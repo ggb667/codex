@@ -219,6 +219,14 @@ pub(super) fn agent_registry_lock_path() -> PathBuf {
     cleanup_lock_path_for(&agent_registry_log_path(), "agent.registry.cleanup.lock")
 }
 
+pub(super) fn canonical_state_path(agent_id: &str) -> PathBuf {
+    agent_registry_log_path()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("agent-state")
+        .join(format!("{}.json", agent_id.to_ascii_lowercase()))
+}
+
 pub(super) fn agent_chat_log_path() -> PathBuf {
     let config_path =
         agent_config_from_env().and_then(|config| non_empty_path(&config.message_log_path));
