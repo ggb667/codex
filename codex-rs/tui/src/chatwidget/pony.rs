@@ -10,6 +10,9 @@ impl ChatWidget {
         let Some(identity) = agent_ipc::agent_identity_from_env(self.config.cwd.as_ref()) else {
             return;
         };
+        if let Err(err) = agent_ipc::read_startup_state(&identity) {
+            tracing::warn!(error = %err, "failed to read canonical agent startup state");
+        }
         if let Err(err) = agent_ipc::append_registry_heartbeat(&identity) {
             tracing::debug!(error = %err, "failed to write initial pony IPC heartbeat");
         }

@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 mod drain;
 mod roster;
+mod startup_state;
 mod storage;
 
 pub(crate) use drain::DrainReport;
@@ -29,6 +30,7 @@ use storage::agent_registry_log_path;
 use storage::append_chat_message_at;
 use storage::append_registry_heartbeat_at;
 use storage::append_text_block;
+use storage::canonical_state_path;
 use storage::cleanup_lock_path_for;
 use storage::read_live_registry_at;
 use storage::receipt_ledger_path;
@@ -232,6 +234,16 @@ pub(crate) fn append_registry_heartbeat(identity: &AgentIdentity) -> io::Result<
     let registry_path = agent_registry_log_path();
     let lock_path = agent_registry_lock_path();
     append_registry_heartbeat_at(&registry_path, &lock_path, identity)
+}
+
+pub(crate) fn agent_state_path(identity: &AgentIdentity) -> PathBuf {
+    canonical_state_path(&identity.agent_name)
+}
+
+pub(crate) fn read_startup_state(
+    identity: &AgentIdentity,
+) -> io::Result<Option<startup_state::CanonicalAgentState>> {
+    startup_state::read_for_startup(&agent_state_path(identity))
 }
 
 pub(crate) fn append_chat_message(
