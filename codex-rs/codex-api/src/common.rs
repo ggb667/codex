@@ -199,6 +199,7 @@ pub struct StreamOptions {
 #[derive(Debug, Serialize, Default, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum TextFormatType {
+    Text,
     #[default]
     JsonSchema,
 }
@@ -208,11 +209,14 @@ pub struct TextFormat {
     /// Format type used by the OpenAI text controls.
     pub r#type: TextFormatType,
     /// When true, the server is expected to strictly validate responses.
-    pub strict: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
     /// JSON schema for the desired output.
-    pub schema: Value,
-    /// Friendly name for the format, used in telemetry/debugging.
-    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<Value>,
+    /// Friendly name for the format.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// Controls the `text` field for the Responses API, combining verbosity and
@@ -406,9 +410,9 @@ pub fn create_text_param_for_request(
         verbosity: verbosity.map(std::convert::Into::into),
         format: output_schema.as_ref().map(|schema| TextFormat {
             r#type: TextFormatType::JsonSchema,
-            strict: output_schema_strict,
-            schema: schema.clone(),
-            name: "codex_output_schema".to_string(),
+            strict: Some(output_schema_strict),
+            schema: Some(schema.clone()),
+            name: Some("codex_output_schema".to_string()),
         }),
     })
 }

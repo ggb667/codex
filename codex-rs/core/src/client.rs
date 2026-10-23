@@ -968,11 +968,22 @@ impl ModelClient {
             }
             None
         };
-        let text = create_text_param_for_request(
+        let mut text = create_text_param_for_request(
             verbosity,
             &prompt.output_schema,
             prompt.output_schema_strict,
         );
+
+        // LM Studio requires text.format even for ordinary text responses.
+        if !is_openai && prompt.output_schema.is_none() {
+            let controls = text.get_or_insert_with(Default::default);
+            controls.format = Some(codex_api::TextFormat {
+                r#type: codex_api::TextFormatType::Text,
+                strict: None,
+                schema: None,
+                name: None,
+            });
+        }
         let prompt_cache_key = Some(self.prompt_cache_key(responses_metadata));
         let service_tier = model_info.service_tier_for_request(service_tier);
         let request = ResponsesApiRequest {
